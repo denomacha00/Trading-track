@@ -141,6 +141,17 @@ class Settings(BaseSettings):
     # running commentary.
     ai_monitor_enabled: bool = Field(default=False)
 
+    # Assistant AUTOPILOT (opt-in, OFF by default). When true, the safe subset of
+    # actions the assistant proposes in chat is APPLIED automatically the moment it
+    # proposes them — settings within the allowlist, bot start/stop, price alerts,
+    # and PAPER orders — instead of waiting for a manual Confirm tap. This is what
+    # lets a hands-off user say "set me up safely and start" and have it actually
+    # happen. LIVE (real-money) orders and switching paper<->live are NEVER
+    # autopiloted: those always require an explicit human confirmation, no matter
+    # this flag. Off by default; the operator turns it on when they want the
+    # assistant to act for them.
+    ai_autopilot_enabled: bool = Field(default=False)
+
     # Live market-news sources for the AI assistant + News panel. Comma-separated
     # public RSS/Atom feed URLs (crypto/markets). Real headlines only — if a feed
     # is unreachable it's reported as unavailable, never faked. No user data is

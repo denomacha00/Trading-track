@@ -179,7 +179,15 @@ type ChatMsg = ChatTurn & {
   // When this turn was created (unix ms). Used to age the persisted transcript
   // out after 24h (see chatHistory). Stamped at creation; absent on old data.
   ts?: number
+  // Stable id for an action-bearing reply (see _actionTurnSeq). Only set when the
+  // turn carries a proposal the autopilot may auto-run.
+  id?: number
 }
+
+// Monotonic id stamped on assistant reply turns that carry a proposed action, so
+// the autopilot effect can start each auto-action EXACTLY once (matching by id is
+// stable across the appends/awaits that a manual index can't survive).
+let _actionTurnSeq = 0
 
 function Dashboard({
   me,
@@ -2849,6 +2857,9 @@ function AssistantPanel({
   const [listening, setListening] = useState(false)
   const recRef = useRef<SpeechRec | null>(null)
   const listRef = useRef<HTMLDivElement | null>(null)
+  // Ids of auto (autopilot) actions we've already kicked off, so the effect that
+  // watches `turns` starts each one exactly once even as it re-runs on every append.
+  const autoStartedRef = useRef<Set<number>>(new Set())
 
   const speechSupported = typeof window !== 'undefined' && getSpeechRecognition() != null
 
@@ -2895,10 +2906,14 @@ function AssistantPanel({
       })
       // Extract any hidden navigation action; the spoken/shown text is the reply
       // with the tag removed, and a button lets the user actually go there. A
-      // validated proposed_action (order/settings/bot/train) rides along and is
-      // shown as a Confirm/Cancel card — nothing runs until the user confirms.
+      // validated proposed_action (order/settings/bot/train/alert) rides along.
+      // The SERVER decides `auto`: when true (autopilot on + a safe, non-live
+      // action) we start it immediately as 'running' so no Confirm card ever
+      // shows and the outcome line is the real endpoint result — never the AI
+      // claiming it's "done". Otherwise it's 'pending' and waits for a tap.
       const { text, dest } = parseNavAction(res.reply)
       const action = res.proposed_action ?? undefined
+      const auto = !!action && (action as ProposedAction).auto === true
       setTurns((t) => [
         ...t,
         {
@@ -2907,7 +2922,8 @@ function AssistantPanel({
           usedNews: res.used_news,
           nav: dest ? { dest, label: NAV_LABEL[dest] } : undefined,
           action,
-          actionState: action ? 'pending' : undefined,
+          actionState: action ? (auto ? 'running' : 'pending') : undefined,
+          id: action ? ++_actionTurnSeq : undefined,
           ts: Date.now(),
         },
       ])
@@ -2951,6 +2967,8 @@ function AssistantPanel({
       return { title: 'Change settings', lines: Object.entries(a.changes).map(([k, v]) => `${k} → ${v}`), danger: false }
     if (a.type === 'bot')
       return { title: a.state === 'start' ? 'Start the bot' : 'Stop the bot', lines: [a.state === 'start' ? 'Begin trading / monitoring per your settings.' : 'Halt autonomous trading.'], danger: false }
+    if (a.type === 'alert')
+      return { title: 'Set a price alert', lines: [`${a.symbol} ${a.condition} ${a.price}`, ...(a.note ? [`Note: ${a.note}`] : []), 'Notifies you on a REAL price cross — it never trades.'], danger: false }
     return { title: 'Train a strategy', lines: [`${a.strategy} on ${a.symbol} ${a.timeframe}`, 'Measures real results on history; saves only if it beats the baseline.'], danger: false }
   }
 
@@ -2986,6 +3004,15 @@ function AssistantPanel({
         const res = await api.setBot(action.state)
         setActionState(idx, 'done')
         pushResult(`✅ Bot ${res.running ? 'started' : 'stopped'}.`)
+      } else if (action.type === 'alert') {
+        const al = await api.createAlert({
+          symbol: action.symbol,
+          condition: action.condition,
+          price: action.price,
+          ...(action.note ? { note: action.note } : {}),
+        })
+        setActionState(idx, 'done')
+        pushResult(`✅ Alert armed: ${al.symbol} ${al.condition} ${al.price}${al.note ? ` (${al.note})` : ''}. You'll be notified on a real cross.`)
       } else if (action.type === 'train') {
         const rep = await api.train(action.symbol, action.strategy, action.timeframe, true)
         setActionState(idx, 'done')
@@ -3002,6 +3029,29 @@ function AssistantPanel({
       pushResult(`⚠️ Couldn't complete that action: ${msg}`)
     }
   }
+
+  // AUTOPILOT: when the server flagged a proposal `auto` (autopilot on + a safe,
+  // non-live action), the reply turn is appended already 'running'. This effect
+  // picks it up on the next commit and calls the SAME authenticated endpoint a
+  // manual Confirm would — so nothing bypasses auth, and the outcome line is the
+  // real endpoint result, never the AI asserting success. Matched by stable id
+  // (not index) and guarded by autoStartedRef so it fires exactly once; a live
+  // order or paper<->live switch is never `auto`, so it still waits for a tap.
+  useEffect(() => {
+    const idx = turns.findIndex(
+      (m) =>
+        m.id != null &&
+        m.action &&
+        (m.action as ProposedAction).auto === true &&
+        m.actionState === 'running' &&
+        !autoStartedRef.current.has(m.id),
+    )
+    if (idx === -1) return
+    const m = turns[idx]
+    autoStartedRef.current.add(m.id as number)
+    void runAction(idx, m.action as ProposedAction)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turns])
 
   const toggleMic = () => {
     const Rec = getSpeechRecognition()
@@ -3087,6 +3137,7 @@ function AssistantPanel({
                     const d = describeAction(t.action)
                     const running = t.actionState === 'running'
                     const done = t.actionState === 'done'
+                    const auto = t.action.auto === true
                     return (
                       <div className={`action-card${d.danger ? ' danger' : ''}`}>
                         <div className="action-title">
@@ -3103,6 +3154,8 @@ function AssistantPanel({
                         )}
                         {done ? (
                           <div className="action-status">Done ✓</div>
+                        ) : auto && running ? (
+                          <div className="action-status">Autopilot: applying now…</div>
                         ) : (
                           <div className="action-btns">
                             <button
@@ -4041,6 +4094,7 @@ function SettingsPanel({
         use_saved_strategy: form.use_saved_strategy,
         ai_trade_confirm: form.ai_trade_confirm,
         ai_monitor_enabled: form.ai_monitor_enabled,
+        ai_autopilot_enabled: form.ai_autopilot_enabled,
       })
       onSaved(saved)
     } catch (e) {
@@ -4311,6 +4365,26 @@ function SettingsPanel({
         {form.ai_enabled
           ? 'Turn on "Read replies & alerts aloud" in the assistant to hear them.'
           : 'Add an AI key (Credentials) to enable this.'}
+      </p>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={form.ai_autopilot_enabled}
+          onChange={(e) => setForm({ ...form, ai_autopilot_enabled: e.target.checked })}
+          disabled={!form.ai_enabled}
+        />
+        Assistant autopilot (apply the assistant's safe actions automatically)
+      </label>
+      <p className="hint">
+        Opt-in and <b>off by default</b>. When on, the assistant <b>applies the safe
+        actions it proposes the moment it proposes them</b> — settings within the
+        allowlist, starting/stopping the bot, price alerts, and <b>paper</b> orders —
+        instead of waiting for a Confirm tap. This is what lets a hands-off user say
+        "set me up safely and start" and have it actually happen. <b>Real-money (live)
+        orders and switching paper↔live are never autopiloted</b> — those always need
+        your explicit confirmation. Every outcome shown is the real result of the
+        action, never a claim.{' '}
+        {form.ai_enabled ? '' : 'Add an AI key (Credentials) to enable this.'}
       </p>
       <p className="hint">
         Trailing stop ratchets an open long's stop-loss upward as price rises to

@@ -113,7 +113,13 @@ def _monitor_positions(db, user, engine, price_of) -> list[dict]:
         rows = []
     for t in rows:
         entry, amount = float(t.entry_price or 0), float(t.amount or 0)
-        pnl, px = float(t.pnl or 0), price_of(t.symbol)
+        px = price_of(t.symbol)
+        # Trade.pnl is only written when a trade CLOSES (it's 0.0 the whole time a
+        # position is open), so reading it here would make the "turned red"
+        # call-out never fire. Compute the REAL unrealized P&L from the current
+        # live price instead; if the price can't be read this tick we leave it 0
+        # (never a fabricated number) and simply skip the drawdown call-out.
+        pnl = engine.unrealized_pnl(t, px) if px is not None else float(t.pnl or 0)
         is_long = (t.side or "buy").lower() != "sell"
         if px is not None and t.stop_loss and entry > 0:
             stop = float(t.stop_loss)

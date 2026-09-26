@@ -21,6 +21,10 @@ from app.strategies import Strategy
 class BacktestTrade:
     entry_index: int
     entry_price: float
+    # Total cash spent to OPEN the position, INCLUDING the entry fee. P&L is
+    # (exit proceeds - entry_cost); using entry_price * qty instead would silently
+    # drop the entry fee and overstate every trade's profit by that fee.
+    entry_cost: float = 0.0
     exit_index: int | None = None
     exit_price: float | None = None
     pnl: float = 0.0
@@ -103,7 +107,9 @@ def run_backtest(
             position_qty = (spend - fee_paid) / buy_price
             total_fees += fee_paid
             balance = 0.0
-            current_trade = BacktestTrade(entry_index=i, entry_price=buy_price)
+            current_trade = BacktestTrade(
+                entry_index=i, entry_price=buy_price, entry_cost=spend
+            )
             peak_price = buy_price
         elif pending == "sell" and position_qty > 0.0:
             sell_price = fill_price * (1 - slip)  # receive less (adverse)
@@ -114,7 +120,7 @@ def run_backtest(
             if current_trade is not None:
                 current_trade.exit_index = i
                 current_trade.exit_price = sell_price
-                current_trade.pnl = proceeds - (current_trade.entry_price * position_qty)
+                current_trade.pnl = proceeds - current_trade.entry_cost
                 trades.append(current_trade)
                 current_trade = None
             balance = proceeds
@@ -146,7 +152,7 @@ def run_backtest(
                 proceeds = gross - fee_paid
                 current_trade.exit_index = i
                 current_trade.exit_price = exit_price
-                current_trade.pnl = proceeds - (current_trade.entry_price * position_qty)
+                current_trade.pnl = proceeds - current_trade.entry_cost
                 trades.append(current_trade)
                 current_trade = None
                 balance = proceeds

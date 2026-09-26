@@ -671,16 +671,12 @@ async def close_trade(
     ):
         raise HTTPException(status_code=404, detail="Open trade not found")
     engine = _engine_for(db, user)
+    # Close the EXACT trade by id (not "an open trade for this symbol", which is
+    # ambiguous with multiple DCA legs) and enforce paper/live book isolation.
     accepted, message, updated = await asyncio.to_thread(
-        engine.execute_signal,
+        engine.close_by_id,
         db,
-        action="close",
-        symbol=trade.symbol,
-        amount=None,
-        stop_loss=None,
-        take_profit=None,
-        source="manual",
-        note="manual close",
+        trade_id,
     )
     return ExecutionResult(
         accepted=accepted, message=message,
@@ -814,6 +810,7 @@ def _settings_out(engine, user: User) -> SettingsOut:
         use_saved_strategy=getattr(s, "use_saved_strategy", False),
         ai_trade_confirm=getattr(s, "ai_trade_confirm", False),
         ai_monitor_enabled=getattr(s, "ai_monitor_enabled", False),
+        ai_autopilot_enabled=getattr(s, "ai_autopilot_enabled", False),
         ai_enabled=bool(s.ai_api_key),
         ai_model=s.ai_model,
         ai_style=engine.ai._style() if s.ai_api_key else "",
@@ -1213,6 +1210,17 @@ def _assistant_account_context(db: Session, user: User, engine) -> str:
         f"confirm_tf={s.auto_confirm_timeframe or 'off'}, min_conf={s.min_signal_confidence}); "
         f"AI trade review {'on' if getattr(s, 'ai_trade_confirm', False) else 'off'}"
     )
+    lines.append(
+        "- Assistant autopilot: "
+        + (
+            "ON — you APPLY safe actions yourself the moment you propose them "
+            "(settings, bot start/stop, alerts, PAPER orders); LIVE orders and "
+            "paper<->live switches still need the operator's confirmation."
+            if getattr(s, "ai_autopilot_enabled", False)
+            else "OFF — every action you propose only appears on a Confirm card "
+            "and does nothing until the operator taps Confirm."
+        )
+    )
     now = _utcnow()
 
     def _hours_since(ts) -> float | None:
@@ -1516,6 +1524,15 @@ def _normalize_proposed_action(raw: dict | None, engine) -> dict | None:
     try:
         atype = str(raw.get("type", "")).strip().lower()
         reason = str(raw.get("reason", "")).strip()[:280] or None
+        # AUTOPILOT policy (decided server-side, never trusted from the client):
+        # when the operator has turned autopilot on, the SAFE subset is applied
+        # automatically; otherwise every action waits for a manual Confirm tap.
+        # A LIVE (real-money) order is NEVER auto-applied, autopilot or not — that
+        # always needs an explicit human confirmation. ``auto`` tells the frontend
+        # which path to take; it can only ever RELAX to a confirm card, never the
+        # reverse (the real endpoints re-check licence/risk/live-permission again).
+        autopilot = bool(getattr(getattr(engine, "settings", None), "ai_autopilot_enabled", False))
+        live = bool(getattr(getattr(engine, "settings", None), "is_live", False))
 
         if atype == "order":
             side = str(raw.get("side", "")).strip().lower()
@@ -1541,6 +1558,9 @@ def _normalize_proposed_action(raw: dict | None, engine) -> dict | None:
                 if fv > 0:
                     out[k] = fv
             out.setdefault("amount", None)  # null => risk manager sizes it safely
+            # A live order is real money: never autopilot it. A paper order is
+            # safe to auto-apply when the operator enabled autopilot.
+            out["auto"] = autopilot and not live
             return out
 
         if atype == "settings":
@@ -1569,13 +1589,37 @@ def _normalize_proposed_action(raw: dict | None, engine) -> dict | None:
                 # Anything else (e.g. trading_mode, api keys) is silently dropped.
             if not changes:
                 return None
-            return {"type": "settings", "changes": changes, "reason": reason}
+            return {"type": "settings", "changes": changes, "reason": reason, "auto": autopilot}
 
         if atype == "bot":
             state = str(raw.get("state", "")).strip().lower()
             if state not in ("start", "stop"):
                 return None
-            return {"type": "bot", "state": state, "reason": reason}
+            return {"type": "bot", "state": state, "reason": reason, "auto": autopilot}
+
+        if atype == "alert":
+            symbol = str(raw.get("symbol", "")).strip().upper()
+            if not symbol or "/" not in symbol:
+                return None
+            condition = str(raw.get("condition", "")).strip().lower()
+            if condition not in ("above", "below"):
+                return None
+            try:
+                price = float(raw.get("price"))
+            except (TypeError, ValueError):
+                return None
+            if price <= 0:
+                return None
+            note = str(raw.get("note", "")).strip()[:200] or None
+            return {
+                "type": "alert",
+                "symbol": symbol,
+                "condition": condition,
+                "price": price,
+                "note": note,
+                "reason": reason,
+                "auto": autopilot,
+            }
 
         if atype == "train":
             symbol = str(raw.get("symbol", "")).strip().upper()
@@ -1591,6 +1635,7 @@ def _normalize_proposed_action(raw: dict | None, engine) -> dict | None:
                 "strategy": strategy,
                 "timeframe": timeframe,
                 "reason": reason,
+                "auto": autopilot,
             }
     except Exception:
         return None

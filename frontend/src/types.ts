@@ -69,6 +69,13 @@ export interface ChatTurn {
 // the backend validates its suggestion against a strict allowlist and returns one
 // of these, the UI shows a Confirm/Cancel card, and only on Confirm does the app
 // call the normal authenticated endpoint. `reason` is the AI's one-line rationale.
+//
+// `auto` is set by the SERVER (never the model): true only when the operator has
+// turned autopilot on AND the action is in the safe subset (settings, bot,
+// alert, or a PAPER order). When true the UI applies it immediately via the same
+// authenticated endpoint a manual Confirm would call — so the outcome line is
+// always the real one, never the AI claiming success. LIVE orders and paper<->live
+// switches are never auto (auto=false) and always need a manual Confirm tap.
 export type ProposedAction =
   | {
       type: 'order'
@@ -80,15 +87,26 @@ export type ProposedAction =
       stop_loss?: number
       take_profit?: number
       reason?: string | null
+      auto?: boolean
     }
-  | { type: 'settings'; changes: Partial<Settings>; reason?: string | null }
-  | { type: 'bot'; state: 'start' | 'stop'; reason?: string | null }
+  | { type: 'settings'; changes: Partial<Settings>; reason?: string | null; auto?: boolean }
+  | { type: 'bot'; state: 'start' | 'stop'; reason?: string | null; auto?: boolean }
   | {
       type: 'train'
       symbol: string
       strategy: string
       timeframe: string
       reason?: string | null
+      auto?: boolean
+    }
+  | {
+      type: 'alert'
+      symbol: string
+      condition: 'above' | 'below'
+      price: number
+      note?: string | null
+      reason?: string | null
+      auto?: boolean
     }
 
 export interface Settings {
@@ -122,6 +140,12 @@ export interface Settings {
   // risk — a stop about to hit, a position deep red, nearing your loss limit.
   // Opt-in and OFF by default; it never trades, only calls things out.
   ai_monitor_enabled: boolean
+  // When on, the SAFE subset of assistant actions (settings, bot start/stop,
+  // price alerts, and PAPER orders) is APPLIED automatically the moment the AI
+  // proposes it — no manual Confirm tap. LIVE (real-money) orders and switching
+  // paper<->live are NEVER autopiloted; those always need an explicit confirm.
+  // Opt-in and OFF by default.
+  ai_autopilot_enabled: boolean
   ai_enabled: boolean
   ai_model?: string
   ai_style?: string

@@ -46,9 +46,15 @@ class RiskManager:
         start = dt.datetime.now(dt.timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
+        # Scope to the CURRENT trading mode: paper and live are separate books,
+        # so simulated losses must never trip the live daily-loss breaker (nor
+        # the reverse). Without this filter a paper drawdown could halt live
+        # trading, or live losses could be masked by paper wins.
         stmt = self._scope(
             select(Trade).where(
-                Trade.status == TradeStatus.closed.value, Trade.closed_at >= start
+                Trade.status == TradeStatus.closed.value,
+                Trade.closed_at >= start,
+                Trade.mode == self.settings.trading_mode,
             )
         )
         return float(sum(t.pnl for t in db.scalars(stmt).all()))
@@ -87,6 +93,7 @@ class RiskManager:
         is_opening: bool,
         stop_price: float | None = None,
         day_unrealized: float = 0.0,
+        equity_for_limits: float | None = None,
     ) -> RiskDecision:
         """Validate a prospective trade and return a sized decision.
 
@@ -94,6 +101,14 @@ class RiskManager:
         When supplied it is added to today's realized PnL for the daily-loss
         circuit breaker, so a large *unrealized* drawdown also halts new entries
         rather than letting losses compound until a stop fires.
+
+        ``equity_for_limits`` (optional) is the TOTAL account equity (free cash +
+        open-position value) used ONLY as the basis for the daily-loss limit.
+        Position *sizing* still uses ``equity`` (free cash available to deploy).
+        Separating them matters: as capital gets deployed the free cash shrinks,
+        so basing the loss limit on free cash would tighten the breaker the more
+        you trade and trip it far too early. Falls back to ``equity`` when not
+        supplied, preserving the old behaviour for callers that don't pass it.
         """
         if price <= 0:
             return RiskDecision(False, "Invalid price")
@@ -108,8 +123,11 @@ class RiskManager:
 
             # Daily loss limit (loss is negative pnl). Include open drawdown so
             # the breaker reflects TOTAL current risk, not just closed trades.
+            # The limit is a % of total account equity (see equity_for_limits),
+            # not the shrinking free-cash figure used for sizing.
             day_pnl = self.day_realized_pnl(db) + day_unrealized
-            loss_limit = -abs(equity * (self.settings.daily_loss_limit_pct / 100.0))
+            limit_basis = equity_for_limits if equity_for_limits is not None else equity
+            loss_limit = -abs(limit_basis * (self.settings.daily_loss_limit_pct / 100.0))
             if day_pnl <= loss_limit:
                 return RiskDecision(
                     False,

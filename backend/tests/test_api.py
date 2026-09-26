@@ -543,6 +543,7 @@ def test_normalize_order_defaults_amount_to_none():
         "symbol": "BTC/USDT",  # normalised upper-case
         "reason": "momentum",
         "amount": None,  # null => risk manager sizes it
+        "auto": False,  # no engine/autopilot off => confirm-gated
     }
 
 
@@ -612,6 +613,7 @@ def test_normalize_bot_and_train():
         "strategy": "ma_cross",
         "timeframe": "4h",
         "reason": None,
+        "auto": False,  # no engine/autopilot off => confirm-gated
     }
 
 
@@ -621,6 +623,65 @@ def test_normalize_garbage_is_none():
     assert _normalize_proposed_action(None, None) is None
     assert _normalize_proposed_action({"type": "nonsense"}, None) is None
     assert _normalize_proposed_action("not a dict", None) is None
+
+
+def test_normalize_alert():
+    from app.main import _normalize_proposed_action
+
+    a = _normalize_proposed_action(
+        {"type": "alert", "symbol": "btc/usdt", "condition": "Above", "price": "65000", "note": "watch"},
+        None,
+    )
+    assert a == {
+        "type": "alert",
+        "symbol": "BTC/USDT",  # upper-cased
+        "condition": "above",  # lower-cased
+        "price": 65000.0,  # coerced to float
+        "note": "watch",
+        "reason": None,
+        "auto": False,
+    }
+    # A bad condition, non-positive price, or symbol without a pair is refused.
+    assert _normalize_proposed_action({"type": "alert", "symbol": "BTC/USDT", "condition": "sideways", "price": 1}, None) is None
+    assert _normalize_proposed_action({"type": "alert", "symbol": "BTC/USDT", "condition": "above", "price": 0}, None) is None
+    assert _normalize_proposed_action({"type": "alert", "symbol": "BTC", "condition": "above", "price": 1}, None) is None
+
+
+class _AutopilotEngine:
+    """Minimal engine stub exposing just the settings the normalizer reads."""
+
+    class _S:
+        def __init__(self, autopilot, live):
+            self.ai_autopilot_enabled = autopilot
+            self.is_live = live
+
+    def __init__(self, autopilot=False, live=False):
+        self.settings = self._S(autopilot, live)
+
+
+def test_autopilot_flag_gates_live_orders_but_not_paper():
+    from app.main import _normalize_proposed_action
+
+    order = {"type": "order", "side": "buy", "symbol": "BTC/USDT"}
+
+    # Autopilot ON + paper: a paper order, a settings change, a bot toggle and an
+    # alert are all auto-applied (the safe subset).
+    eng = _AutopilotEngine(autopilot=True, live=False)
+    assert _normalize_proposed_action(order, eng)["auto"] is True
+    assert _normalize_proposed_action({"type": "settings", "changes": {"max_open_positions": 3}}, eng)["auto"] is True
+    assert _normalize_proposed_action({"type": "bot", "state": "start"}, eng)["auto"] is True
+    assert _normalize_proposed_action({"type": "alert", "symbol": "BTC/USDT", "condition": "above", "price": 65000}, eng)["auto"] is True
+
+    # Autopilot ON + LIVE: a real-money order is NEVER auto (always confirm-gated),
+    # even though non-money actions still are.
+    eng_live = _AutopilotEngine(autopilot=True, live=True)
+    assert _normalize_proposed_action(order, eng_live)["auto"] is False
+    assert _normalize_proposed_action({"type": "bot", "state": "start"}, eng_live)["auto"] is True
+
+    # Autopilot OFF: nothing is auto — every action waits for a manual Confirm.
+    eng_off = _AutopilotEngine(autopilot=False, live=False)
+    assert _normalize_proposed_action(order, eng_off)["auto"] is False
+    assert _normalize_proposed_action({"type": "settings", "changes": {"max_open_positions": 3}}, eng_off)["auto"] is False
 
 
 def _admin_engine():
@@ -660,6 +721,7 @@ def test_ai_chat_returns_validated_proposed_action(client, monkeypatch):
         "symbol": "BTC/USDT",
         "reason": "trend up",
         "amount": None,
+        "auto": False,  # paper account, autopilot off => confirm-gated
     }
 
 

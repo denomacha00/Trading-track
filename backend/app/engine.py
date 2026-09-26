@@ -90,6 +90,20 @@ class TradingEngine:
             stmt = stmt.where(Trade.user_id == self.user_id)
         return stmt
 
+    def _scope_book(self, stmt):
+        """Scope a Trade query to this engine's user AND its CURRENT trading mode.
+
+        Paper and live are SEPARATE books that coexist in the same table (``mode``
+        is stored per trade). Any query about the *current* book — open positions,
+        resting orders, this-mode equity/realized-PnL, the SL/TP monitor — must
+        exclude the other mode. Otherwise leftover open PAPER positions would
+        inflate live equity, count against live position/exposure limits, or (the
+        dangerous one) be handed to the live SL/TP monitor and closed with a REAL
+        exchange order. History/analytics that intentionally span modes (e.g. the
+        performance report) use :meth:`_scope` instead.
+        """
+        return self._scope(stmt).where(Trade.mode == self.settings.trading_mode)
+
     # ---- wiring ------------------------------------------------------
 
     def attach_broadcaster(self, broadcaster: Any, loop: asyncio.AbstractEventLoop) -> None:
@@ -135,7 +149,7 @@ class TradingEngine:
             return
         open_trades = list(
             db.scalars(
-                self._scope(
+                self._scope_book(
                     select(Trade).where(Trade.status == TradeStatus.open.value)
                 )
             ).all()
@@ -339,7 +353,7 @@ class TradingEngine:
 
     def _open_trade_for_symbol(self, db: Session, symbol: str) -> Optional[Trade]:
         # A resting (pending) limit order also occupies the symbol slot.
-        stmt = self._scope(
+        stmt = self._scope_book(
             select(Trade).where(
                 Trade.symbol == symbol,
                 Trade.status.in_(
@@ -357,7 +371,7 @@ class TradingEngine:
         preservation ("less loss") shouldn't wait for a stop to fire.
         """
         open_trades = db.scalars(
-            self._scope(select(Trade).where(Trade.status == TradeStatus.open.value))
+            self._scope_book(select(Trade).where(Trade.status == TradeStatus.open.value))
         ).all()
         total = 0.0
         for t in open_trades:
@@ -380,7 +394,7 @@ class TradingEngine:
         balance = self._equity(db)
         position_value = 0.0
         open_trades = db.scalars(
-            self._scope(select(Trade).where(Trade.status == TradeStatus.open.value))
+            self._scope_book(select(Trade).where(Trade.status == TradeStatus.open.value))
         ).all()
         for t in open_trades:
             try:
@@ -555,7 +569,7 @@ class TradingEngine:
     def _consecutive_losses(self, db: Session) -> int:
         """Count the current run of losing CLOSED trades (most recent first)."""
         rows = db.scalars(
-            self._scope(
+            self._scope_book(
                 select(Trade)
                 .where(Trade.status == TradeStatus.closed.value)
                 .order_by(Trade.closed_at.desc())
@@ -693,6 +707,7 @@ class TradingEngine:
                 is_opening=True,
                 stop_price=stop_loss,
                 day_unrealized=self._open_unrealized(db),
+                equity_for_limits=self._total_equity(db),
             )
             if not decision.allowed:
                 return False, f"Rejected by risk manager: {decision.reason}", None
@@ -1006,6 +1021,7 @@ class TradingEngine:
                 db, equity=equity, price=price, requested_amount=amount,
                 is_opening=True, stop_price=stop_loss,
                 day_unrealized=self._open_unrealized(db),
+                equity_for_limits=self._total_equity(db),
             )
             if not decision.allowed:
                 return False, f"Rejected by risk manager: {decision.reason}", []
@@ -1074,7 +1090,7 @@ class TradingEngine:
         with self._lock:
             rows = list(
                 db.scalars(
-                    self._scope(
+                    self._scope_book(
                         select(Trade).where(
                             Trade.symbol == symbol,
                             Trade.status.in_(
@@ -1196,7 +1212,7 @@ class TradingEngine:
         closed/filled, using the exchange's average fill price.
         """
         filled: list[Trade] = []
-        stmt = self._scope(select(Trade).where(Trade.status == TradeStatus.pending.value))
+        stmt = self._scope_book(select(Trade).where(Trade.status == TradeStatus.pending.value))
         for trade in list(db.scalars(stmt).all()):
             limit = trade.limit_price or trade.entry_price
             filled_amt: float | None = None  # live: exchange-reported fill qty
@@ -1304,6 +1320,41 @@ class TradingEngine:
         )
         return True, f"Closed {trade.symbol} @ {price:.2f} (PnL {pnl:.2f})", trade
 
+    def close_by_id(
+        self, db: Session, trade_id: int
+    ) -> tuple[bool, str, Optional[Trade]]:
+        """Close (or cancel) ONE specific trade by id — the exact row the operator
+        asked for, never "some open trade for this symbol".
+
+        Closing by symbol via :meth:`execute_signal` is ambiguous when a symbol
+        holds several legs (a DCA ladder): it closes whichever row the query
+        returns first, which may not be the one the user clicked. This targets the
+        precise trade and enforces book isolation — a trade from the OTHER book
+        (paper while the bot is live, or the reverse) is refused rather than
+        closed with a real exchange order against the wrong book.
+        """
+        with self._lock:
+            trade = db.get(Trade, trade_id)
+            if trade is None or (
+                self.user_id is not None and trade.user_id != self.user_id
+            ):
+                return False, "Trade not found.", None
+            if trade.status not in (
+                TradeStatus.open.value,
+                TradeStatus.pending.value,
+            ):
+                return False, "That trade is not open or pending.", None
+            if (trade.mode or "paper") != self.settings.trading_mode:
+                return (
+                    False,
+                    f"That is a {trade.mode} position but the bot is in "
+                    f"{self.settings.trading_mode} mode — switch modes to close it.",
+                    None,
+                )
+            if trade.status == TradeStatus.pending.value:
+                return self._cancel_pending(db, trade, "manual cancel")
+            return self._close_trade(db, trade, "manual close")
+
     def _realized_pnl(self, trade: Trade, exit_price: float) -> float:
         if trade.side == "buy":
             gross = (exit_price - trade.entry_price) * trade.amount
@@ -1332,7 +1383,7 @@ class TradingEngine:
     def check_open_positions(self, db: Session) -> list[tuple[Trade, str]]:
         """Check SL/TP for all open trades and close those that hit. Returns closed."""
         closed: list[tuple[Trade, str]] = []
-        stmt = self._scope(select(Trade).where(Trade.status == TradeStatus.open.value))
+        stmt = self._scope_book(select(Trade).where(Trade.status == TradeStatus.open.value))
         for trade in list(db.scalars(stmt).all()):
             try:
                 # Fetch WITHOUT a fallback: during a real data outage we must NOT
@@ -1612,7 +1663,7 @@ class TradingEngine:
     def status(self, db: Session) -> dict[str, Any]:
         open_trades = list(
             db.scalars(
-                self._scope(
+                self._scope_book(
                     select(Trade).where(Trade.status == TradeStatus.open.value)
                 )
             ).all()
@@ -1637,7 +1688,7 @@ class TradingEngine:
             sum(
                 t.pnl
                 for t in db.scalars(
-                    self._scope(
+                    self._scope_book(
                         select(Trade).where(Trade.status == TradeStatus.closed.value)
                     )
                 ).all()

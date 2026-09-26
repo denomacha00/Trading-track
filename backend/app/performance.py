@@ -59,8 +59,8 @@ def _summarize(trades: list[Any]) -> dict[str, Any]:
         "avg_win": round(gross_profit / len(wins), 8) if wins else 0.0,
         "avg_loss": round(-gross_loss / len(losses), 8) if losses else 0.0,
         "expectancy": round(total_pnl / n, 8) if n else 0.0,
-        "largest_win": round(max(pnls), 8) if pnls else 0.0,
-        "largest_loss": round(min(pnls), 8) if pnls else 0.0,
+        "largest_win": round(max(wins), 8) if wins else 0.0,
+        "largest_loss": round(min(losses), 8) if losses else 0.0,
         "max_drawdown": round(_max_drawdown(pnls), 8),
     }
 
