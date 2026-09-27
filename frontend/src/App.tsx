@@ -240,6 +240,12 @@ function Dashboard({
   const [chartView, setChartView] = useState<'bot' | 'tv'>(
     () => (localStorage.getItem('tt.chartView') === 'tv' ? 'tv' : 'bot'),
   )
+  // Chart size mode: normal, maximized (fixed full-screen overlay for close
+  // analysis on phone or PC — the canvas simply re-fits the bigger box, so it
+  // stays pixel-crisp, no image upscaling), or minimized (collapse the chart body
+  // to just its header so the panels below come into view). Mutually exclusive.
+  const [chartMax, setChartMax] = useState(false)
+  const [chartMin, setChartMin] = useState(false)
   // Which price-overlay indicators are switched on, loaded from localStorage so
   // the choice sticks (like a saved TradingView layout). All real math on the
   // bot chart's own candles.
@@ -460,6 +466,26 @@ function Dashboard({
   const liveBinance = !!access && !access.testnet && (access.exchange ?? 'binance') === 'binance'
   const stream = useBinanceStream(symbol, timeframe, liveBinance)
   const [menuOpen, setMenuOpen] = useState(false)
+  // Ref to the tabbed content column. On phones the two-column layout collapses
+  // into a single stack (stats + chart on top, the tabbed panel below), so
+  // picking a view from the hamburger drawer used to switch the tab correctly
+  // but leave you scrolled at the top — the new panel sat off-screen and it read
+  // as "tapping Settings did nothing". `navigate` brings it into view.
+  const contentRef = useRef<HTMLDivElement>(null)
+  const navigate = useCallback((key: TabKey) => {
+    setTab(key)
+    setMenuOpen(false)
+    // Only scroll when the layout is actually stacked (the tab strip is hidden
+    // ≤900px, the drawer is the nav). On desktop both columns are side-by-side,
+    // so a jump would be jarring and pointless.
+    if (typeof window !== 'undefined' && window.matchMedia('(max-width: 900px)').matches) {
+      // Defer a frame so the tab has switched and the drawer-close doesn't fight
+      // the scroll.
+      requestAnimationFrame(() => {
+        contentRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      })
+    }
+  }, [])
   // Global connection status (shown in the slim bar under the header on every
   // tab): the built-in AI provider's real reachability + the exchange access.
   const [aiHealth, setAiHealth] = useState<AiHealth | null>(null)
@@ -525,6 +551,17 @@ function Dashboard({
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [menuOpen])
+
+  // Escape leaves the maximized (full-screen) chart, like any overlay. Only bound
+  // while maximized so it never swallows Escape elsewhere.
+  useEffect(() => {
+    if (!chartMax) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setChartMax(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [chartMax])
 
   const refreshTrades = useCallback(async () => {
     try {
@@ -1053,10 +1090,7 @@ function Dashboard({
             <button
               key={n.key}
               className={`drawer-item ${tab === n.key ? 'active' : ''}`}
-              onClick={() => {
-                setTab(n.key)
-                setMenuOpen(false)
-              }}
+              onClick={() => navigate(n.key)}
               type="button"
             >
               <span className="drawer-ico">{n.icon}</span>
@@ -1157,7 +1191,9 @@ function Dashboard({
             onError={(m) => showToast('error', m)}
           />
 
-          <section className="panel">
+          <section
+            className={`panel chart-panel${chartMax ? ' chart-max' : ''}${chartMin ? ' chart-min' : ''}`}
+          >
             <div className="panel-head">
               <div className="price-ticker">
                 <span>Price</span>
@@ -1261,6 +1297,35 @@ function Dashboard({
                     title="The full TradingView chart: every drawing tool and indicator (live market data)"
                   >
                     TradingView
+                  </button>
+                </div>
+                {/* Size controls: minimize (collapse to the header so the panels
+                    below come into view) and maximize (a full-screen overlay for
+                    close analysis on phone or PC). Mutually exclusive. */}
+                <div className="chart-view-toggle" role="group" aria-label="Chart size">
+                  <button
+                    type="button"
+                    className={`cvt-btn${chartMin ? ' active' : ''}`}
+                    aria-pressed={chartMin}
+                    onClick={() => {
+                      setChartMin((v) => !v)
+                      setChartMax(false)
+                    }}
+                    title={chartMin ? 'Restore the chart' : 'Minimize the chart'}
+                  >
+                    {chartMin ? '▢' : '—'}
+                  </button>
+                  <button
+                    type="button"
+                    className={`cvt-btn${chartMax ? ' active' : ''}`}
+                    aria-pressed={chartMax}
+                    onClick={() => {
+                      setChartMax((v) => !v)
+                      setChartMin(false)
+                    }}
+                    title={chartMax ? 'Exit full screen (Esc)' : 'Full screen for analysis'}
+                  >
+                    {chartMax ? '✕' : '⛶'}
                   </button>
                 </div>
               </div>
@@ -1472,7 +1537,7 @@ function Dashboard({
           </section>
         </div>
 
-        <div className="col">
+        <div className="col" ref={contentRef}>
           <section className="panel">
             <div className="panel-head">
               <div className="tabs">
@@ -1568,7 +1633,7 @@ function Dashboard({
                   onReadAloudChange={setReadAloud}
                   ttsSupported={ttsSupported}
                   speak={speak}
-                  onNavigate={setTab}
+                  onNavigate={navigate}
                   onChartControl={applyChartControl}
                   onError={(m) => showToast('error', m)}
                 />

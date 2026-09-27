@@ -474,6 +474,40 @@ th.mono {
   width: 100%;
 }
 
+/* Chart size modes (the ⛶ / — controls in the chart header). Maximize is a
+   full-screen fixed overlay, so the same crisp canvas simply re-fits a bigger
+   box (no image upscaling — it stays pixel-sharp for close analysis). Minimize
+   collapses the body to just the header so the panels below come into view. */
+.chart-panel.chart-max {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 100vh;
+  height: 100dvh;
+  z-index: 1000;
+  margin: 0;
+  border-radius: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+.chart-panel.chart-max .panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.chart-panel.chart-max .chart-wrap {
+  /* Grow past the inline pixel height to fill the overlay: flex-basis keeps the
+     inline height, flex-grow claims the remaining space; the canvas autoSizes. */
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.chart-panel.chart-min .panel-body {
+  display: none;
+}
+
 /* Oscillator sub-pane (RSI / MACD): a fixed-height slot stacked under price,
    holding its own synced chart plus a floating value read-out. Hidden (not
    unmounted) when its indicator is off, so the chart is only ever built in a
