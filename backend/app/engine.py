@@ -1479,8 +1479,13 @@ class TradingEngine:
                     order, trade.symbol, fill_price, trade.side, trade.amount
                 )
             else:
+                # PAPER fill: only when the market REALLY trades through our limit.
+                # Fetch WITHOUT a fallback — `_price(fallback=limit)` would hand back
+                # the limit itself during a feed outage, trivially "crossing" it and
+                # filling every resting order at its own price on dead data. On any
+                # failure skip this tick and re-check once the feed is back.
                 try:
-                    price = self._price(trade.symbol, fallback=limit)
+                    price = self._price(trade.symbol)
                 except Exception:
                     continue
                 crossed = (
@@ -1853,34 +1858,85 @@ class TradingEngine:
                     closed.append((trade, hit))
         return closed
 
+    def _move_exchange_stop(self, trade: Trade, new_stop: float) -> None:
+        """Move the LIVE exchange-side protective stop to ``new_stop`` for the
+        full held quantity. Caller holds the lock and has confirmed the trade is
+        still open. No-op in paper mode.
+
+        On spot the resting stop reserves the base asset, so a replacement can't
+        be placed until the old one is cancelled — we cancel first, then create,
+        and keep that brief window honest and crash-proof:
+          • can't cancel the old stop → leave it in place (still protective at the
+            old level) and bail, rather than stack a second the venue would reject
+            for the now-reserved base;
+          • cancelled but can't re-place → drop the id and tell the operator the
+            exchange stop is off (the in-process stop still enforces the level
+            while the bot runs).
+        The caller always updates ``trade.stop_loss`` first, so the new level is
+        enforced in-process regardless of the exchange outcome.
+        """
+        if not self.settings.is_live:
+            return
+        side = "sell" if trade.side == "buy" else "buy"
+        old = trade.stop_order_id
+        if old:
+            try:
+                self.connector.cancel_order(old, trade.symbol)
+            except Exception as exc:
+                self._emit(
+                    "stop_move_failed",
+                    {"id": trade.id, "stage": "cancel", "error": str(exc)},
+                )
+                return
+            trade.stop_order_id = None
+        try:
+            placed = self.connector.create_stop_loss_order(
+                trade.symbol, side, trade.amount, new_stop
+            )
+        except Exception as exc:
+            placed = None
+            self._emit(
+                "stop_move_failed",
+                {"id": trade.id, "stage": "place", "error": str(exc)},
+            )
+        if placed:
+            trade.stop_order_id = str(placed.get("id"))
+        else:
+            self._notify(
+                f"⚠️ {trade.symbol}: couldn't move the exchange stop-loss. The "
+                f"in-app stop at {new_stop:g} is still active while the bot runs, "
+                f"but the exchange-side safety net is off — check your API keys "
+                f"and that the market allows stop orders."
+            )
+
     def _maybe_trail_stop(self, db: Session, trade: Trade, price: float) -> None:
         """Ratchet a long position's stop-loss upward as price rises.
 
         Only tightens (raises) the stop, never loosens it, and only for longs.
-        Disabled when trailing_stop_pct is 0.
+        Disabled when trailing_stop_pct is 0. The mutation and any exchange-side
+        stop move run UNDER THE LOCK after re-reading the row, so a close racing
+        on another session can't leave an orphaned resting stop on the venue.
         """
         pct = self.settings.trailing_stop_pct
         if pct <= 0 or trade.side != "buy":
             return
         candidate = price * (1 - pct / 100.0)
-        # Only raise the stop, and never above the current price.
-        if candidate < price and (trade.stop_loss is None or candidate > trade.stop_loss):
+        # Cheap pre-check on the (possibly stale) row; re-verified under the lock.
+        if not (candidate < price and (trade.stop_loss is None or candidate > trade.stop_loss)):
+            return
+        with self._lock:
+            db.refresh(trade)
+            if trade.status != TradeStatus.open.value:
+                return  # closed underneath us — never place a stop for it
+            if trade.stop_loss is not None and candidate <= float(trade.stop_loss):
+                return  # already trailed at least this far
             trade.stop_loss = candidate
-            # Live: move the exchange-side stop order too (cancel + replace).
-            if self.settings.is_live and trade.side == "buy":
-                if trade.stop_order_id:
-                    self.connector.cancel_order(trade.stop_order_id, trade.symbol)
-                    trade.stop_order_id = None
-                new_stop = self.connector.create_stop_loss_order(
-                    trade.symbol, "sell", trade.amount, candidate
-                )
-                if new_stop:
-                    trade.stop_order_id = str(new_stop.get("id"))
+            self._move_exchange_stop(trade, candidate)
             db.commit()
-            self._emit(
-                "stop_trailed",
-                {"id": trade.id, "symbol": trade.symbol, "stop_loss": candidate},
-            )
+        self._emit(
+            "stop_trailed",
+            {"id": trade.id, "symbol": trade.symbol, "stop_loss": candidate},
+        )
 
     def _round_trip_fee_pct(self) -> float:
         """Approximate round-trip cost (%) of a trade: taker fee on entry + exit.
@@ -1934,17 +1990,15 @@ class TradingEngine:
             return
         if trade.stop_loss is not None and candidate <= float(trade.stop_loss):
             return  # existing stop is already at least this protective
-        trade.stop_loss = candidate
-        if self.settings.is_live:
-            if trade.stop_order_id:
-                self.connector.cancel_order(trade.stop_order_id, trade.symbol)
-                trade.stop_order_id = None
-            new_stop = self.connector.create_stop_loss_order(
-                trade.symbol, "sell", trade.amount, candidate
-            )
-            if new_stop:
-                trade.stop_order_id = str(new_stop.get("id"))
-        db.commit()
+        with self._lock:
+            db.refresh(trade)
+            if trade.status != TradeStatus.open.value:
+                return  # closed underneath us — never place a stop for it
+            if trade.stop_loss is not None and candidate <= float(trade.stop_loss):
+                return
+            trade.stop_loss = candidate
+            self._move_exchange_stop(trade, candidate)
+            db.commit()
         self._emit(
             "profit_locked",
             {"id": trade.id, "symbol": trade.symbol, "stop_loss": candidate,
