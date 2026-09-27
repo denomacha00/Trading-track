@@ -319,6 +319,98 @@ def test_consecutive_loss_breaker_blocks_autonomous_buy(db):
     assert "circuit breaker" in msg.lower()
 
 
+# ---- unattended (webhook) entries get the same discretionary gates --
+# The autonomous loop already applies these; the audit found the webhook path
+# bypassed them. execute_signal now enforces the re-entry cooldown + streak
+# breaker (and, for a webhook, a FRESH bear-regime pause) on UNATTENDED sources
+# ("auto"/"tradingview"), while a deliberate MANUAL order stays exempt — it is a
+# human acting by hand and remains bounded by the hard risk gates.
+
+def test_webhook_buy_respects_reentry_cooldown(db):
+    conn = FakeConnector(price=100.0)
+    eng = _engine(conn, reentry_cooldown_minutes=15.0)
+    eng._last_loss_exit["BTC/USDT"] = _utcnow()  # just took a loss here
+    ok, msg, trade = eng.execute_signal(
+        db, action="buy", symbol="BTC/USDT", amount=1.0,
+        stop_loss=None, take_profit=None, source="tradingview",
+    )
+    assert ok is False
+    assert trade is None
+    assert "cooldown" in msg.lower()
+
+
+def test_webhook_buy_respects_consecutive_loss_breaker(db):
+    conn = FakeConnector(price=100.0)
+    eng = _engine(conn, max_consecutive_losses=2)
+    base = _utcnow()
+    _add_closed(db, "ETH/USDT", -5.0, base - dt.timedelta(minutes=2))
+    _add_closed(db, "ETH/USDT", -5.0, base - dt.timedelta(minutes=1))
+    ok, msg, trade = eng.execute_signal(
+        db, action="buy", symbol="SOL/USDT", amount=1.0,
+        stop_loss=None, take_profit=None, source="tradingview",
+    )
+    assert ok is False
+    assert trade is None
+    assert "circuit breaker" in msg.lower()
+def test_webhook_buy_paused_in_fresh_bear_regime(db):
+    conn = FakeConnector(price=100.0)
+    eng = _engine(conn, auto_pause_in_bear=True)
+    eng._last_regime["BTC/USDT"] = {
+        "regime": "bear", "detail": "price below a falling EMA200",
+        "protective_hold": False, "entries_paused": True,
+        "verdict": "sell", "at": _utcnow().isoformat(),
+    }
+    ok, msg, trade = eng.execute_signal(
+        db, action="buy", symbol="BTC/USDT", amount=1.0,
+        stop_loss=None, take_profit=None, source="tradingview",
+    )
+    assert ok is False
+    assert trade is None
+    assert "regime" in msg.lower()
+
+
+def test_webhook_buy_ignores_stale_bear_regime(db):
+    # A regime read older than the freshness window means the bot isn't watching
+    # this symbol now — never block a webhook long on a stale reading (that would
+    # be acting on data we no longer have).
+    conn = FakeConnector(price=100.0)
+    eng = _engine(conn, auto_pause_in_bear=True)
+    eng._last_regime["BTC/USDT"] = {
+        "regime": "bear", "detail": "old read",
+        "protective_hold": False, "entries_paused": True,
+        "verdict": "sell",
+        "at": (_utcnow() - dt.timedelta(minutes=20)).isoformat(),
+    }
+    ok, msg, trade = eng.execute_signal(
+        db, action="buy", symbol="BTC/USDT", amount=1.0,
+        stop_loss=None, take_profit=None, source="tradingview",
+    )
+    assert ok, msg
+    assert trade is not None
+    assert trade.status == TradeStatus.open.value
+def test_manual_buy_is_exempt_from_discretionary_gates(db):
+    # A deliberate human order is NOT blocked by the cooldown / streak / regime
+    # pauses (it stays bounded by the hard risk gates). Stack ALL three against
+    # it and confirm the manual buy still opens.
+    conn = FakeConnector(price=100.0)
+    eng = _engine(conn, reentry_cooldown_minutes=15.0,
+                  max_consecutive_losses=2, auto_pause_in_bear=True)
+    base = _utcnow()
+    _add_closed(db, "BTC/USDT", -5.0, base - dt.timedelta(minutes=2))
+    _add_closed(db, "BTC/USDT", -5.0, base - dt.timedelta(minutes=1))
+    eng._last_loss_exit["BTC/USDT"] = _utcnow()
+    eng._last_regime["BTC/USDT"] = {
+        "regime": "bear", "detail": "", "protective_hold": False,
+        "entries_paused": True, "verdict": "sell", "at": _utcnow().isoformat(),
+    }
+    ok, msg, trade = eng.execute_signal(
+        db, action="buy", symbol="BTC/USDT", amount=1.0,
+        stop_loss=None, take_profit=None, source="manual",
+    )
+    assert ok, msg
+    assert trade is not None
+    assert trade.status == TradeStatus.open.value
+
 # ---- stopped bot still manages open positions (#3) ------------------
 
 def test_stopped_bot_still_runs_stop_loss(db):

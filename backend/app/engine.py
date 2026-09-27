@@ -826,6 +826,77 @@ class TradingEngine:
             "— skipping entry to avoid a bad fill"
         )
 
+    # How recent a regime snapshot must be to gate a webhook long. Snapshots are
+    # refreshed every monitor tick (~seconds) while the bot watches a symbol, so
+    # a reading older than this means the bot ISN'T currently watching it — we
+    # then decline to block on a stale read rather than invent a current one.
+    _REGIME_FRESH_SECONDS = 600.0
+
+    def _entry_guards(
+        self, db: Session, symbol: str, *, check_regime: bool = False
+    ) -> tuple[bool, str]:
+        """Discretionary "should we open NEW risk right now?" gates for UNATTENDED
+        entries (the autonomous loop and TradingView webhooks). Returns
+        ``(ok, reason)``.
+
+        These sit alongside — never replace — the hard risk gates (drawdown
+        kill-switch, position/exposure caps, daily-loss limit, spread, live
+        read-only), which apply to every order including manual ones. A manual
+        order is a human acting deliberately, so it is NOT subject to these
+        anti-whipsaw / streak / regime pauses; an unattended entry is, so a
+        webhook that fires repeatedly into a losing streak or a bear market is
+        gated exactly like the bot's own decisions. Cheap and deterministic: no
+        network I/O and nothing fabricated — when a reading is unavailable the
+        gate stands aside rather than block on invented data. ``check_regime``
+        is opt-in because the autonomous path already applies the bear-regime
+        pause at analysis time and only needs the cooldown/streak checks here.
+        """
+        sym = symbol.upper().strip()
+        # Anti-whipsaw: honour the re-entry cooldown after a losing exit on this
+        # symbol so we don't buy straight back into the chop that stopped us out.
+        cooldown = self._reentry_cooldown_remaining(sym)
+        if cooldown > 0:
+            return (
+                False,
+                f"{symbol}: re-entry cooldown ({cooldown / 60:.1f} min left "
+                "after a losing exit)",
+            )
+        # Consecutive-loss circuit breaker: stop opening new risk after a losing
+        # streak until a win breaks it.
+        max_streak = getattr(self.settings, "max_consecutive_losses", 0) or 0
+        if max_streak > 0:
+            streak = self._consecutive_losses(db)
+            if streak >= max_streak:
+                return (
+                    False,
+                    f"{symbol}: paused after {streak} consecutive losses "
+                    "(circuit breaker)",
+                )
+        # Bear-regime pause (opt-in via auto_pause_in_bear). Acts ONLY on a real,
+        # recent regime reading captured by the monitor loop — never a fabricated
+        # or stale one, so it can't block on a market read the bot doesn't have.
+        if check_regime and getattr(self.settings, "auto_pause_in_bear", True):
+            snap = self._last_regime.get(sym)
+            if snap and snap.get("entries_paused"):
+                at = snap.get("at")
+                fresh = False
+                if at:
+                    try:
+                        age = (_utcnow() - dt.datetime.fromisoformat(at)).total_seconds()
+                        fresh = 0 <= age <= self._REGIME_FRESH_SECONDS
+                    except Exception:
+                        fresh = False
+                if fresh:
+                    detail = (snap.get("detail") or "").strip()
+                    reason = (
+                        f"{symbol}: new longs paused — "
+                        f"{snap.get('regime', 'bear')} regime"
+                    )
+                    if detail:
+                        reason += f" ({detail})"
+                    return False, reason
+        return True, ""
+
     # ---- core execution ---------------------------------------------
 
     def execute_signal(
@@ -902,6 +973,22 @@ class TradingEngine:
                     "(no open long to close).",
                     None,
                 )
+            # Discretionary anti-runaway gates for UNATTENDED entries: an
+            # autonomous decision or a TradingView webhook must respect the
+            # re-entry cooldown, the consecutive-loss circuit breaker and (webhook)
+            # the bear-regime pause — the same protections the bot applies to its
+            # own trades, so an alert firing repeatedly into a losing streak or a
+            # falling market is stood aside. A manual order is a deliberate human
+            # action and is exempt here (it stays bounded by the hard risk gates
+            # above and the risk manager below). The autonomous path already
+            # applied the regime pause at analysis time, so only the webhook needs
+            # the (cached, freshness-checked) regime read.
+            if source in {"auto", "tradingview"}:
+                ok_guard, guard_reason = self._entry_guards(
+                    db, symbol, check_regime=(source == "tradingview")
+                )
+                if not ok_guard:
+                    return False, guard_reason, None
             price = self._price(symbol)
             # For a limit order, size and validate against the LIMIT price (the
             # intended fill), not the current market price.
@@ -2210,27 +2297,13 @@ class TradingEngine:
         if analysis.verdict == "buy":
             if existing:
                 return False, f"{symbol}: already long"
-            _sym = symbol.upper()
-            # Anti-whipsaw: honour the re-entry cooldown after a losing exit on
-            # this symbol so the bot doesn't buy straight back into a chop.
-            cooldown = self._reentry_cooldown_remaining(_sym)
-            if cooldown > 0:
-                return (
-                    False,
-                    f"{symbol}: re-entry cooldown ({cooldown / 60:.1f} min left "
-                    "after a losing exit)",
-                )
-            # Consecutive-loss circuit breaker: stop opening new autonomous risk
-            # after a losing streak until a win breaks it.
-            max_streak = getattr(self.settings, "max_consecutive_losses", 0) or 0
-            if max_streak > 0:
-                streak = self._consecutive_losses(db)
-                if streak >= max_streak:
-                    return (
-                        False,
-                        f"{symbol}: paused after {streak} consecutive losses "
-                        "(circuit breaker)",
-                    )
+            # Anti-whipsaw re-entry cooldown + consecutive-loss circuit breaker.
+            # The bear-regime pause was already applied at analysis time (a
+            # bear-regime BUY is turned to HOLD upstream), so it isn't re-checked
+            # here. execute_signal enforces the same gates for webhook entries.
+            ok_guard, guard_reason = self._entry_guards(db, symbol)
+            if not ok_guard:
+                return False, guard_reason
             # Permission-gated AI review of the ENTRY. Risk-first and veto-only:
             # it can BLOCK new risk but never invent a trade, and if the AI is
             # unavailable it falls back to the deterministic decision. Governed by
