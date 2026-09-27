@@ -41,9 +41,13 @@ class TrainingCandidate:
     num_trades: int
     score: float
     # Out-of-sample (validation) performance, when a holdout split is used.
-    # None means the candidate was evaluated on the full dataset only.
+    # None means the candidate was evaluated on the full dataset only. All four
+    # OOS figures are captured together so the auto-trade gate can judge a saved
+    # strategy on its held-out behaviour, never the optimistic in-sample fit.
     validation_return_pct: float | None = None
     validation_num_trades: int | None = None
+    validation_win_rate_pct: float | None = None
+    validation_max_drawdown_pct: float | None = None
     overfit_gap_pct: float | None = None
 
 
@@ -179,6 +183,8 @@ def train(
             )
             candidate.validation_return_pct = round(v.total_return_pct, 2)
             candidate.validation_num_trades = v.num_trades
+            candidate.validation_win_rate_pct = round(v.win_rate_pct, 2)
+            candidate.validation_max_drawdown_pct = round(v.max_drawdown_pct, 2)
             candidate.overfit_gap_pct = round(
                 result.total_return_pct - v.total_return_pct, 2
             )

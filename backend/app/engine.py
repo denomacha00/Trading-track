@@ -277,33 +277,38 @@ class TradingEngine:
     def _validate_saved_strategy(self, cfg: dict) -> tuple[bool, str, dict]:
         """Judge whether a saved strategy has earned the right to drive new BUYS.
 
-        Uses ONLY the real metrics recorded when the strategy was trained/backtested
-        — out-of-sample validation return, win rate, trade count, drawdown — against
-        the operator's thresholds. Returns ``(ok, reason, detail)``. It never invents
-        a number: if the metrics are missing (or lack an out-of-sample split) the
-        gate fails CLOSED with a clear reason, because an unproven strategy has not
+        Judges the strategy on its OUT-OF-SAMPLE (holdout) behaviour — return,
+        win rate, trade count AND drawdown are all read from the validation run,
+        never the optimistic in-sample fit. Returns ``(ok, reason, detail)``. It
+        never invents or substitutes a number: if the metrics are missing, lack
+        an out-of-sample split, or an ENABLED check has no out-of-sample figure
+        recorded (e.g. a strategy saved before OOS metrics were captured), the
+        gate fails CLOSED asking for a retrain — an unproven strategy has not
         earned real money's trust. This is the honest stand-in for "make it 95%
-        correct": we can't promise accuracy, but we can refuse to auto-trade a
-        strategy that hasn't demonstrated a positive, out-of-sample edge.
+        correct": we can't promise accuracy, but we refuse to auto-trade a
+        strategy that hasn't shown a positive, out-of-sample edge.
         """
         metrics = (cfg or {}).get("metrics")
         if not isinstance(metrics, dict) or not metrics:
             return False, "no backtest metrics yet — retrain to validate", {}
         s = self.settings
-        oos = metrics.get("validation_return_pct")
-        in_sample_only = oos is None
+        oos_return = metrics.get("validation_return_pct")
+        in_sample_only = oos_return is None
+        # Out-of-sample figures: present only when a holdout split ran on a build
+        # that persists them. Missing => unknown, NEVER the rosier in-sample value.
+        oos_win_rate = metrics.get("validation_win_rate_pct")
+        oos_num_trades = metrics.get("validation_num_trades")
+        oos_drawdown = metrics.get("validation_max_drawdown_pct")
         return_pct = float(
-            oos if oos is not None else (metrics.get("total_return_pct", 0.0) or 0.0)
+            oos_return if oos_return is not None
+            else (metrics.get("total_return_pct", 0.0) or 0.0)
         )
-        win_rate = float(metrics.get("win_rate_pct", 0.0) or 0.0)
-        num_trades = int(metrics.get("num_trades", 0) or 0)
-        drawdown = float(metrics.get("max_drawdown_pct", 0.0) or 0.0)
         detail = {
             "return_pct": round(return_pct, 2),
             "return_basis": "in-sample only" if in_sample_only else "out-of-sample",
-            "win_rate_pct": round(win_rate, 2),
-            "num_trades": num_trades,
-            "max_drawdown_pct": round(drawdown, 2),
+            "win_rate_pct": round(oos_win_rate, 2) if oos_win_rate is not None else None,
+            "num_trades": oos_num_trades,
+            "max_drawdown_pct": round(oos_drawdown, 2) if oos_drawdown is not None else None,
             "overfit_gap_pct": metrics.get("overfit_gap_pct"),
         }
         fails: list[str] = []
@@ -312,18 +317,49 @@ class TradingEngine:
             basis = "in-sample " if in_sample_only else "out-of-sample "
             fails.append(f"{basis}return {return_pct:+.1f}% ≤ required {min_return:.1f}%")
         min_trades = getattr(s, "strategy_min_trades", 0) or 0
-        if num_trades < min_trades:
-            fails.append(f"only {num_trades} trades (need ≥ {min_trades})")
+        if min_trades > 0:
+            if oos_num_trades is None:
+                fails.append("no out-of-sample trade count (retrain to validate)")
+            elif int(oos_num_trades) < min_trades:
+                fails.append(
+                    f"only {int(oos_num_trades)} out-of-sample trades "
+                    f"(need ≥ {min_trades})"
+                )
         min_wr = getattr(s, "strategy_min_win_rate_pct", 0.0) or 0.0
-        if min_wr > 0 and win_rate < min_wr:
-            fails.append(f"win rate {win_rate:.0f}% < required {min_wr:.0f}%")
+        if min_wr > 0:
+            if oos_win_rate is None:
+                fails.append("no out-of-sample win rate (retrain to validate)")
+            elif float(oos_win_rate) < min_wr:
+                fails.append(
+                    f"out-of-sample win rate {float(oos_win_rate):.0f}% "
+                    f"< required {min_wr:.0f}%"
+                )
         max_dd = getattr(s, "strategy_max_drawdown_pct", 0.0) or 0.0
-        if max_dd > 0 and drawdown > max_dd:
-            fails.append(f"drawdown {drawdown:.0f}% > allowed {max_dd:.0f}%")
+        if max_dd > 0:
+            if oos_drawdown is None:
+                fails.append("no out-of-sample drawdown (retrain to validate)")
+            elif float(oos_drawdown) > max_dd:
+                fails.append(
+                    f"out-of-sample drawdown {float(oos_drawdown):.0f}% "
+                    f"> allowed {max_dd:.0f}%"
+                )
         if in_sample_only:
             fails.append("no out-of-sample validation (retrain to produce one)")
         ok = not fails
         return ok, ("validated" if ok else "; ".join(fails)), detail
+
+    def _strategy_signal_confidence(self, cfg: dict, analysis) -> float:
+        """An HONEST confidence for a saved-strategy verdict.
+
+        A strategy firing is a deterministic rule trigger, not a probability, so
+        we never stamp it 100%. Prefer the strategy's REAL out-of-sample win rate
+        (the share of held-out trades that won); if that wasn't recorded, keep the
+        analyzer's own computed confidence. Never a fabricated 1.0.
+        """
+        wr = ((cfg or {}).get("metrics") or {}).get("validation_win_rate_pct")
+        if isinstance(wr, (int, float)):
+            return max(0.0, min(1.0, float(wr) / 100.0))
+        return max(0.0, min(1.0, float(getattr(analysis, "confidence", 0.0) or 0.0)))
 
     def _apply_saved_strategy(self, symbol: str, df, analysis):
         """Let the user's SAVED strategy own the verdict when they've opted in.
@@ -370,10 +406,10 @@ class TradingEngine:
                     )
                     return analysis
             analysis.verdict = "buy"
-            analysis.confidence = 1.0
+            analysis.confidence = self._strategy_signal_confidence(cfg, analysis)
         elif action == "sell":
             analysis.verdict = "sell"
-            analysis.confidence = 1.0
+            analysis.confidence = self._strategy_signal_confidence(cfg, analysis)
         else:
             analysis.verdict = "hold"
         analysis.summary = f"{label} → {action.upper()}" + (f": {reason}" if reason else "")

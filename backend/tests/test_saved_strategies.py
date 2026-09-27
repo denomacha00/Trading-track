@@ -135,13 +135,18 @@ def test_restore_state_loads_saved_strategies(db):
 
 def test_saved_buy_taken_in_bull_regime(db, monkeypatch):
     eng = _engine(use_saved_strategy=True)
-    eng.strategy_configs["BTC/USDT"] = {"strategy": "ma_cross", "params": {}}
+    eng.strategy_configs["BTC/USDT"] = {
+        "strategy": "ma_cross", "params": {},
+        "metrics": {"validation_win_rate_pct": 58.0},
+    }
     _stub(monkeypatch, "buy")
     analysis = MarketAnalyzer().analyze(_UP, "BTC/USDT")
     assert eng._bear_regime(analysis) is False
     out = eng._apply_saved_strategy("BTC/USDT", _UP, analysis)
     assert out.verdict == "buy"
-    assert out.confidence == 1.0
+    # Honest confidence = the strategy's REAL out-of-sample win rate (58%), never
+    # a fabricated 100%.
+    assert out.confidence == pytest.approx(0.58)
 
 
 def test_saved_buy_suppressed_in_bear_regime(db, monkeypatch):
@@ -159,12 +164,15 @@ def test_saved_buy_suppressed_in_bear_regime(db, monkeypatch):
 def test_saved_sell_is_always_honoured(db, monkeypatch):
     # Reducing risk is never blocked, even in a bull regime.
     eng = _engine(use_saved_strategy=True)
-    eng.strategy_configs["BTC/USDT"] = {"strategy": "ma_cross", "params": {}}
+    eng.strategy_configs["BTC/USDT"] = {
+        "strategy": "ma_cross", "params": {},
+        "metrics": {"validation_win_rate_pct": 58.0},
+    }
     _stub(monkeypatch, "sell")
     analysis = MarketAnalyzer().analyze(_UP, "BTC/USDT")
     out = eng._apply_saved_strategy("BTC/USDT", _UP, analysis)
     assert out.verdict == "sell"
-    assert out.confidence == 1.0
+    assert out.confidence == pytest.approx(0.58)
 
 
 def test_not_opted_in_keeps_analyzer_verdict(db, monkeypatch):
@@ -209,11 +217,17 @@ def test_broken_saved_strategy_falls_back_to_analyzer(db, monkeypatch):
 
 
 _GOOD_METRICS = {
-    "validation_return_pct": 12.0,   # out-of-sample split present and positive
-    "win_rate_pct": 58.0,
-    "num_trades": 30,
-    "max_drawdown_pct": 9.0,
-    "overfit_gap_pct": 4.0,
+    # Out-of-sample (holdout) figures — the ONLY ones the gate may judge.
+    "validation_return_pct": 12.0,
+    "validation_win_rate_pct": 58.0,
+    "validation_num_trades": 30,
+    "validation_max_drawdown_pct": 9.0,
+    # Rosy in-sample figures recorded alongside — the gate must IGNORE these.
+    "total_return_pct": 60.0,
+    "win_rate_pct": 95.0,
+    "num_trades": 200,
+    "max_drawdown_pct": 1.0,
+    "overfit_gap_pct": 48.0,
 }
 
 
@@ -294,7 +308,8 @@ def test_gate_on_takes_validated_buy(db, monkeypatch):
     analysis = MarketAnalyzer().analyze(_UP, "BTC/USDT")
     out = eng._apply_saved_strategy("BTC/USDT", _UP, analysis)
     assert out.verdict == "buy"
-    assert out.confidence == 1.0
+    # Confidence is the real OOS win rate (58%), not a fabricated 100%.
+    assert out.confidence == pytest.approx(0.58)
 
 
 def test_gate_never_blocks_a_sell(db, monkeypatch):
@@ -303,6 +318,52 @@ def test_gate_never_blocks_a_sell(db, monkeypatch):
     eng.strategy_configs["BTC/USDT"] = {"strategy": "ma_cross", "params": {}}
     _stub(monkeypatch, "sell")
     analysis = MarketAnalyzer().analyze(_UP, "BTC/USDT")
+    before_conf = analysis.confidence
     out = eng._apply_saved_strategy("BTC/USDT", _UP, analysis)
     assert out.verdict == "sell"
-    assert out.confidence == 1.0
+    # No saved metrics -> keep the analyzer's real confidence, never a fake 1.0.
+    assert out.confidence == pytest.approx(before_conf)
+
+
+def test_gate_uses_out_of_sample_not_in_sample_metrics():
+    # The heart of the honesty fix: rosy IN-SAMPLE numbers must NEVER satisfy the
+    # gate. A config that looks great in-sample but falls apart out-of-sample
+    # (few trades, low win rate, deep drawdown) fails every out-of-sample check.
+    eng = _engine(
+        require_strategy_validation=True,
+        strategy_min_return_pct=0.0,
+        strategy_min_win_rate_pct=55.0,
+        strategy_min_trades=10,
+        strategy_max_drawdown_pct=15.0,
+    )
+    cfg = {"strategy": "ma_cross", "metrics": {
+        "total_return_pct": 80.0, "win_rate_pct": 92.0,
+        "num_trades": 150, "max_drawdown_pct": 3.0,
+        "validation_return_pct": 5.0, "validation_win_rate_pct": 40.0,
+        "validation_num_trades": 3, "validation_max_drawdown_pct": 28.0,
+    }}
+    ok, reason, detail = eng._validate_saved_strategy(cfg)
+    assert ok is False
+    # Judged on the REAL out-of-sample figures, never the in-sample ones.
+    assert detail["win_rate_pct"] == 40.0 and detail["num_trades"] == 3
+    assert detail["max_drawdown_pct"] == 28.0
+    assert "win rate" in reason and "trades" in reason and "drawdown" in reason
+
+
+def test_gate_fails_closed_when_oos_submetric_missing():
+    # A strategy saved before OOS win-rate was captured has an OOS return but no
+    # OOS win rate. With a win-rate threshold on, the gate fails CLOSED (retrain)
+    # rather than fall back to the rosier in-sample win rate.
+    eng = _engine(
+        require_strategy_validation=True,
+        strategy_min_return_pct=0.0,
+        strategy_min_win_rate_pct=55.0,
+        strategy_min_trades=0,
+    )
+    cfg = {"strategy": "ma_cross", "metrics": {
+        "validation_return_pct": 12.0, "win_rate_pct": 90.0,
+    }}
+    ok, reason, detail = eng._validate_saved_strategy(cfg)
+    assert ok is False
+    assert "out-of-sample win rate" in reason
+    assert detail["win_rate_pct"] is None   # never the 90% in-sample number
