@@ -136,13 +136,14 @@ export default function App() {
   return <Dashboard me={me} onLogout={logout} onMeChanged={setMe} theme={theme} onToggleTheme={toggleTheme} />
 }
 
-type TabKey = 'trades' | 'performance' | 'signals' | 'assistant' | 'news' | 'analyze' | 'train' | 'backtest' | 'settings' | 'admin'
+type TabKey = 'trades' | 'performance' | 'history' | 'signals' | 'assistant' | 'news' | 'analyze' | 'train' | 'backtest' | 'settings' | 'admin'
 
 // Left-drawer navigation. `admin: true` items only render for admins. The same
 // keys drive the in-panel tab strip, so the two stay in sync off one `tab`.
 const NAV: { key: TabKey; label: string; icon: string; admin?: boolean }[] = [
   { key: 'trades', label: 'Trades', icon: '📈' },
   { key: 'performance', label: 'Performance', icon: '🏆' },
+  { key: 'history', label: 'History', icon: '🗂' },
   { key: 'signals', label: 'Signals', icon: '📡' },
   { key: 'assistant', label: 'AI Assistant', icon: '🤖' },
   { key: 'news', label: 'News', icon: '📰' },
@@ -157,6 +158,7 @@ const NAV: { key: TabKey; label: string; icon: string; admin?: boolean }[] = [
 const NAV_LABEL: Record<TabKey, string> = {
   trades: 'Trades',
   performance: 'Performance',
+  history: 'History',
   signals: 'Signals',
   assistant: 'AI Assistant',
   news: 'News',
@@ -173,6 +175,8 @@ const NAV_ALIAS: Record<string, TabKey> = {
   trades: 'trades', trade: 'trades', positions: 'trades', dashboard: 'trades', home: 'trades',
   performance: 'performance', perf: 'performance', stats: 'performance', results: 'performance',
   pnl: 'performance', analytics: 'performance',
+  history: 'history', journal: 'history', log: 'history', logs: 'history', timeline: 'history',
+  activity: 'history', equity: 'history', curve: 'history', past: 'history',
   signals: 'signals', signal: 'signals',
   assistant: 'assistant', ai: 'assistant', chat: 'assistant',
   news: 'news', headlines: 'news', feed: 'news', feeds: 'news',
@@ -1619,6 +1623,12 @@ function Dashboard({
                   Performance
                 </span>
                 <span
+                  className={`tab ${tab === 'history' ? 'active' : ''}`}
+                  onClick={() => setTab('history')}
+                >
+                  History
+                </span>
+                <span
                   className={`tab ${tab === 'signals' ? 'active' : ''}`}
                   onClick={() => setTab('signals')}
                 >
@@ -1686,6 +1696,13 @@ function Dashboard({
               {tab === 'signals' && <SignalsTable signals={signals} />}
               {tab === 'performance' && (
                 <PerformancePanel onError={(m) => showToast('error', m)} />
+              )}
+              {tab === 'history' && (
+                <HistoryPanel
+                  trades={trades}
+                  signals={signals}
+                  onError={(m) => showToast('error', m)}
+                />
               )}
               {tab === 'assistant' && (
                 <AssistantPanel
@@ -3235,6 +3252,321 @@ function PerformancePanel({ onError }: { onError: (msg: string) => void }) {
           </table>
         </div>
       )}
+    </div>
+  )
+}
+
+// ---- History dashboard ------------------------------------------------
+// One place to trace what actually happened: a realized-P&L equity curve built
+// from CLOSED trades, plus a chronological journal merging trade exits,
+// analyzer/webhook signals and fired price alerts. Everything here is REAL
+// recorded history — nothing simulated or back-filled. Paper and live are never
+// mixed into one equity line (simulated vs real money), so the panel reviews one
+// account mode at a time.
+
+// A compact SVG equity curve of cumulative realized P&L. Draws only the points
+// given; an empty set renders an honest note, never a fake flat line at zero.
+function EquityCurve({ points }: { points: { t: string | null; cum: number; pnl: number }[] }) {
+  if (points.length === 0)
+    return (
+      <div className="empty" style={{ minHeight: 110 }}>
+        No closed trades in this view yet — the curve fills as positions close.
+      </div>
+    )
+  const W = 720
+  const H = 190
+  const pad = 10
+  const padY = 16
+  const cums = points.map((p) => p.cum)
+  let lo = Math.min(0, ...cums)
+  let hi = Math.max(0, ...cums)
+  if (hi === lo) {
+    hi += 1
+    lo -= 1
+  }
+  const n = points.length
+  const x = (i: number) => pad + (n === 1 ? (W - 2 * pad) / 2 : (i / (n - 1)) * (W - 2 * pad))
+  const y = (v: number) => padY + (1 - (v - lo) / (hi - lo)) * (H - 2 * padY)
+  const line = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p.cum).toFixed(1)}`).join(' ')
+  const last = cums[n - 1]
+  const stroke = last >= 0 ? '#1eae63' : '#e2555a'
+  const zeroY = y(0)
+  const area = `${line} L${x(n - 1).toFixed(1)},${zeroY.toFixed(1)} L${x(0).toFixed(1)},${zeroY.toFixed(1)} Z`
+  const peak = Math.max(...cums)
+  const trough = Math.min(...cums)
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} preserveAspectRatio="none" role="img"
+      aria-label={`Cumulative realized P&L over ${n} closed trades, ending ${last >= 0 ? '+' : ''}${fmt(last)}`}>
+      <defs>
+        <linearGradient id="eqfill" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={stroke} stopOpacity="0.22" />
+          <stop offset="100%" stopColor={stroke} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <line x1={pad} y1={zeroY} x2={W - pad} y2={zeroY} stroke="#8892a6" strokeOpacity="0.4" strokeDasharray="4 4" strokeWidth="1" />
+      <path d={area} fill="url(#eqfill)" stroke="none" />
+      <path d={line} fill="none" stroke={stroke} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+      <circle cx={x(cums.indexOf(peak))} cy={y(peak)} r="2.5" fill="#1eae63" />
+      <circle cx={x(cums.indexOf(trough))} cy={y(trough)} r="2.5" fill="#e2555a" />
+    </svg>
+  )
+}
+// History & journal: a read-only, per-mode audit of everything that happened —
+// the realized-P&L curve (accumulated client-side so paper and live never share
+// a line), realized stat tiles, and a merged trade/signal/alert timeline.
+type HistMode = 'paper' | 'live'
+type HistEvent =
+  | { kind: 'trade'; ts: number; t: string | null; symbol: string; side: string; pnl: number; note: string | null }
+  | { kind: 'signal'; ts: number; t: string; symbol: string | null; action: string | null; source: string; accepted: number; confidence: number | null }
+  | { kind: 'alert'; ts: number; t: string; symbol: string; condition: string; price: number; hit: number | null }
+
+function HistoryPanel({
+  trades,
+  signals,
+  onError,
+}: {
+  trades: Trade[]
+  signals: SignalRow[]
+  onError: (msg: string) => void
+}) {
+  const [perf, setPerf] = useState<Performance | null>(null)
+  const [alerts, setAlerts] = useState<Alert[]>([])
+  const [loading, setLoading] = useState(true)
+  const [failed, setFailed] = useState(false)
+  const [mode, setMode] = useState<HistMode>('paper')
+  const [sym, setSym] = useState<string>('all')
+  const [days, setDays] = useState<number>(0) // 0 = all time
+  const modeTouched = useRef(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setFailed(false)
+    try {
+      const [p, a] = await Promise.all([
+        api.performance(),
+        api.listAlerts().catch(() => [] as Alert[]),
+      ])
+      setPerf(p)
+      setAlerts(a)
+    } catch (e) {
+      setFailed(true)
+      onError((e as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }, [onError])
+  useEffect(() => {
+    load()
+  }, [load])
+
+  // Default the mode toggle ONCE to whichever account has closed trades (prefer
+  // live if it has any), so the first look isn't an empty paper curve.
+  useEffect(() => {
+    if (!perf || modeTouched.current) return
+    if (perf.live.closed_trades > 0) setMode('live')
+  }, [perf])
+
+  const cls = (n: number) => (n > 0 ? 'pos' : n < 0 ? 'neg' : '')
+  const money = (n: number) => `${n < 0 ? '-' : ''}$${fmt(Math.abs(n))}`
+  const fmtTime = (iso: string | null) => {
+    if (!iso) return '-'
+    const d = new Date(iso)
+    return Number.isNaN(d.getTime()) ? '-' : d.toLocaleString()
+  }
+  const cutoff = days > 0 ? Date.now() - days * 86400000 : 0
+  const inRange = (iso: string | null) => {
+    if (cutoff === 0) return true
+    if (!iso) return false
+    const t = new Date(iso).getTime()
+    return Number.isNaN(t) ? false : t >= cutoff
+  }
+
+  // Symbols present anywhere in the history, for the filter dropdown.
+  const symbols = useMemo(() => {
+    const s = new Set<string>()
+    perf?.equity_curve.forEach((p) => s.add(p.symbol))
+    trades.forEach((t) => t.symbol && s.add(t.symbol))
+    return Array.from(s).sort()
+  }, [perf, trades])
+
+  // Cumulative realized-P&L curve for the SELECTED mode (+ symbol + range).
+  // Accumulated here on the client so paper and live never share a line.
+  const curve = useMemo(() => {
+    if (!perf) return [] as { t: string | null; cum: number; pnl: number }[]
+    let run = 0
+    return perf.equity_curve
+      .filter((p) => p.mode === mode && (sym === 'all' || p.symbol === sym) && inRange(p.t))
+      .map((p) => {
+        run += p.pnl
+        return { t: p.t, pnl: p.pnl, cum: Math.round(run * 1e8) / 1e8 }
+      })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [perf, mode, sym, days])
+
+  // Chronological journal: closed trades (selected mode) + signals + fired
+  // alerts (both mode-agnostic market events), newest first, capped.
+  const events = useMemo<HistEvent[]>(() => {
+    const out: HistEvent[] = []
+    trades.forEach((t) => {
+      if (t.status !== 'closed' || t.mode !== mode) return
+      if (sym !== 'all' && t.symbol !== sym) return
+      if (!inRange(t.closed_at)) return
+      out.push({ kind: 'trade', ts: t.closed_at ? new Date(t.closed_at).getTime() : 0, t: t.closed_at, symbol: t.symbol, side: t.side, pnl: t.pnl, note: t.note })
+    })
+    signals.forEach((s) => {
+      if (sym !== 'all' && s.symbol !== sym) return
+      if (!inRange(s.created_at)) return
+      out.push({ kind: 'signal', ts: new Date(s.created_at).getTime(), t: s.created_at, symbol: s.symbol, action: s.action, source: s.source, accepted: s.accepted, confidence: s.confidence })
+    })
+    alerts.forEach((a) => {
+      if (a.status !== 'triggered' || (sym !== 'all' && a.symbol !== sym) || !inRange(a.triggered_at)) return
+      out.push({ kind: 'alert', ts: a.triggered_at ? new Date(a.triggered_at).getTime() : 0, t: a.triggered_at ?? '', symbol: a.symbol, condition: a.condition, price: a.price, hit: a.triggered_price })
+    })
+    return out.sort((a, b) => b.ts - a.ts).slice(0, 200)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trades, signals, alerts, mode, sym, days])
+
+  if (loading && !perf)
+    return <div className="empty" style={{ minHeight: 160 }}>Loading history…</div>
+  if (failed && !perf)
+    return (
+      <div className="empty" style={{ minHeight: 160 }}>
+        Couldn't load history.
+        <button className="btn" style={{ marginLeft: 10 }} onClick={load}>Retry</button>
+      </div>
+    )
+  const bucket = mode === 'live' ? perf!.live : perf!.paper
+  const realized = curve.length ? curve[curve.length - 1].cum : 0
+  return (
+    <div className="history-panel">
+      <div className="hist-head">
+        <div>
+          <p className="hint" style={{ margin: 0 }}>
+            Every closed trade, signal and fired alert — trace how you traded and how the market moved. Paper and live are kept apart; nothing here is simulated or back-filled.
+          </p>
+        </div>
+        <button className="btn" onClick={load} disabled={loading} title="Reload">
+          {loading ? '…' : '↻ Refresh'}
+        </button>
+      </div>
+
+      <div className="hist-controls">
+        <div className="seg" role="tablist" aria-label="Account mode">
+          <button role="tab" aria-selected={mode === 'paper'} className={`seg-btn ${mode === 'paper' ? 'active' : ''}`}
+            onClick={() => { modeTouched.current = true; setMode('paper') }}>📝 Paper</button>
+          <button role="tab" aria-selected={mode === 'live'} className={`seg-btn ${mode === 'live' ? 'active' : ''}`}
+            onClick={() => { modeTouched.current = true; setMode('live') }}>💵 Live</button>
+        </div>
+        <label className="hist-filter">Symbol
+          <select value={sym} onChange={(e) => setSym(e.target.value)}>
+            <option value="all">All</option>
+            {symbols.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </label>
+        <label className="hist-filter">Range
+          <select value={days} onChange={(e) => setDays(Number(e.target.value))}>
+            <option value={0}>All time</option>
+            <option value={1}>24h</option>
+            <option value={7}>7 days</option>
+            <option value={30}>30 days</option>
+            <option value={90}>90 days</option>
+          </select>
+        </label>
+      </div>
+
+      <div className="hist-card">
+        <div className="hist-curve-head">
+          <span className="muted">Realized P&amp;L curve · {mode === 'live' ? 'Live' : 'Paper'}{sym !== 'all' ? ` · ${sym}` : ''}</span>
+          <strong className={cls(realized)}>{money(realized)}</strong>
+        </div>
+        <EquityCurve points={curve} />
+        <div className="muted tiny" style={{ marginTop: 6 }}>
+          Cumulative booked profit/loss, one step per closed trade. Not a mark-to-market balance — open positions aren't shown until they close.
+        </div>
+      </div>
+
+      {bucket.closed_trades > 0 ? (
+        <div className="stats cols-3">
+          <div className="stat">
+            <div className="label">Closed trades</div>
+            <div className="value">{bucket.closed_trades}</div>
+          </div>
+          <div className="stat">
+            <div className="label">Win rate</div>
+            <div className="value">{fmt(bucket.win_rate_pct)}%</div>
+            <div className="muted tiny">{bucket.wins}W · {bucket.losses}L{bucket.breakeven ? ` · ${bucket.breakeven}BE` : ''}</div>
+          </div>
+          <div className="stat">
+            <div className="label">Profit factor</div>
+            <div className="value" title={bucket.profit_factor == null ? 'Undefined — no losing trades yet' : undefined}>
+              {bucket.profit_factor == null ? '—' : fmt(bucket.profit_factor)}
+            </div>
+          </div>
+          <div className="stat">
+            <div className="label">Expectancy / trade</div>
+            <div className={`value ${cls(bucket.expectancy)}`}>{money(bucket.expectancy)}</div>
+          </div>
+          <div className="stat">
+            <div className="label">Avg win / loss</div>
+            <div className="value"><span className="pos">{money(bucket.avg_win)}</span> / <span className="neg">{money(bucket.avg_loss)}</span></div>
+          </div>
+          <div className="stat">
+            <div className="label">Best / worst</div>
+            <div className="value"><span className="pos">{money(bucket.largest_win)}</span> / <span className="neg">{money(bucket.largest_loss)}</span></div>
+          </div>
+          <div className="stat">
+            <div className="label">Max drawdown</div>
+            <div className="value neg">{bucket.max_drawdown ? money(-bucket.max_drawdown) : money(0)}</div>
+            <div className="muted tiny">peak-to-trough</div>
+          </div>
+        </div>
+      ) : (
+        <div className="empty" style={{ minHeight: 80 }}>
+          No closed {mode} trades{sym !== 'all' ? ` for ${sym}` : ''}{days > 0 ? ' in this range' : ''} yet. Stats appear once a position closes.
+        </div>
+      )}
+
+      <div className="hist-card hist-journal">
+        <div className="hist-curve-head">
+          <span className="muted">Activity journal</span>
+          <span className="muted tiny">{events.length >= 200 ? 'latest 200' : `${events.length} event${events.length === 1 ? '' : 's'}`}</span>
+        </div>
+        {events.length === 0 ? (
+          <div className="empty" style={{ minHeight: 80 }}>Nothing recorded for this view yet.</div>
+        ) : (
+          <ul className="timeline">
+            {events.map((e, i) => (
+              <li key={`${e.kind}-${e.ts}-${i}`} className={`tl-item tl-${e.kind}`}>
+                <span className="tl-time" title={fmtTime(e.t)}>{fmtTime(e.t)}</span>
+                {e.kind === 'trade' && (
+                  <span className="tl-body">
+                    <span className="tl-badge trade">Trade</span>
+                    <strong>{e.symbol}</strong> <span className="muted">{e.side}</span> closed{' '}
+                    <strong className={cls(e.pnl)}>{money(e.pnl)}</strong>
+                    {e.note ? <span className="muted tiny"> · {e.note}</span> : null}
+                  </span>
+                )}
+                {e.kind === 'signal' && (
+                  <span className="tl-body">
+                    <span className="tl-badge signal">Signal</span>
+                    <strong>{e.symbol ?? '—'}</strong> <span className="muted">{e.action ?? '?'}</span>
+                    <span className="muted tiny"> · {e.source}</span>
+                    {e.confidence != null ? <span className="muted tiny"> · conf {fmt(e.confidence * 100, 0)}%</span> : null}
+                    {e.accepted ? <span className="tl-tag ok">taken</span> : <span className="tl-tag">skipped</span>}
+                  </span>
+                )}
+                {e.kind === 'alert' && (
+                  <span className="tl-body">
+                    <span className="tl-badge alert">Alert</span>
+                    <strong>{e.symbol}</strong> <span className="muted">{e.condition} ${fmt(e.price)}</span>
+                    {e.hit != null ? <span className="muted tiny"> · hit ${fmt(e.hit)}</span> : null}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
     </div>
   )
 }

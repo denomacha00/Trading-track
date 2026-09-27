@@ -290,6 +290,8 @@ def test_performance_endpoint_shape_no_trades(client):
     # Paper/live are always split so simulated gains never look like real money.
     assert p["paper"]["closed_trades"] == 0
     assert p["live"]["closed_trades"] == 0
+    # The realized-P&L equity curve starts empty — never back-filled or invented.
+    assert p["equity_curve"] == []
 
 
 # ---- multi-user, licensing & admin ---------------------------------

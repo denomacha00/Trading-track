@@ -1443,6 +1443,42 @@ pre.code {
   .tab-current {
     display: block;
   }
+  /* --- Chart controls on phones/tablets ---------------------------------
+     On a narrow screen the chart header used to squeeze the price and every
+     control (symbol, timeframe, indicators, ICT, Trades, Watch, Bot/TV and
+     the size buttons) into one cramped row, so the small size icons were hard
+     to see and tap. Stack the header, let the controls wrap full-width, and
+     give every toggle a proper finger-sized target. */
+  .chart-panel .panel-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+  .chart-panel .panel-head > .row {
+    width: 100%;
+    gap: 8px;
+  }
+  .cvt-btn {
+    padding: 9px 13px;
+    font-size: 14px;
+    min-height: 42px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  /* The minimize / maximize icons were a faint 12px glyph — the exact thing
+     the user couldn't see on their phone. Make them big, bold and obviously
+     tappable, and let the group sit at the end of the row on its own. */
+  .chart-view-toggle[aria-label="Chart size"] {
+    margin-left: auto;
+  }
+  .chart-view-toggle[aria-label="Chart size"] .cvt-btn {
+    font-size: 20px;
+    line-height: 1;
+    min-width: 52px;
+    min-height: 44px;
+    font-weight: 700;
+  }
 }
 
 /* Hamburger + left navigation drawer ------------------------------- */
@@ -2107,3 +2143,116 @@ pre.code {
 .alert-side { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .alert-armed { font-size: 12px; color: var(--green); white-space: nowrap; }
 .alert-fired { font-size: 12px; color: var(--muted); white-space: nowrap; }
+
+/* ---- History & journal dashboard ---- */
+.history-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.hist-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.hist-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.hist-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.hist-filter select {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+.hist-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+}
+.hist-curve-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+/* __HIST_CSS_1__ */
+.hist-journal .timeline {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.tl-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 2px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+}
+.tl-item:first-child { border-top: none; }
+.tl-time {
+  flex: 0 0 auto;
+  width: 150px;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tl-body {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.tl-badge {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.tl-badge.trade { color: var(--accent); border-color: var(--accent); }
+.tl-badge.signal { color: var(--green); border-color: var(--green); }
+.tl-badge.alert { color: #d9a441; border-color: #d9a441; }
+/* __HIST_CSS_2__ */
+.tl-tag {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.tl-tag.ok { color: var(--green); border-color: var(--green); }
+.history-panel .tiny { font-size: 11px; }
+
+@media (max-width: 640px) {
+  .hist-head { flex-direction: column; }
+  .tl-item { flex-direction: column; gap: 2px; }
+  .tl-time { width: auto; }
+}

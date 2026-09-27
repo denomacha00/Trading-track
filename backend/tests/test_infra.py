@@ -481,6 +481,41 @@ def test_performance_avg_hold_seconds_from_timestamps():
     assert p["avg_hold_seconds"] == 7200.0
 
 
+def test_performance_equity_curve_lists_closed_events_in_close_order():
+    from app.performance import compute_performance
+
+    p = compute_performance([
+        _trade(10.0, mode="paper", symbol="BTC/USDT"),
+        _trade(-4.0, mode="live", symbol="ETH/USDT"),
+        _trade(6.0, mode="paper", symbol="BTC/USDT"),
+    ])
+    curve = p["equity_curve"]
+    assert len(curve) == 3  # one realized event per closed trade
+    # Each point carries the raw booked pnl + its mode/symbol — no pre-summed total,
+    # because paper and live must never be added into one running equity line.
+    assert [pt["pnl"] for pt in curve] == [10.0, -4.0, 6.0]
+    assert [pt["mode"] for pt in curve] == ["paper", "live", "paper"]
+    assert [pt["symbol"] for pt in curve] == ["BTC/USDT", "ETH/USDT", "BTC/USDT"]
+    assert all(pt["t"] is not None for pt in curve)  # real close timestamps
+    # The cumulative line is a CLIENT concern, accumulated per mode so simulated
+    # and real money stay separate.
+    paper_cum, run = [], 0.0
+    for pt in curve:
+        if pt["mode"] == "paper":
+            run += pt["pnl"]
+            paper_cum.append(round(run, 8))
+    assert paper_cum == [10.0, 16.0]
+
+
+def test_performance_equity_curve_empty_and_ignores_open():
+    from app.performance import compute_performance
+
+    assert compute_performance([])["equity_curve"] == []  # never fabricated
+    p = compute_performance([_trade(5.0, status="open"), _trade(8.0)])
+    assert len(p["equity_curve"]) == 1  # the still-open position has no realized event
+    assert p["equity_curve"][0]["pnl"] == 8.0
+
+
 # ---- scaled / DCA entries (offline paper engine, price pinned) -------
 #
 # These exercise the REAL execute_scaled_entry / close_symbol code paths on a

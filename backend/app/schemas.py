@@ -175,6 +175,18 @@ class PerfSymbol(BaseModel):
     wins: int
 
 
+class EquityPoint(BaseModel):
+    """One realized-P&L event: a single closed trade's booked result at its close
+    time. The cumulative equity line is built on the client PER MODE — paper and
+    live are never summed (simulated and real money must not mix). ``t`` is the ISO
+    close time, or null when the record has no close timestamp."""
+
+    t: Optional[str] = None
+    pnl: float
+    symbol: str
+    mode: str
+
+
 class PerformanceOut(PerfBucket):
     """Overall stats (inherited) plus paper/live splits and a per-symbol
     breakdown. Paper and live are separate so simulated gains are never counted
@@ -184,6 +196,9 @@ class PerformanceOut(PerfBucket):
     paper: PerfBucket
     live: PerfBucket
     by_symbol: list[PerfSymbol]
+    # Realized-P&L events in close order (one per closed trade). Empty until the
+    # first position is closed — never back-filled or invented.
+    equity_curve: list[EquityPoint] = []
 
 
 class BotStatus(BaseModel):

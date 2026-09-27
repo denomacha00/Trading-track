@@ -61,6 +61,9 @@ export interface Trade {
   order_type?: string
   limit_price?: number | null
   pnl: number
+  // Real exchange fee booked against this trade (live only; 0 in paper). Never
+  // fabricated — absent/older rows may omit it.
+  fee?: number
   mode: string
   source: string
   note: string | null
@@ -366,6 +369,18 @@ export interface PerfSymbol {
   wins: number
 }
 
+// One realized-P&L event: a single closed trade's booked result at its close
+// time. The cumulative equity line is built on the CLIENT per mode — paper and
+// live are never summed (simulated and real money must not mix). `t` is the ISO
+// close time, or null when the record has no close timestamp. Mirrors the
+// backend EquityPoint.
+export interface EquityPoint {
+  t: string | null
+  pnl: number
+  symbol: string
+  mode: string
+}
+
 // Overall realized performance plus paper/live splits and a per-symbol
 // breakdown. Paper and live are separate so simulated gains are never counted
 // as real money. Mirrors the backend PerformanceOut.
@@ -374,6 +389,9 @@ export interface Performance extends PerfBucket {
   paper: PerfBucket
   live: PerfBucket
   by_symbol: PerfSymbol[]
+  // Realized-P&L events in close order (one per closed trade). Empty until the
+  // first position closes — never back-filled or invented.
+  equity_curve: EquityPoint[]
 }
 
 // Real, explainable analytics for a backtest run — every figure derived from the

@@ -88,6 +88,7 @@ def compute_performance(trades: Iterable[Any]) -> dict[str, Any]:
 
     by_symbol: dict[str, dict[str, Any]] = {}
     holds: list[float] = []
+    curve: list[dict[str, Any]] = []
     for t in closed:
         sym = str(getattr(t, "symbol", "") or "?")
         b = by_symbol.setdefault(sym, {"symbol": sym, "trades": 0, "pnl": 0.0, "wins": 0})
@@ -103,6 +104,18 @@ def compute_performance(trades: Iterable[Any]) -> dict[str, Any]:
                 holds.append((closed_at - opened).total_seconds())
             except (TypeError, ValueError):
                 pass
+        # One realized-P&L event per closed trade, in close order. We deliberately
+        # do NOT pre-sum a cumulative here: paper and live must never be added into
+        # one curve (simulated vs real money), so the running total is built on the
+        # client per selected mode. ``t`` is null when the close time is missing.
+        curve.append(
+            {
+                "t": closed_at.isoformat() if isinstance(closed_at, dt.datetime) else None,
+                "pnl": round(p, 8),
+                "symbol": sym,
+                "mode": str(getattr(t, "mode", "") or "paper").lower(),
+            }
+        )
 
     overall = _summarize(closed)
     paper = _summarize([t for t in closed if str(getattr(t, "mode", "")).lower() == "paper"])
@@ -114,4 +127,5 @@ def compute_performance(trades: Iterable[Any]) -> dict[str, Any]:
         "paper": paper,
         "live": live,
         "by_symbol": symbols,
+        "equity_curve": curve,
     }
