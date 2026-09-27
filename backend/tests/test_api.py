@@ -851,6 +851,43 @@ def test_ai_chat_no_action_when_none_proposed(client, monkeypatch):
     assert r.json()["proposed_action"] is None
 
 
+def test_ai_chat_news_grounded_action_is_never_auto(client, monkeypatch):
+    # M11: news is untrusted third-party text (a prompt-injection surface). Even
+    # with autopilot ON on a paper account — where a paper order would normally
+    # auto-apply — an action from a NEWS-grounded reply must be downgraded to a
+    # human Confirm. A hostile headline must not be able to move money silently.
+    engine, _ = _admin_engine()
+    assert engine.settings.is_live is False  # premise: paper account
+    monkeypatch.setattr(engine.settings, "ai_autopilot_enabled", True)
+
+    def fake_chat(question, **kwargs):
+        return 'On it.\n[[action:{"type":"order","side":"buy","symbol":"BTC/USDT","amount":null}]]'
+
+    monkeypatch.setattr(engine.ai, "chat", fake_chat)
+
+    import app.main as main_mod
+    monkeypatch.setattr(
+        main_mod, "fetch_market_news",
+        lambda feeds, limit=8: ([{"title": "BTC rips higher", "source": "feed"}], []),
+    )
+
+    # Baseline: WITHOUT news, autopilot + paper => a paper order auto-applies.
+    r0 = client.post("/api/ai/chat", json={"question": "buy"})
+    assert r0.status_code == 200
+    assert r0.json()["proposed_action"]["auto"] is True
+
+    # WITH news: the SAME proposal is forced confirm-gated by the injection guard.
+    r1 = client.post("/api/ai/chat", json={"question": "buy", "include_news": True})
+    assert r1.status_code == 200
+    body = r1.json()
+    assert body["used_news"] is True
+    act = body["proposed_action"]
+    assert act is not None
+    assert act["auto"] is False
+    assert act.get("injection_guard") is True
+
+
+
 def test_ai_chat_context_has_trading_hours(client, monkeypatch):
     # The failing example from the field: "how many hours was my trading for". The
     # grounding context must carry real durations derived from trade timestamps.

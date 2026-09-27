@@ -1921,6 +1921,14 @@ def ai_chat(
     # frontend calls the normal authenticated endpoint.
     clean_reply, raw_action = strip_action_tag(reply)
     proposed_action = _normalize_proposed_action(raw_action, engine)
+    # SAFETY (M11): a reply grounded in third-party NEWS must never AUTO-apply an
+    # action. Untrusted headlines are a prompt-injection surface — even though we
+    # fence them and defang action tags before they reach the model, if an
+    # injection ever slipped a proposal through, acting on it would still require
+    # an explicit human Confirm. Downgrade auto -> confirm here; never the reverse.
+    if used_news and proposed_action is not None and proposed_action.get("auto"):
+        proposed_action["auto"] = False
+        proposed_action["injection_guard"] = True
     return {
         "reply": clean_reply,
         "ai_enabled": engine.ai.available,
