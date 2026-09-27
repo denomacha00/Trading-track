@@ -53,12 +53,15 @@ class Settings(BaseSettings):
     ai_model: str = Field(default="gpt-4o-mini")
     ai_timeout_seconds: float = Field(default=45.0)
     # Fast-failover connect timeout (seconds). A DOWN/unreachable primary provider
-    # (the classic "justrouter is down" case) is abandoned after this many seconds
-    # so the SAME request fails over to the secondary provider fast — instead of the
+    # (the classic "justworker is down" case) is abandoned after this many seconds
+    # so the SAME request fails over to the secondary provider — instead of the
     # client hanging for the full ai_timeout_seconds. Caps CONNECT time only, so a
     # healthy provider (connects in <1s) is never affected and a slow-but-alive
-    # response still gets the full read budget. Lower it for snappier failover.
-    ai_connect_timeout_seconds: float = Field(default=5.0)
+    # response still gets the full read budget. Set to 10s so justworker (primary)
+    # gets a bit more grace to answer when it's slow-but-alive before we hand the
+    # request to the fallback; the trade-off is failover on a truly-dead primary
+    # takes up to ~10s instead of ~5s. Lower it for snappier failover.
+    ai_connect_timeout_seconds: float = Field(default=10.0)
     # Provider API style: "auto" (infer from model/base_url), "openai", or
     # "anthropic". Auto picks Anthropic when the model looks like a Claude model
     # or the base URL is anthropic-flavoured; otherwise OpenAI chat-completions.
@@ -78,9 +81,13 @@ class Settings(BaseSettings):
     # narrate/answer/veto — it never places a trade. Same key handling as the
     # primary (whitespace/quote/NAME= cleaning) so a pasted Railway value works.
     ai_fallback_api_key: str = Field(default="")
-    ai_fallback_base_url: str = Field(default="https://api.openai.com/v1")
-    ai_fallback_model: str = Field(default="gpt-4o-mini")
-    ai_fallback_api_style: str = Field(default="auto")
+    # This bot's configured fallback is glm-5.3-flash on the hcnsec gateway
+    # (OpenAI-compatible). These are non-secret defaults, so on Railway you only
+    # need to set AI_FALLBACK_API_KEY to switch the fallback ON — base_url/model/
+    # style are already correct. Override any of them via env if you swap vendors.
+    ai_fallback_base_url: str = Field(default="https://api.hcnsec.cn/v1")
+    ai_fallback_model: str = Field(default="glm-5.3-flash")
+    ai_fallback_api_style: str = Field(default="openai")
 
     # Risk management
     max_open_positions: int = Field(default=5)

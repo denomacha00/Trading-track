@@ -70,7 +70,10 @@ _SYSTEM_ASSISTANT = (
     "itself reports the real outcome; don't announce a success you can't actually "
     "see. Real-money (live) orders and switching paper->live ALWAYS need their "
     "explicit confirmation. If a request is unsafe, say so plainly instead of going "
-    "along with it. Never ask for or repeat secrets or API keys."
+    "along with it. Never ask for or repeat secrets or API keys. "
+    "Reply with your answer ONLY — never show a 'thinking process', a numbered "
+    "breakdown of the request, <think> tags, or any behind-the-scenes reasoning; "
+    "the operator reads exactly what you write, so give them the finished reply."
 )
 
 # What the assistant knows about the product itself, so "how does this work?" and
@@ -534,7 +537,7 @@ class AICommentator:
             )
             resp.raise_for_status()
             data = resp.json()
-            return data["choices"][0]["message"]["content"].strip()
+            return _extract_openai_text(data)
 
     def _post(
         self,
@@ -981,6 +984,80 @@ def _extract_json(text: str) -> str:
     return text
 
 
+_THINK_BLOCK_RE = re.compile(
+    r"<\s*(think|thinking|reasoning|thought)\s*>.*?<\s*/\s*\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_REASONING_OPENERS = (
+    "here's a thinking process", "here is a thinking process",
+    "here's my thinking", "here is my thinking",
+    "thinking process:", "thought process:", "reasoning:",
+    "let me think", "let me analyze", "let me work through",
+    "chain of thought", "chain-of-thought",
+)
+_FINAL_ANSWER_RE = re.compile(
+    r"(?:final answer|final response|final reply|"
+    r"here'?s (?:my|the) (?:answer|response|reply)|"
+    r"my (?:answer|response|reply) to you|to answer your question)\s*[:\-—]*\s*",
+    re.IGNORECASE,
+)
+_ACTION_TAG_RE = re.compile(r"\[\[action:.*?\]\]", re.IGNORECASE | re.DOTALL)
+
+
+def _strip_reasoning(text: Optional[str]) -> Optional[str]:
+    """Remove a model's leaked chain-of-thought so only the answer reaches the user.
+
+    Some models — notably the ones a free gateway's "auto" route can land on —
+    dump their scratchpad into the reply: a ``<think>…</think>`` block, or a
+    "Here's a thinking process: 1. Analyze…" preamble. That must never reach the
+    operator (it's not the answer and reads as broken). We strip tagged blocks
+    outright, and when the reply LEADS with a reasoning preamble we keep only
+    what follows an explicit "final answer" marker. If we can't confidently tell
+    where reasoning ends and the answer begins, we leave the text untouched —
+    better a slightly messy answer than a butchered or empty one. A proposed
+    ``[[action:…]]`` tag is preserved even if it sat in the trimmed part, so the
+    Confirm card still fires.
+    """
+    if not text:
+        return None
+    cleaned = _THINK_BLOCK_RE.sub("", text).strip()
+    if cleaned.lower().startswith(_REASONING_OPENERS):
+        matches = list(_FINAL_ANSWER_RE.finditer(cleaned))
+        if matches:
+            tail = cleaned[matches[-1].end():].strip()
+            if tail:
+                action = _ACTION_TAG_RE.search(cleaned)
+                if action and action.group(0) not in tail:
+                    tail = f"{tail}\n{action.group(0)}"
+                return tail
+    return cleaned or None
+
+
+def _extract_openai_text(data: dict[str, Any]) -> Optional[str]:
+    """Pull the text out of an OpenAI-compatible chat-completions response.
+
+    Defensive on purpose. Some providers — especially free/aggregator gateways
+    under load, or reasoning models — return a choice whose ``content`` is null
+    (or omit it). The old ``["content"].strip()`` then raised AttributeError on
+    None and killed the WHOLE request instead of failing over. Treat any
+    missing/blank content as "no usable text" (return None) so the caller
+    cleanly tries the next provider — the whole point of the fallback. We do NOT
+    fall back to a ``reasoning_content`` scratchpad here: that is the model's raw
+    chain-of-thought, never a finished answer, and must never reach the user.
+    """
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    message = first.get("message") if isinstance(first, dict) else None
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        return _strip_reasoning(content)
+    return None
+
+
 def _extract_anthropic_text(data: dict[str, Any]) -> Optional[str]:
     """Pull the text out of an Anthropic messages response."""
     content = data.get("content")
@@ -990,8 +1067,7 @@ def _extract_anthropic_text(data: dict[str, Any]) -> Optional[str]:
             for blk in content
             if isinstance(blk, dict) and blk.get("type") == "text"
         ]
-        text = "".join(parts).strip()
-        return text or None
+        return _strip_reasoning("".join(parts))
     if isinstance(content, str):
-        return content.strip() or None
+        return _strip_reasoning(content)
     return None

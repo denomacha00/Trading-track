@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from app.ai import AICommentator, _extract_anthropic_text, _looks_anthropic, _sanitize_history
+from app.ai import AICommentator, _extract_anthropic_text, _extract_openai_text, _looks_anthropic, _sanitize_history, _strip_reasoning
 from app.analysis import Factor, MarketAnalysis
 
 
@@ -163,6 +163,82 @@ def test_extract_anthropic_text_joins_blocks():
 def test_extract_anthropic_text_empty_returns_none():
     assert _extract_anthropic_text({"content": []}) is None
     assert _extract_anthropic_text({}) is None
+
+
+def test_extract_openai_text_reads_content():
+    assert _extract_openai_text({"choices": [{"message": {"content": "  hi there  "}}]}) == "hi there"
+
+
+def test_extract_openai_text_null_content_returns_none():
+    # A provider (a free gateway under load, or a reasoning model) can answer
+    # HTTP 200 with content=null. That must be treated as "no usable text"
+    # (None) — NOT crash with AttributeError on None.strip() — so the caller can
+    # cleanly fail over to the next provider instead of the whole request dying.
+    assert _extract_openai_text({"choices": [{"message": {"content": None}}]}) is None
+    assert _extract_openai_text({"choices": [{"message": {}}]}) is None
+    assert _extract_openai_text({"choices": [{}]}) is None
+    assert _extract_openai_text({"choices": []}) is None
+    assert _extract_openai_text({}) is None
+
+
+def test_extract_openai_text_does_not_leak_reasoning_scratchpad():
+    # If a reasoning model returns only its raw chain-of-thought in a side field
+    # and a null content, we return None (no answer) rather than surfacing the
+    # scratchpad — the operator complained about exactly that leak with "auto".
+    data = {"choices": [{"message": {"content": None, "reasoning_content": "let me think step 1..."}}]}
+    assert _extract_openai_text(data) is None
+
+
+# ---- reasoning-scratchpad stripping (clean replies from a leaky fallback) ---
+# A free gateway's "auto" route can land on a model that dumps its chain-of-
+# thought into the reply. _strip_reasoning keeps that scratchpad from ever
+# reaching the operator, without butchering a genuine answer.
+
+
+def test_strip_reasoning_removes_think_block():
+    assert _strip_reasoning("<think>plan the trade</think>Buy looks weak here.") == "Buy looks weak here."
+    assert _strip_reasoning("<Thinking>\nstep 1\n</Thinking>\n\nHold for now.") == "Hold for now."
+
+
+def test_strip_reasoning_trims_preamble_to_final_answer():
+    leaked = (
+        "Here's a thinking process:\n"
+        "1. Analyze user input: they want risk at 0.5%.\n"
+        "2. Decide it's sensible.\n"
+        "Final answer: 0.5% per trade is a solid beginner setting."
+    )
+    assert _strip_reasoning(leaked) == "0.5% per trade is a solid beginner setting."
+
+
+def test_strip_reasoning_preserves_action_tag_from_trimmed_part():
+    # The proposed action may sit in the reasoning body; it must survive the trim
+    # so the Confirm card still fires even when the answer prose came after it.
+    leaked = (
+        "Here's my thinking: they asked to cap exposure. "
+        '[[action:{"type":"settings","changes":{"max_total_exposure_pct":20.0}}]] '
+        "Final answer: capping you at 20%."
+    )
+    out = _strip_reasoning(leaked)
+    assert out.startswith("capping you at 20%")
+    assert '[[action:{"type":"settings"' in out
+
+
+def test_strip_reasoning_leaves_clean_answers_untouched():
+    clean = "Momentum's fading on BTC — I'd wait for a close above 85k before adding."
+    assert _strip_reasoning(clean) == clean
+
+
+def test_strip_reasoning_conservative_without_final_marker():
+    # Opens like reasoning but has no clear "final answer" boundary: leave it
+    # ALONE rather than risk deleting the real reply. Better messy than empty.
+    text = "Let me think about this. The trend is up and volume confirms it, so I'd stay long."
+    assert _strip_reasoning(text) == text
+
+
+def test_strip_reasoning_empty_and_none():
+    assert _strip_reasoning("") is None
+    assert _strip_reasoning(None) is None
+    assert _strip_reasoning("<think>only scratchpad, no answer</think>") is None
 
 
 # ---- fallbacks -------------------------------------------------------
@@ -449,6 +525,21 @@ def test_fallback_picks_up_when_primary_fails(monkeypatch):
     assert calls[1]["url"] == "https://fallback.example.com/messages"
     assert calls[1]["headers"]["x-api-key"] == "sk-ant-fallback"
     assert "Authorization" not in calls[1]["headers"]
+
+
+def test_null_content_from_primary_fails_over(monkeypatch):
+    # The dominant real-world flake on a free gateway: HTTP 200 but content=null.
+    # It must be treated as "no usable text" and fail over to the fallback, not
+    # crash the request — so the assistant keeps answering when it matters.
+    _install_sequence(monkeypatch, [
+        ("ok", {"choices": [{"message": {"content": None}}]}),
+        _ANTHROPIC_FB_OK,
+    ])
+    ai = AICommentator(_dual_settings())
+    out = ai.chat("how is my bot doing?")
+    assert out == "fallback answer"
+    assert ai._last_provider == "fallback"
+    assert len(_RecordingClient.calls) == 2
 
 
 def test_primary_ok_means_fallback_is_never_called(monkeypatch):
