@@ -1479,6 +1479,45 @@ pre.code {
     min-height: 44px;
     font-weight: 700;
   }
+  /* --- Finger-sized controls on phones ----------------------------------
+     The always-visible top-bar icons were 34px and the Stop-bot / Sign-out
+     pills 37px tall — fiddly to hit on a phone. Give every top-bar control a
+     ~44px touch target (Apple/Google minimum) without changing the desktop. */
+  /* Scoped under .topbar / .drawer so these win over the base rules that are
+     defined later in this file (equal specificity would otherwise lose). */
+  .topbar .hamburger { width: 44px; height: 44px; }
+  .topbar .notif-bell,
+  .topbar .theme-toggle { width: 44px; height: 44px; font-size: 17px; }
+  .topbar .btn { min-height: 42px; }
+  /* The drawer close was a 28px ✕; make it an obvious tap target and give the
+     nav rows a little more height so a thumb lands cleanly. */
+  .drawer .drawer-close {
+    font-size: 20px;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 8px 12px;
+  }
+  .drawer .drawer-item { padding: 13px 12px; }
+  /* Form controls (alert prices, settings, order entry, login) and buttons get
+     a full finger height on phones so they're easy to tap and type into. The
+     top-bar .btn override above (42px) still wins by specificity. */
+  .input,
+  .select,
+  select.select { min-height: 40px; }
+  .btn { min-height: 40px; }
+  /* Chart header pickers (symbol, timeframe, indicators, ICT) were 30-37px —
+     bump them to a full finger height so they're easy to open on a phone. */
+  .sym-picker-btn,
+  .ind-btn,
+  .chart-panel .panel-head select {
+    min-height: 42px;
+  }
+  /* The vertical drawing palette overlays the chart, so keep it compact, but
+     28px tool buttons and 20px colour dots are too small for a fingertip.
+     Enlarge them enough to tap reliably while the strip still fits the chart. */
+  .chart-toolbar .ct-btn { width: 36px; height: 36px; font-size: 17px; }
+  .chart-toolbar .ct-swatch { width: 26px; height: 26px; }
+  .chart-toolbar .ct-sep { width: 26px; }
 }
 
 /* Hamburger + left navigation drawer ------------------------------- */
