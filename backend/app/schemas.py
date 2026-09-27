@@ -53,6 +53,7 @@ class TradeOut(BaseModel):
     order_type: str = "market"
     limit_price: Optional[float] = None
     pnl: float
+    fee: float = 0.0  # real exchange fees observed (quote); live only, else 0
     mode: str
     source: str
     note: Optional[str]

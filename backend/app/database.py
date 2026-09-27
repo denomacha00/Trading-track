@@ -75,6 +75,7 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "order_type": "VARCHAR(8) DEFAULT 'market'",
         "limit_price": "FLOAT",
         "user_id": "INTEGER",
+        "fee": "FLOAT DEFAULT 0.0",
     },
     "signal_logs": {"user_id": "INTEGER"},
     # Multi-tenant licensing v2: username login + time-limited licences.

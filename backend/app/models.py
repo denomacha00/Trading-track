@@ -144,6 +144,12 @@ class Trade(Base):
     take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(12), default=TradeStatus.open.value, index=True)
     pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    # Real exchange fees actually observed on this trade, expressed in the QUOTE
+    # asset and summed across the entry + exit legs. LIVE only: paper trades leave
+    # this 0.0 and model fees via the configurable simulated taker fee instead.
+    # Live realized P&L is booked net of this — we never invent a fee, only
+    # subtract ones the venue reported. See TradingEngine._fill_details.
+    fee: Mapped[float] = mapped_column(Float, default=0.0)
     order_type: Mapped[str] = mapped_column(String(8), default="market")
     limit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     mode: Mapped[str] = mapped_column(String(8), default="paper")

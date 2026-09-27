@@ -917,6 +917,7 @@ class TradingEngine:
 
             qty = decision.amount
             exchange_order_id: str | None = None
+            entry_fee = 0.0  # real quote fee observed on a LIVE open; paper stays 0
 
             # ---- LIMIT order: rest it, fill later when price crosses ----
             if limit_price:
@@ -991,6 +992,12 @@ class TradingEngine:
                     exchange_order_id = str(order.get("id")) if order else None
                     filled_price = float(order.get("average") or order.get("price") or price)
                     price = filled_price
+                    # Book the REAL filled base qty (net of any base-asset fee),
+                    # not the requested size — over-reporting holdings is what
+                    # later hits -2010 on the close. Capture the entry fee too.
+                    qty, entry_fee = self._net_fill(order, symbol, price, action, qty)
+                    if qty <= 0:
+                        return False, "Rejected: exchange reported a zero fill", None
                 except Exception as exc:
                     return False, self._friendly_exchange_error(exc, "order"), None
             else:
@@ -1024,6 +1031,7 @@ class TradingEngine:
                 source=source,
                 exchange_order_id=exchange_order_id,
                 stop_order_id=stop_order_id,
+                fee=entry_fee,
                 note=note,
                 opened_at=_utcnow(),
                 user_id=self.user_id,
@@ -1064,6 +1072,7 @@ class TradingEngine:
         if kind == "market":
             price = self._price(symbol)
             exchange_order_id: str | None = None
+            entry_fee = 0.0  # real quote fee observed on a LIVE open; paper stays 0
             if self.settings.is_live:
                 spread_reason = self._spread_guard(symbol)
                 if spread_reason:
@@ -1076,6 +1085,10 @@ class TradingEngine:
                     order = self.connector.create_market_order(symbol, "buy", qty)
                     exchange_order_id = str(order.get("id")) if order else None
                     price = float(order.get("average") or order.get("price") or price)
+                    # Real filled base qty (net of base-asset fee) + observed fee.
+                    qty, entry_fee = self._net_fill(order, symbol, price, "buy", qty)
+                    if qty <= 0:
+                        return False, "Rejected: exchange reported a zero fill", None
                 except Exception as exc:
                     return False, self._friendly_exchange_error(exc, "order"), None
             else:
@@ -1095,7 +1108,7 @@ class TradingEngine:
                 stop_loss=sl, take_profit=tp, status=TradeStatus.open.value,
                 mode=self.settings.trading_mode, source=source,
                 exchange_order_id=exchange_order_id, stop_order_id=stop_order_id,
-                note=note, opened_at=_utcnow(), user_id=self.user_id,
+                fee=entry_fee, note=note, opened_at=_utcnow(), user_id=self.user_id,
             )
             db.add(trade)
             db.commit()
@@ -1419,6 +1432,7 @@ class TradingEngine:
         for trade in list(db.scalars(stmt).all()):
             limit = trade.limit_price or trade.entry_price
             filled_amt: float | None = None  # live: exchange-reported fill qty
+            entry_fee: float = 0.0           # live: real quote fee on the fill
             if self.settings.is_live:
                 order = self.connector.fetch_order(
                     trade.exchange_order_id or "", trade.symbol
@@ -1454,9 +1468,15 @@ class TradingEngine:
                 # quantity so venue rounding never leaves us over-reporting.
                 if status not in {"closed", "filled"}:
                     continue
-                filled_amt = float(order.get("filled") or 0) or trade.amount
                 fill_price = float(
                     order.get("average") or order.get("price") or limit
+                )
+                # Track the REAL filled base qty (net of any base-asset fee) and
+                # capture the observed entry fee, so we never over-report holdings
+                # nor overstate P&L. Falls back to the tracked size if the venue
+                # reports no positive fill.
+                filled_amt, entry_fee = self._net_fill(
+                    order, trade.symbol, fill_price, trade.side, trade.amount
                 )
             else:
                 try:
@@ -1495,6 +1515,7 @@ class TradingEngine:
                         continue
                 if filled_amt is not None:
                     trade.amount = filled_amt
+                    trade.fee = (trade.fee or 0.0) + entry_fee
                 self._fill_pending(db, trade, fill_price)
             filled.append(trade)
         return filled
@@ -1578,6 +1599,10 @@ class TradingEngine:
                 price = float(
                     close_order.get("average") or close_order.get("price") or price
                 )
+                # Add the REAL exit fee to the trade's fee tally so realized P&L
+                # is booked net of both legs (entry fee was captured at open).
+                _, exit_fee, _ = self._fill_details(close_order, trade.symbol, price)
+                trade.fee = (trade.fee or 0.0) + exit_fee
 
         return self._book_close(db, trade, price, reason)
 
@@ -1658,15 +1683,95 @@ class TradingEngine:
             gross = (trade.entry_price - exit_price) * trade.amount
         # PAPER mode charges a realistic, configurable taker fee on BOTH legs so
         # the simulated wallet reflects the true cost of trading (fees are a real
-        # drag every trader pays). This is honest simulation. LIVE P&L stays the
-        # raw fill-price difference — Binance deducts its own real fees on the
-        # user's actual account, and we never invent a fee we didn't observe.
+        # drag every trader pays). This is honest simulation. LIVE P&L subtracts
+        # the REAL fees the venue reported (trade.fee, in quote), captured on the
+        # entry and exit fills — never a fee we invented, never zero-by-omission.
         if not self.settings.is_live:
             fee_pct = max(getattr(self.settings, "paper_taker_fee_pct", 0.0) or 0.0, 0.0)
             if fee_pct > 0:
                 fee_rate = fee_pct / 100.0
                 gross -= (trade.entry_price + exit_price) * trade.amount * fee_rate
-        return gross
+            return gross
+        return gross - (getattr(trade, "fee", 0.0) or 0.0)
+
+    @staticmethod
+    def _fill_details(
+        order: dict | None, symbol: str, fill_price: float
+    ) -> tuple[float, float, float]:
+        """Parse a ccxt order into ``(filled_base, fee_quote, fee_base)`` — the
+        REAL economic result of a live fill, never an invented one.
+
+        * ``filled_base`` — base quantity the venue reports filled
+          (``order['filled']``); ``0.0`` when absent/unparseable.
+        * ``fee_quote`` — total fee expressed in the QUOTE asset, summed over
+          every fee entry we can value from data we actually have: a quote fee is
+          taken as-is; a base-asset fee is valued at ``fill_price`` (a real fill
+          price, not a guess). A fee charged in a THIRD asset (e.g. BNB) is left
+          OUT rather than converted with a price we never observed — we under-
+          count that rare case instead of fabricating a number.
+        * ``fee_base`` — the portion charged in the BASE asset. On a spot BUY the
+          venue takes this out of the coins you receive, so it reduces the amount
+          you can later sell; booking the gross fill over-reports holdings and a
+          later close hits Binance -2010 (insufficient balance).
+
+        Handles both ccxt fee shapes: the itemised ``order['fees']`` list when
+        present (authoritative — avoids double counting), else single ``fee``.
+        """
+        if not order:
+            return 0.0, 0.0, 0.0
+        try:
+            filled_base = float(order.get("filled") or 0.0)
+        except (TypeError, ValueError):
+            filled_base = 0.0
+        if filled_base < 0:
+            filled_base = 0.0
+        base = quote = ""
+        if symbol and "/" in symbol:
+            base_part, _, rest = symbol.partition("/")
+            base = base_part.upper()
+            quote = rest.split(":", 1)[0].upper()  # drop any ":settle" suffix
+        entries = order.get("fees")
+        if not isinstance(entries, list) or not entries:
+            single = order.get("fee")
+            entries = [single] if isinstance(single, dict) else []
+        fee_quote = 0.0
+        fee_base = 0.0
+        for f in entries:
+            if not isinstance(f, dict):
+                continue
+            try:
+                cost = float(f.get("cost") or 0.0)
+            except (TypeError, ValueError):
+                cost = 0.0
+            if cost <= 0:
+                continue
+            cur = str(f.get("currency") or "").upper()
+            if quote and cur == quote:
+                fee_quote += cost
+            elif base and cur == base:
+                fee_base += cost
+                if fill_price > 0:
+                    fee_quote += cost * fill_price
+            # else: fee in a third asset we can't value from real data — skip it
+            # rather than convert with a price we never observed.
+        return filled_base, fee_quote, fee_base
+
+    def _net_fill(
+        self, order: dict | None, symbol: str, fill_price: float,
+        side: str, requested_qty: float,
+    ) -> tuple[float, float]:
+        """Return ``(net_base_qty, entry_fee_quote)`` for a live open fill.
+
+        ``net_base_qty`` is what we can actually SELL later: the venue-reported
+        filled quantity, minus any base-asset fee the venue skimmed off a BUY.
+        Falls back to ``requested_qty`` when the venue reports no positive fill.
+        """
+        filled_base, fee_quote, fee_base = self._fill_details(order, symbol, fill_price)
+        qty = filled_base if filled_base > 0 else requested_qty
+        if side == "buy" and fee_base > 0:
+            qty = max(qty - fee_base, 0.0)
+        return qty, fee_quote
+
 
     @staticmethod
     def unrealized_pnl(trade: Trade, price: float) -> float:
