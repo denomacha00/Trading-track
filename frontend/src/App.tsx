@@ -240,6 +240,13 @@ function Dashboard({
   const [showTradeMarkers, setShowTradeMarkers] = useState<boolean>(
     () => localStorage.getItem('tt.showTradeMarkers') === '1',
   )
+  // Bumped to tell PriceChart to wipe every hand-drawn line (the assistant's
+  // "clear the drawings" command). A counter, not a boolean, so each request is a
+  // distinct edge PriceChart can react to.
+  const [chartClearSignal, setChartClearSignal] = useState(0)
+  // View-history for the assistant's chart commands, so "undo" steps the chart
+  // back one change. Each entry is the view as it was BEFORE a change we applied.
+  const chartUndoRef = useRef<{ symbol: string; timeframe: string; indicators: IndicatorPrefs }[]>([])
   useEffect(() => {
     localStorage.setItem('tt.chartView', chartView)
   }, [chartView])
@@ -249,6 +256,68 @@ function Dashboard({
   useEffect(() => {
     localStorage.setItem('tt.showTradeMarkers', showTradeMarkers ? '1' : '0')
   }, [showTradeMarkers])
+  // Apply a VIEW-ONLY chart command from the assistant (switch symbol/timeframe,
+  // toggle indicators, clear drawings — or step back one change on `undo`). It only
+  // ever changes what the operator is LOOKING AT; it moves no money and calls no
+  // endpoint. Returns a short, TRUE summary of what actually changed, which the
+  // assistant shows as the outcome line — so it's never the AI claiming something
+  // it didn't really do. Defined as a plain closure so it always reads the freshest
+  // chart state for its undo snapshot.
+  const applyChartControl = (c: {
+    symbol?: string
+    timeframe?: string
+    indicators?: Partial<IndicatorPrefs>
+    clear_drawings?: boolean
+    undo?: boolean
+  }): string => {
+    if (c.undo) {
+      const prev = chartUndoRef.current.pop()
+      if (!prev) return 'Nothing to undo on the chart.'
+      setSymbol(prev.symbol)
+      setTimeframe(prev.timeframe)
+      setIndicators(prev.indicators)
+      if (chartView !== 'bot') setChartView('bot')
+      const on = Object.entries(prev.indicators).filter(([, v]) => v).map(([k]) => k).join(', ')
+      return `Reverted the chart to ${prev.symbol} · ${prev.timeframe}${on ? ` · ${on}` : ''}.`
+    }
+    const parts: string[] = []
+    const viewChanges =
+      (!!c.symbol && c.symbol !== symbol) ||
+      (!!c.timeframe && c.timeframe !== timeframe) ||
+      (!!c.indicators && Object.keys(c.indicators).length > 0)
+    // Snapshot the CURRENT view before a view change so `undo` can restore it.
+    // Clearing drawings is destructive and NOT snapshotted — undo can't un-delete
+    // drawings (and the assistant is told to say so).
+    if (viewChanges) {
+      chartUndoRef.current.push({ symbol, timeframe, indicators })
+      if (chartUndoRef.current.length > 25) chartUndoRef.current.shift()
+    }
+    if (c.symbol && c.symbol !== symbol) {
+      setSymbol(c.symbol)
+      parts.push(`symbol → ${c.symbol}`)
+    }
+    if (c.timeframe && c.timeframe !== timeframe) {
+      setTimeframe(c.timeframe)
+      parts.push(`timeframe → ${c.timeframe}`)
+    }
+    if (c.indicators && Object.keys(c.indicators).length > 0) {
+      const inds = c.indicators
+      setIndicators((cur) => ({ ...cur, ...inds }))
+      const shown = Object.entries(inds).filter(([, v]) => v).map(([k]) => k)
+      const hidden = Object.entries(inds).filter(([, v]) => v === false).map(([k]) => k)
+      if (shown.length) parts.push(`show ${shown.join(', ')}`)
+      if (hidden.length) parts.push(`hide ${hidden.join(', ')}`)
+    }
+    if (c.clear_drawings) {
+      setChartClearSignal((n) => n + 1)
+      parts.push('cleared all drawings')
+    }
+    if (!parts.length) return 'The chart already matched that — nothing to change.'
+    // The TradingView embed can't be driven, so make sure the operator is on our
+    // own real-data chart where these changes are actually visible.
+    if (chartView !== 'bot') setChartView('bot')
+    return `Chart updated: ${parts.join(' · ')}.`
+  }
   // Wall-clock of the last status we received (WS push or poll), so the bot
   // activity strip can show an honest "updated Ns ago" heartbeat.
   const [statusTs, setStatusTs] = useState(0)
@@ -1049,6 +1118,7 @@ function Dashboard({
                   priceLines={chartPriceLines}
                   indicators={indicators}
                   markers={showTradeMarkers ? chartMarkers : []}
+                  clearSignal={chartClearSignal}
                 />
               ) : (
                 <div className="empty">
@@ -1299,6 +1369,7 @@ function Dashboard({
                   ttsSupported={ttsSupported}
                   speak={speak}
                   onNavigate={setTab}
+                  onChartControl={applyChartControl}
                   onError={(m) => showToast('error', m)}
                 />
               )}
@@ -2833,6 +2904,7 @@ function AssistantPanel({
   ttsSupported,
   speak,
   onNavigate,
+  onChartControl,
   onError,
 }: {
   symbol: string
@@ -2848,6 +2920,16 @@ function AssistantPanel({
   ttsSupported: boolean
   speak: (text: string) => void
   onNavigate: (dest: TabKey) => void
+  // Apply a VIEW-ONLY chart command (owned by the Dashboard so it drives the real
+  // chart). Returns a TRUE one-line summary of what actually changed, used as the
+  // action's outcome — never the AI claiming a change it didn't make.
+  onChartControl: (c: {
+    symbol?: string
+    timeframe?: string
+    indicators?: Partial<IndicatorPrefs>
+    clear_drawings?: boolean
+    undo?: boolean
+  }) => string
   onError: (msg: string) => void
 }) {
   const [input, setInput] = useState('')
@@ -2969,6 +3051,21 @@ function AssistantPanel({
       return { title: a.state === 'start' ? 'Start the bot' : 'Stop the bot', lines: [a.state === 'start' ? 'Begin trading / monitoring per your settings.' : 'Halt autonomous trading.'], danger: false }
     if (a.type === 'alert')
       return { title: 'Set a price alert', lines: [`${a.symbol} ${a.condition} ${a.price}`, ...(a.note ? [`Note: ${a.note}`] : []), 'Notifies you on a REAL price cross — it never trades.'], danger: false }
+    if (a.type === 'chart') {
+      if (a.undo) return { title: 'Undo chart change', lines: ['Step the chart back to the previous view.', 'View only — shows things, moves no money.'], danger: false }
+      const lines: string[] = []
+      if (a.symbol) lines.push(`Symbol → ${a.symbol}`)
+      if (a.timeframe) lines.push(`Timeframe → ${a.timeframe}`)
+      if (a.indicators && Object.keys(a.indicators).length) {
+        const shown = Object.entries(a.indicators).filter(([, v]) => v).map(([k]) => k)
+        const hidden = Object.entries(a.indicators).filter(([, v]) => v === false).map(([k]) => k)
+        if (shown.length) lines.push(`Show: ${shown.join(', ')}`)
+        if (hidden.length) lines.push(`Hide: ${hidden.join(', ')}`)
+      }
+      if (a.clear_drawings) lines.push('Clear all drawings (can’t be undone).')
+      lines.push('View only — shows things, moves no money.')
+      return { title: 'Update the chart', lines, danger: false }
+    }
     return { title: 'Train a strategy', lines: [`${a.strategy} on ${a.symbol} ${a.timeframe}`, 'Measures real results on history; saves only if it beats the baseline.'], danger: false }
   }
 
@@ -3021,6 +3118,19 @@ function AssistantPanel({
             ? `✅ Trained ${rep.strategy} on ${rep.symbol} ${rep.timeframe}: return ${rep.best.total_return_pct.toFixed(2)}%, win ${rep.best.win_rate_pct.toFixed(1)}%, ${rep.best.num_trades} trades — ${rep.saved ? 'saved to your account.' : 'not saved (did not beat the baseline).'}${rep.warning ? ` Note: ${rep.warning}` : ''}`
             : `ℹ️ Training ran but found no config beating the baseline${rep.warning ? ` — ${rep.warning}` : ''}.`,
         )
+      } else if (action.type === 'chart') {
+        // VIEW-ONLY and local: no endpoint, no money. Apply it to the real chart
+        // and report exactly what changed (the summary comes from the applier, so
+        // the outcome line is the truth of what happened, not the AI's claim).
+        const summary = onChartControl({
+          symbol: action.symbol,
+          timeframe: action.timeframe,
+          indicators: action.indicators,
+          clear_drawings: action.clear_drawings,
+          undo: action.undo,
+        })
+        setActionState(idx, 'done')
+        pushResult('✅ ' + summary)
       }
     } catch (e) {
       const msg = (e as Error).message

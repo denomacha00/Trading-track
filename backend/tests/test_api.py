@@ -647,6 +647,61 @@ def test_normalize_alert():
     assert _normalize_proposed_action({"type": "alert", "symbol": "BTC", "condition": "above", "price": 1}, None) is None
 
 
+def test_normalize_chart_view_action():
+    # The chart action is VIEW-ONLY (it changes what the operator is looking at and
+    # moves no money). Only real, allowlisted fields survive; bad ones are dropped.
+    from app.main import _normalize_proposed_action
+
+    a = _normalize_proposed_action(
+        {
+            "type": "chart",
+            "symbol": "eth/usdt",  # upper-cased
+            "timeframe": "4H",  # lower-cased, in the allowed set
+            "indicators": {
+                "rsi": "true",  # coerced to bool
+                "macd": True,
+                "ema9": False,  # explicit hide survives
+                "bogus": True,  # unknown key -> dropped
+            },
+            "clear_drawings": "yes",  # coerced to bool
+            "reason": "show momentum",
+        },
+        None,
+    )
+    assert a == {
+        "type": "chart",
+        "symbol": "ETH/USDT",
+        "timeframe": "4h",
+        "indicators": {"rsi": True, "macd": True, "ema9": False},
+        "clear_drawings": True,
+        "reason": "show momentum",
+        "auto": False,  # no engine/autopilot off => confirm-gated
+    }
+
+
+def test_normalize_chart_undo_is_standalone():
+    # "undo when asked" — a pure undo needs no other field and short-circuits; the
+    # frontend maps it to its own view-history stack.
+    from app.main import _normalize_proposed_action
+
+    a = _normalize_proposed_action({"type": "chart", "undo": True}, None)
+    assert a == {"type": "chart", "reason": None, "auto": False, "undo": True}
+
+
+def test_normalize_chart_rejects_empty_and_bad_fields():
+    # An empty tag (nothing actionable) yields None so no do-nothing card renders;
+    # a bad timeframe / non-pair symbol / all-unknown indicators are dropped, and if
+    # nothing real is left the whole proposal is refused.
+    from app.main import _normalize_proposed_action
+
+    assert _normalize_proposed_action({"type": "chart"}, None) is None
+    assert _normalize_proposed_action({"type": "chart", "timeframe": "2h"}, None) is None  # not in the picker
+    assert _normalize_proposed_action({"type": "chart", "symbol": "BTC"}, None) is None  # no pair
+    assert _normalize_proposed_action({"type": "chart", "indicators": {"nope": True}}, None) is None
+    # A single valid field is enough to render a card.
+    assert _normalize_proposed_action({"type": "chart", "timeframe": "1h"}, None)["timeframe"] == "1h"
+
+
 class _AutopilotEngine:
     """Minimal engine stub exposing just the settings the normalizer reads."""
 
@@ -671,6 +726,8 @@ def test_autopilot_flag_gates_live_orders_but_not_paper():
     assert _normalize_proposed_action({"type": "settings", "changes": {"max_open_positions": 3}}, eng)["auto"] is True
     assert _normalize_proposed_action({"type": "bot", "state": "start"}, eng)["auto"] is True
     assert _normalize_proposed_action({"type": "alert", "symbol": "BTC/USDT", "condition": "above", "price": 65000}, eng)["auto"] is True
+    # A chart (view-only) change is always in the safe subset.
+    assert _normalize_proposed_action({"type": "chart", "timeframe": "1h"}, eng)["auto"] is True
 
     # Autopilot ON + LIVE: a real-money order is NEVER auto (always confirm-gated),
     # even though non-money actions still are.
@@ -773,6 +830,8 @@ def test_ai_chat_proposes_every_action_type(client, monkeypatch):
         ('[[action:{"type":"bot","state":"start"}]]', "bot"),
         ('[[action:{"type":"alert","symbol":"BTC/USDT","condition":"above","price":65000}]]', "alert"),
         ('[[action:{"type":"train","symbol":"BTC/USDT","strategy":"ma_cross","timeframe":"1h"}]]', "train"),
+        ('[[action:{"type":"chart","symbol":"BTC/USDT","indicators":{"rsi":true}}]]', "chart"),
+        ('[[action:{"type":"chart","undo":true}]]', "chart"),
     ]
     for tag, expected_type in cases:
         monkeypatch.setattr(engine.ai, "chat", lambda q, _t=tag, **k: f"On it.\n{_t}")

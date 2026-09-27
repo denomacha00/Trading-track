@@ -1,5 +1,7 @@
 // Shared types mirroring the backend schemas.
 
+import type { IndicatorPrefs } from './indicators'
+
 export interface BotStatus {
   running: boolean
   trading_mode: string
@@ -105,6 +107,20 @@ export type ProposedAction =
       condition: 'above' | 'below'
       price: number
       note?: string | null
+      reason?: string | null
+      auto?: boolean
+    }
+  // VIEW-ONLY: change what's on the chart (moves no money, touches no account
+  // state). Every field is optional — only what changes is sent. `undo:true` is a
+  // standalone request that steps the view back one change via the app's own
+  // history stack. Applied by the app locally, never by a network endpoint.
+  | {
+      type: 'chart'
+      symbol?: string
+      timeframe?: string
+      indicators?: Partial<IndicatorPrefs>
+      clear_drawings?: boolean
+      undo?: boolean
       reason?: string | null
       auto?: boolean
     }

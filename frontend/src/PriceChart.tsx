@@ -176,6 +176,7 @@ export function PriceChart({
   priceLines,
   indicators,
   markers,
+  clearSignal,
 }: {
   candles: Candle[]
   theme: Theme
@@ -203,6 +204,10 @@ export function PriceChart({
   // closed (see tradesToMarkers). Real trade history only — undefined or empty
   // means no markers; nothing here is ever invented.
   markers?: ChartMarker[]
+  // Bumped by the parent to wipe every hand-drawn line (the assistant's "clear the
+  // drawings" command). A change in value is the trigger; the initial value is a
+  // no-op so mounting never clears the user's saved drawings.
+  clearSignal?: number
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -1128,6 +1133,17 @@ export function PriceChart({
   }
   // Keep the ref the window keydown handler calls pointed at the live closures.
   actionsRef.current = { del: deleteSelected, cancel: cancelDraw }
+
+  // Wipe all drawings when the parent bumps clearSignal (the assistant's "clear
+  // the drawings" command). A change in value is the trigger; the value seen on
+  // mount is ignored so first render never nukes the user's saved drawings.
+  const prevClearRef = useRef(clearSignal)
+  useEffect(() => {
+    if (clearSignal === prevClearRef.current) return
+    prevClearRef.current = clearSignal
+    clearAll()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clearSignal])
 
   // Grow the wrapper by one fixed-height slot per active oscillator so price
   // keeps its height and each pane stacks below (like adding TradingView panes).

@@ -149,19 +149,22 @@ _NAV_ACTIONS = (
 # emits one machine-read tag describing the action, the backend validates it
 # against a strict allowlist and hands the frontend a proposal, and the app shows
 # the operator a Confirm/Cancel card. Nothing touches money or settings until the
-# operator clicks Confirm. The JSON must be a FLAT object (no nested braces).
+# operator clicks Confirm. The JSON is a single object; it may nest (e.g. settings
+# carries a "changes" object, chart an "indicators" object).
 _ACTION_GUIDE = (
     "ACTION PROTOCOL — how you actually DO things:\n"
     "When the operator asks you to place/close a trade, change a setting, start or "
-    "stop the bot, set a price alert, or train a strategy, first say (briefly) what "
+    "stop the bot, set a price alert, train a strategy, or show/change what's on the "
+    "chart, first say (briefly) what "
     "you'll do and why, THEN append on its own final line ONE tag of the form "
-    "[[action:{...}]] whose body is a single flat JSON object. Emit at most one "
+    "[[action:{...}]] whose body is a single JSON object. Emit at most one "
     "action tag (and don't also emit a goto tag). Only propose an action the user "
     "actually asked for or clearly agreed to. Use REAL values from the context; if "
     "you don't have a real number, ask instead of guessing.\n"
     "WHAT HAPPENS TO YOUR TAG — and how to talk about it truthfully: if the operator "
     "has AUTOPILOT ON (the account snapshot tells you), the app APPLIES the safe "
-    "actions for them right away — settings, bot start/stop, price alerts and PAPER "
+    "actions for them right away — settings, bot start/stop, price alerts, chart view "
+    "changes and PAPER "
     "orders — and shows the real outcome. If autopilot is OFF, the tag becomes a "
     "Confirm card and NOTHING happens until they tap it. A LIVE (real-money) order "
     "and switching paper<->live ALWAYS wait for their explicit confirmation, autopilot "
@@ -192,6 +195,17 @@ _ACTION_GUIDE = (
     '• Train + save a strategy: {"type":"train","symbol":"BTC/USDT",'
     '"strategy":"ma_cross","timeframe":"1h","reason":"..."}. Training measures real '
     "results on history and only saves if it genuinely beats the baseline.\n"
+    '• Control the chart — VIEW ONLY, it shows things and moves NO money: '
+    '{"type":"chart","symbol":"BTC/USDT","timeframe":"1h",'
+    '"indicators":{"rsi":true,"macd":true,"ema9":false},"clear_drawings":false,'
+    '"reason":"..."}. Every field is optional — send ONLY what changes. Use it just '
+    "when the operator asks you to show a symbol, switch timeframe, add/remove an "
+    "indicator, or wipe the hand-drawn lines. Indicator keys (true=show, false=hide): "
+    "ema9, ema21, sma50, sma200, bb, vwap, rsi, macd, volume, volumeProfile. "
+    "Timeframes: 1m,5m,15m,1h,4h,1d. To UNDO your last chart change when they ask, "
+    'send {"type":"chart","undo":true} — that steps the view back one change. One '
+    "caution to state honestly: clearing drawings deletes them, so undo restores the "
+    "view (symbol/timeframe/indicators) but cannot bring wiped drawings back.\n"
     "The tag is hidden from the user, so keep your sentence before it self-contained."
 )
 

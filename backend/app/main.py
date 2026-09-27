@@ -1527,6 +1527,17 @@ _AI_SETTINGS_BOOL = {
 }
 _AI_SETTINGS_STR = {"auto_symbols", "auto_timeframe", "auto_confirm_timeframe"}
 
+# Chart is a VIEW-ONLY action: it changes what the operator is LOOKING AT — the
+# symbol, the timeframe, which indicators/overlays are drawn, and clearing the
+# hand-drawn lines — and moves no money, touches no account state. So it's always
+# safe to autopilot. The indicator keys mirror the frontend IndicatorPrefs exactly
+# and the timeframe set mirrors the chart's own picker; anything else is dropped.
+_AI_CHART_INDICATORS = {
+    "ema9", "ema21", "sma50", "sma200", "bb", "vwap",
+    "rsi", "macd", "volume", "volumeProfile",
+}
+_AI_CHART_TIMEFRAMES = {"1m", "5m", "15m", "1h", "4h", "1d"}
+
 
 def _coerce_bool(v) -> bool | None:
     if isinstance(v, bool):
@@ -1671,6 +1682,48 @@ def _normalize_proposed_action(raw: dict | None, engine) -> dict | None:
                 "reason": reason,
                 "auto": autopilot,
             }
+
+        if atype == "chart":
+            # VIEW-ONLY: change what the operator is looking at. Moves no money and
+            # touches no account state, so it's autopilot-safe like the other
+            # non-order actions. `undo` is a standalone request the frontend maps to
+            # its own view-history stack; otherwise we require at least one real
+            # change so an empty tag never renders a do-nothing card.
+            out: dict = {"type": "chart", "reason": reason, "auto": autopilot}
+            if _coerce_bool(raw.get("undo")):
+                out["undo"] = True
+                return out
+            changed = False
+            sym = raw.get("symbol")
+            if sym is not None:
+                s = str(sym).strip().upper()
+                if "/" in s:
+                    out["symbol"] = s
+                    changed = True
+            tf = raw.get("timeframe")
+            if tf is not None:
+                t = str(tf).strip().lower()
+                if t in _AI_CHART_TIMEFRAMES:
+                    out["timeframe"] = t
+                    changed = True
+            inds_in = raw.get("indicators")
+            if isinstance(inds_in, dict):
+                inds: dict = {}
+                for k, v in inds_in.items():
+                    key = str(k).strip()
+                    if key in _AI_CHART_INDICATORS:
+                        b = _coerce_bool(v)
+                        if b is not None:
+                            inds[key] = b
+                if inds:
+                    out["indicators"] = inds
+                    changed = True
+            if _coerce_bool(raw.get("clear_drawings")):
+                out["clear_drawings"] = True
+                changed = True
+            if not changed:
+                return None
+            return out
     except Exception:
         return None
     return None
