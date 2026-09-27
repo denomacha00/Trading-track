@@ -262,6 +262,17 @@ class Settings(BaseSettings):
     # running commentary.
     ai_monitor_enabled: bool = Field(default=False)
 
+    # ICT / smart-money analysis (informational; ON by default). When true, every
+    # deterministic analysis ALSO computes a real ICT read on the SAME closed bars
+    # — market structure (BOS/CHoCH/MSS), liquidity sweeps, order blocks, FVGs,
+    # breaker/rejection blocks, BPR, volume imbalances, EQH/EQL liquidity pools,
+    # draw-on-liquidity, premium/discount dealing range + OTE, and PDH/PDL/PWH/PWL.
+    # It is surfaced to the API (`/api/analyze` -> `ict`), drawn on the chart, and
+    # handed to the AI so it reads ICT on the REAL data instead of refusing. This
+    # is a read-only lens: it never sizes, places, or vetoes a trade on its own, so
+    # it's safe to leave on. Turn it off to hide the ICT layer everywhere.
+    ict_enabled: bool = Field(default=True)
+
     # Background MONITOR cadence (seconds between ticks): how often the engine
     # re-checks open positions (stops/targets/profit-lock), evaluates alerts, and
     # runs autonomous analysis. Lower = more responsive but more exchange calls;

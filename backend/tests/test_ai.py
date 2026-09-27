@@ -594,3 +594,76 @@ def test_single_provider_behaviour_unchanged(monkeypatch):
     assert len(_RecordingClient.calls) == 1
     assert ai._last_provider == "primary"
 
+
+# --- ICT read is fed to the AI (the "stop refusing ICT" wiring) -------------
+
+def _real_ict():
+    """A real computed ICT read on a hand-built frame (no network, no fake)."""
+    from app.ict import analyze_ict
+    from tests.test_ict import _triangle_frame
+
+    return analyze_ict(_triangle_frame(120), symbol="BTC/USDT")
+
+
+def test_ict_block_is_empty_without_a_read():
+    # No read -> no block, so the model is never told structure exists when it
+    # doesn't (honesty: absence is absence).
+    assert AICommentator._ict_block(None) == ""
+
+
+def test_ict_block_renders_only_real_computed_levels():
+    ict = _real_ict()
+    block = AICommentator._ict_block(ict)
+    assert block.startswith("ICT / smart-money read (REAL")
+    assert "Bias:" in block and "structure trend:" in block
+    # Any dealing-range edge it prints must be the REAL computed swing level,
+    # never a rounded/invented one.
+    d = ict.as_dict()
+    dr = d.get("dealing_range")
+    if dr:
+        assert f"{float(dr['high']):g}" in block
+        assert f"{float(dr['low']):g}" in block
+
+
+def test_ask_feeds_the_ict_read_and_capability_note(monkeypatch):
+    ai = AICommentator(_settings())
+    captured: dict = {}
+
+    def fake_post(system, prompt, **kw):
+        captured["system"], captured["prompt"] = system, prompt
+        return "ok"
+
+    monkeypatch.setattr(ai, "_post", fake_post)
+    ai.ask("give me the ICT read", _analysis(), ict=_real_ict())
+    # The real read reaches the model...
+    assert "ICT / smart-money read (REAL" in captured["prompt"]
+    # ...and the system prompt tells it to USE it rather than refuse.
+    assert "ICT / SMART-MONEY" in captured["system"]
+
+
+def test_chat_feeds_the_ict_read_and_capability_note(monkeypatch):
+    ai = AICommentator(_settings())
+    captured: dict = {}
+
+    def fake_post(system, prompt, **kw):
+        captured["system"], captured["prompt"] = system, prompt
+        return "ok"
+
+    monkeypatch.setattr(ai, "_post", fake_post)
+    ai.chat("how does ICT read here?", analysis=_analysis(), ict=_real_ict())
+    assert "ICT / smart-money read (REAL" in captured["prompt"]
+    assert "ICT / SMART-MONEY" in captured["system"]
+
+
+def test_ask_without_ict_has_no_ict_block(monkeypatch):
+    ai = AICommentator(_settings())
+    captured: dict = {}
+
+    def fake_post(system, prompt, **kw):
+        captured["prompt"] = prompt
+        return "ok"
+
+    monkeypatch.setattr(ai, "_post", fake_post)
+    ai.ask("plain question", _analysis())  # no ict passed
+    assert "ICT / smart-money read (REAL" not in captured["prompt"]
+

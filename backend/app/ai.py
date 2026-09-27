@@ -30,13 +30,36 @@ from app.config import Settings
 
 logger = logging.getLogger(__name__)
 
+# Shared capability note (added to BOTH the analyst and the assistant system
+# prompts) so the model actually USES the real ICT read the bot now computes,
+# instead of refusing. It only bites when an "ICT / smart-money read" block is
+# present in the context — which the callers add whenever ICT is enabled.
+_ICT_GUIDE = (
+    "ICT / SMART-MONEY: when the context contains an 'ICT / smart-money read', "
+    "it is REAL — the bot computed it from the SAME closed candles (no repaint) — "
+    "so USE it, don't refuse. Read the structure and name the ACTUAL levels from "
+    "it: market structure (BOS = continuation, CHoCH = possible reversal, MSS = a "
+    "CHoCH with displacement), liquidity sweeps (stop runs), order blocks, "
+    "fair-value gaps (FVG / imbalance), breaker & rejection blocks, balanced price "
+    "ranges (BPR), volume imbalances, equal highs/lows, the draw on liquidity "
+    "(nearest unswept pool = where price is likely drawn next) and the "
+    "premium/discount dealing range (favour selling premium / buying discount, "
+    "with the OTE 0.62-0.79 band) plus PDH/PDL/PWH/PWL. NEVER say you 'can't "
+    "compute ICT' or 'don't have an ICT read' when that block is present. If a "
+    "SPECIFIC element isn't in the data (e.g. no unmitigated FVG right now), say "
+    "so honestly rather than inventing one, and never fabricate a price. Treat "
+    "ICT as ONE lens alongside the deterministic verdict — weigh downside first "
+    "and never promise the setup will play out."
+)
+
 _SYSTEM_ANALYST = (
     "You are a rigorous, risk-first crypto trading analyst embedded in the "
     "Tranding-track bot. A deterministic engine already produced the numeric "
     "signal; your job is to reason about it like a careful desk analyst so the "
     "operator avoids costly mistakes. Always weigh downside first, flag when a "
     "setup is low-quality or conflicted, and NEVER promise profit or certainty. "
-    "Be concrete and concise."
+    "Be concrete and concise.\n\n"
+    + _ICT_GUIDE
 )
 
 _SYSTEM_ASSISTANT = (
@@ -112,6 +135,14 @@ _APP_GUIDE = (
     "• Tools: Analyze (deterministic buy/sell/hold verdict + factors, with optional "
     "AI narration/assessment), Backtest (test a strategy on history), Train (search "
     "strategy parameters on historical data).\n"
+    "• ICT / smart-money read: when ICT is enabled (Settings), every Analyze also "
+    "computes a REAL ICT read on the same closed bars and the chart can draw it — "
+    "market structure (BOS/CHoCH/MSS), liquidity sweeps, order blocks, fair-value "
+    "gaps, breaker/rejection blocks, premium/discount dealing range with the OTE "
+    "band, the draw on liquidity, and prior day/week highs & lows. It's an "
+    "analytical LENS, not an auto-trader: it never sizes, places or vetoes a trade "
+    "on its own. Ask me for an ICT read on any symbol and I use these real, "
+    "computed levels — I don't refuse or make them up.\n"
     "• Signals tab: a timeline of every analyzer/webhook signal, whether it was "
     "accepted, and its confidence.\n"
     "• TradingView: each user has a private webhook URL (Settings). Point a "
@@ -660,7 +691,7 @@ class AICommentator:
 
     # ---- public API --------------------------------------------------
 
-    def narrate(self, analysis: MarketAnalysis) -> str:
+    def narrate(self, analysis: MarketAnalysis, ict: Any = None) -> str:
         """Return an LLM explanation of the analysis, or the deterministic summary."""
         if not self.available:
             return analysis.summary
@@ -668,6 +699,7 @@ class AICommentator:
             "Explain in 2-4 sentences what the market is doing and why the verdict "
             "makes sense. Emphasise capital preservation.\n\n"
             + self._analysis_block(analysis)
+            + self._ict_suffix(ict)
         )
         return self._post(_SYSTEM_ANALYST, prompt, max_tokens=350) or analysis.summary
 
@@ -709,7 +741,7 @@ class AICommentator:
             return None
         return line
 
-    def assess(self, analysis: MarketAnalysis) -> str:
+    def assess(self, analysis: MarketAnalysis, ict: Any = None) -> str:
         """Deeper research-style assessment: quality, risks, scenarios, sizing.
 
         This is the "think harder" mode — it does not change the deterministic
@@ -727,12 +759,14 @@ class AICommentator:
             "5. One-line verdict: act or wait, and why.\n"
             "Be honest when the edge is weak. Never promise profit.\n\n"
             + self._analysis_block(analysis)
+            + self._ict_suffix(ict)
             + "\n\n"
             + self._risk_block()
         )
         return self._post(_SYSTEM_ANALYST, prompt) or analysis.summary
 
-    def ask(self, question: str, analysis: MarketAnalysis | None = None) -> str:
+    def ask(self, question: str, analysis: MarketAnalysis | None = None,
+            ict: Any = None) -> str:
         """Answer a free-form question, optionally grounded in current analysis."""
         if not self.available:
             return (
@@ -743,6 +777,7 @@ class AICommentator:
         context = ""
         if analysis is not None:
             context = "\n\nCurrent analysis JSON:\n" + json.dumps(analysis.as_dict())
+        context += self._ict_suffix(ict)
         reply = self._post(_SYSTEM_ANALYST, question + context)
         if reply is not None:
             return reply
@@ -753,6 +788,7 @@ class AICommentator:
         question: str,
         *,
         analysis: "MarketAnalysis | None" = None,
+        ict: Any = None,
         bot_context: str | None = None,
         news: list[dict] | None = None,
         history: Any = None,
@@ -780,6 +816,9 @@ class AICommentator:
             blocks.append("Live bot context (the user's own account):\n" + bot_context)
         if analysis is not None:
             blocks.append(self._analysis_block(analysis))
+        ict_block = self._ict_block(ict)
+        if ict_block:
+            blocks.append(ict_block)
         blocks.append(self._risk_block())
         if news:
             lines = []
@@ -830,6 +869,8 @@ class AICommentator:
             + _ACTION_GUIDE
             + "\n\n"
             + _SAFE_STARTER
+            + "\n\n"
+            + _ICT_GUIDE
         )
         reply = self._post(system, prompt, history=_sanitize_history(history))
         if reply is not None:
@@ -1001,6 +1042,109 @@ class AICommentator:
             f"Verdict: {analysis.verdict} (confidence {analysis.confidence:.0%}, "
             f"score {analysis.score:+.2f})\nFactors:\n{factors}"
         )
+
+    @staticmethod
+    def _ict_block(ict: Any) -> str:
+        """Compact, HONEST rendering of the computed ICT read for the model.
+
+        Every number here comes straight from the engine's real computation on
+        closed bars — nothing is invented. Returns "" when there is no ICT read
+        (lens off, or too thin for a call) so the caller simply omits it and the
+        model is never told there's structure when there isn't.
+        """
+        if ict is None:
+            return ""
+        try:
+            d = ict.as_dict()
+        except Exception:
+            return ""
+
+        def _n(v: Any) -> str:
+            try:
+                return f"{float(v):g}"
+            except (TypeError, ValueError):
+                return "?"
+
+        lines = [
+            "ICT / smart-money read (REAL — computed by the bot on CLOSED bars, "
+            "no repaint; use it, don't refuse):",
+            f"- Bias: {d.get('bias', 'neutral')}; structure trend: "
+            f"{d.get('trend', 'none')}",
+        ]
+        summ = str(d.get("summary") or "").strip()
+        if summ:
+            lines.append(f"- Read: {summ}")
+        dr = d.get("dealing_range")
+        if isinstance(dr, dict):
+            try:
+                pos = f"{float(dr.get('position_pct', 0)) * 100:.0f}%"
+            except (TypeError, ValueError):
+                pos = "?"
+            seg = (
+                f"- Dealing range: price in {dr.get('zone')} (equilibrium "
+                f"{_n(dr.get('equilibrium'))}, {pos} of {_n(dr.get('low'))}-"
+                f"{_n(dr.get('high'))}"
+            )
+            if dr.get("in_ote"):
+                seg += "; inside OTE"
+            lines.append(seg + ")")
+        events = [e for e in (d.get("events") or []) if isinstance(e, dict)]
+        if events:
+            ev = ", ".join(
+                f"{e.get('kind')} {e.get('direction')} @ {_n(e.get('level'))}"
+                + (" (displacement)" if e.get("displacement") else "")
+                for e in events[-3:]
+            )
+            lines.append(f"- Market structure: {ev}")
+        sweeps = [s for s in (d.get("sweeps") or []) if isinstance(s, dict)]
+        if sweeps:
+            sw = ", ".join(
+                f"{s.get('side')} sweep of {_n(s.get('level'))} "
+                f"(reaction {s.get('reaction')})"
+                for s in sweeps[-3:]
+            )
+            lines.append(f"- Liquidity sweeps: {sw}")
+        draw = d.get("draw_on_liquidity")
+        if isinstance(draw, dict):
+            parts = []
+            above, below = draw.get("above"), draw.get("below")
+            if isinstance(above, dict):
+                parts.append(f"above {_n(above.get('price'))}")
+            if isinstance(below, dict):
+                parts.append(f"below {_n(below.get('price'))}")
+            if parts:
+                lines.append(
+                    "- Draw on liquidity (nearest unswept pools): "
+                    + ", ".join(parts)
+                )
+
+        def _zones(key: str, label: str) -> None:
+            zs = [
+                z for z in (d.get(key) or [])
+                if isinstance(z, dict) and not z.get("mitigated")
+            ]
+            if zs:
+                txt = ", ".join(
+                    f"{z.get('kind')} {_n(z.get('bottom'))}-{_n(z.get('top'))}"
+                    for z in zs[:3]
+                )
+                lines.append(f"- {label}: {txt}")
+
+        _zones("order_blocks", "Fresh order blocks")
+        _zones("fvgs", "Open FVGs")
+        _zones("breakers", "Breaker blocks")
+        _zones("rejection_blocks", "Rejection blocks")
+        kl = d.get("key_levels")
+        if isinstance(kl, dict) and kl:
+            bits = ", ".join(f"{k.upper()} {_n(v)}" for k, v in kl.items())
+            lines.append(f"- Key levels: {bits}")
+        return "\n".join(lines)
+
+    def _ict_suffix(self, ict: Any) -> str:
+        """`\\n\\n` + the ICT block when there is one, else empty — for prompts
+        that concatenate rather than join a list of blocks."""
+        block = self._ict_block(ict)
+        return ("\n\n" + block) if block else ""
 
     def _risk_block(self) -> str:
         """The bot's own risk rules, so sizing/stop advice is grounded in the

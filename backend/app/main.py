@@ -36,6 +36,7 @@ from app import __version__
 from app.ai import strip_action_tag
 from app.backtest import run_backtest, summarize_backtest
 from app.config import get_settings
+from app.ict import analyze_ict
 from app.database import get_db, init_db
 from app.deps import get_current_user, require_admin, require_licensed_user
 from app.ratelimit import client_ip, limiter
@@ -123,7 +124,13 @@ def _engine_for(db: Session, user: User):
 
 
 def _analysis_for(engine, symbol: str, timeframe: str = "1h", limit: int = 200):
-    """Fetch candles via a user's connector and run deterministic analysis."""
+    """Fetch candles via a user's connector and run deterministic analysis.
+
+    Returns ``(analysis, ict)`` where ``ict`` is a real ICT/smart-money read on
+    the SAME closed frame (or ``None`` when the ICT lens is turned off for this
+    user). Both are computed from one candle fetch so the ICT structure lines up
+    exactly with the deterministic verdict the operator sees.
+    """
     try:
         raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, max(1, min(limit, 1000)))
     except Exception as exc:
@@ -137,8 +144,19 @@ def _analysis_for(engine, symbol: str, timeframe: str = "1h", limit: int = 200):
     # min_signal_confidence, not a module-global default. analyze_live decides
     # on CLOSED bars only (dropping the still-forming candle) so the verdict
     # cannot repaint, and stamps the live price back on for display.
-    analysis, _ = engine.analyzer.analyze_live(df, symbol.upper())
-    return analysis
+    analysis, closed = engine.analyzer.analyze_live(df, symbol.upper())
+    # The ICT read runs on the SAME closed frame (no repaint) and reuses the
+    # live price the analyzer stamped on, so premium/discount is measured against
+    # where price actually is. Best-effort: a read failure must never break the
+    # deterministic verdict — degrade to no ICT rather than 500.
+    ict = None
+    if getattr(engine.settings, "ict_enabled", True):
+        try:
+            ict = analyze_ict(closed, symbol=symbol.upper(), price=analysis.price)
+        except Exception:
+            logger.exception("ICT read failed for %s", symbol)
+            ict = None
+    return analysis, ict
 
 
 def _bootstrap_admin(db: Session) -> None:
@@ -1050,6 +1068,7 @@ def _settings_out(engine, user: User, db: Session | None = None) -> SettingsOut:
         ai_pretrade_analysis=getattr(s, "ai_pretrade_analysis", False),
         ai_monitor_enabled=getattr(s, "ai_monitor_enabled", False),
         ai_autopilot_enabled=getattr(s, "ai_autopilot_enabled", False),
+        ict_enabled=getattr(s, "ict_enabled", True),
         ai_enabled=bool(s.ai_api_key or getattr(s, "ai_fallback_api_key", "")),
         ai_model=s.ai_model,
         ai_style=engine.ai._style() if (s.ai_api_key or getattr(s, "ai_fallback_api_key", "")) else "",
@@ -1381,13 +1400,18 @@ def analyze(
     user: User = Depends(require_licensed_user),
 ):
     engine = _engine_for(db, user)
-    analysis = _analysis_for(engine, symbol, timeframe)
+    analysis, ict = _analysis_for(engine, symbol, timeframe)
     result = analysis.as_dict()
+    # Real ICT/smart-money read on the same closed bars (None when the lens is
+    # off for this user), so the chart can draw it and the operator sees the
+    # structure behind the verdict. `ict_enabled` tells the UI which state it's in.
+    result["ict"] = ict.as_dict() if ict is not None else None
+    result["ict_enabled"] = bool(getattr(engine.settings, "ict_enabled", True))
     if explain:
-        result["narration"] = engine.ai.narrate(analysis)
+        result["narration"] = engine.ai.narrate(analysis, ict=ict)
         result["ai_enabled"] = engine.ai.available
     if assess:
-        result["assessment"] = engine.ai.assess(analysis)
+        result["assessment"] = engine.ai.assess(analysis, ict=ict)
         result["ai_enabled"] = engine.ai.available
     return result
 
@@ -1417,12 +1441,14 @@ def ai_ask(
     # as /api/ai/chat): degrade gracefully to no-analysis context so the
     # assistant can still answer the question.
     analysis = None
+    ict = None
     if symbol:
         try:
-            analysis = _analysis_for(engine, str(symbol), str(timeframe))
+            analysis, ict = _analysis_for(engine, str(symbol), str(timeframe))
         except Exception:
             analysis = None
-    answer = engine.ai.ask(question, analysis)
+            ict = None
+    answer = engine.ai.ask(question, analysis, ict=ict)
     return {"answer": answer, "ai_enabled": engine.ai.available}
 
 
@@ -1775,6 +1801,9 @@ _AI_SETTINGS_BOOL = {
     "require_strategy_validation",
     "profit_lock_enabled",
     "take_profit_on_reversal",
+    # ICT/smart-money lens is read-only (no money behaviour), so it's safe for the
+    # AI to toggle and is deliberately NOT in _AI_RISK_SETTINGS below.
+    "ict_enabled",
 }
 _AI_SETTINGS_STR = {"auto_symbols", "auto_timeframe", "auto_confirm_timeframe"}
 
@@ -2045,11 +2074,13 @@ def ai_chat(
     # Only compute analysis if a symbol was given; a bad symbol shouldn't 502 the
     # whole chat, so degrade gracefully to no-analysis context.
     analysis = None
+    ict = None
     if symbol:
         try:
-            analysis = _analysis_for(engine, str(symbol), str(timeframe))
+            analysis, ict = _analysis_for(engine, str(symbol), str(timeframe))
         except Exception:
             analysis = None
+            ict = None
 
     # Full NON-secret snapshot of THIS user's own account so the assistant can
     # answer concretely ("how am I doing", "am I set up") — never any secret or
@@ -2102,6 +2133,7 @@ def ai_chat(
     reply = engine.ai.chat(
         question,
         analysis=analysis,
+        ict=ict,
         bot_context=bot_context,
         news=news or None,
         history=history,
