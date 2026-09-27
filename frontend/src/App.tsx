@@ -721,18 +721,29 @@ function Dashboard({
   // Real horizontal levels to MARK on the chart for the CURRENT symbol: each
   // ARMED price alert, plus every OPEN position's entry / stop-loss / take-profit.
   // Every value is a genuine number from the user's own data — never decorative.
+  // The entry / stop / target lines are drawn BOLDER than alerts (solid/thicker)
+  // and their labels carry the % distance from entry, so the closing levels show
+  // up alongside the entry line and read as "SL 12,098 (-2.0%)" / "TP (+4.0%)".
   const chartPriceLines = useMemo(() => {
     const sym = symbol.toUpperCase()
-    const lines: { price: number; color?: string; title?: string }[] = []
+    const lines: { price: number; color?: string; title?: string; dashed?: boolean; width?: 1 | 2 | 3 | 4 }[] = []
     for (const a of alerts) {
       if (a.status !== 'armed' || a.symbol.toUpperCase() !== sym) continue
       lines.push({ price: a.price, color: '#f0a020', title: `Alert ${a.condition} ${fmt(a.price)}` })
     }
+    // Signed % of a level away from entry, e.g. " (+4.0%)" / " (-2.0%)". Empty
+    // when entry is missing — we never invent a distance.
+    const gap = (level: number, entry: number | null | undefined) => {
+      if (!entry) return ''
+      const pct = ((level - entry) / entry) * 100
+      return ` (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%)`
+    }
     for (const t of trades) {
       if (t.status !== 'open' || t.symbol.toUpperCase() !== sym) continue
-      if (t.entry_price) lines.push({ price: t.entry_price, color: '#3b82f6', title: `Entry ${fmt(t.entry_price)}` })
-      if (t.stop_loss) lines.push({ price: t.stop_loss, color: '#ea3943', title: `SL ${fmt(t.stop_loss)}` })
-      if (t.take_profit) lines.push({ price: t.take_profit, color: '#16c784', title: `TP ${fmt(t.take_profit)}` })
+      const entry = t.entry_price
+      if (entry) lines.push({ price: entry, color: '#3b82f6', title: `Entry ${fmt(entry)}`, dashed: false, width: 2 })
+      if (t.stop_loss) lines.push({ price: t.stop_loss, color: '#ea3943', width: 2, title: `SL ${fmt(t.stop_loss)}${gap(t.stop_loss, entry)}` })
+      if (t.take_profit) lines.push({ price: t.take_profit, color: '#16c784', width: 2, title: `TP ${fmt(t.take_profit)}${gap(t.take_profit, entry)}` })
     }
     return lines
   }, [alerts, trades, symbol])

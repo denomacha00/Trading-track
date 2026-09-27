@@ -196,7 +196,10 @@ export function PriceChart({
   // Horizontal reference levels drawn on the price axis (real "marking"): armed
   // price alerts and open-position entry / stop-loss / take-profit levels. Each
   // is a genuine number from the user's OWN data — nothing decorative or faked.
-  priceLines?: { price: number; color?: string; title?: string }[]
+  // `dashed` / `width` let a caller make a line stand out (e.g. an open
+  // position's entry / stop / target) versus a faint reference (armed alerts).
+  // Both are style only — they never change WHICH real number is drawn.
+  priceLines?: { price: number; color?: string; title?: string; dashed?: boolean; width?: 1 | 2 | 3 | 4 }[]
   // Which moving-average / band / VWAP overlays to draw, all computed from the
   // real candles above. Undefined = none (unchanged plain chart).
   indicators?: IndicatorPrefs
@@ -811,7 +814,7 @@ export function PriceChart({
   // changes (via a stable key) so live ticks never churn them. Every level is a
   // real number from the user's own data — the chart never invents a line.
   const priceLinesKey = JSON.stringify(
-    (priceLines ?? []).map((l) => [l.price, l.color, l.title]),
+    (priceLines ?? []).map((l) => [l.price, l.color, l.title, l.dashed, l.width]),
   )
   useEffect(() => {
     const series = seriesRef.current
@@ -830,8 +833,8 @@ export function PriceChart({
         series.createPriceLine({
           price: pl.price,
           color: pl.color || '#8b98a9',
-          lineWidth: 1,
-          lineStyle: LineStyle.Dashed,
+          lineWidth: pl.width ?? 1,
+          lineStyle: pl.dashed === false ? LineStyle.Solid : LineStyle.Dashed,
           axisLabelVisible: true,
           title: pl.title || '',
         }),
