@@ -25,6 +25,9 @@ from app.models import KeyValue
 SETTINGS_KEY = "settings_overrides"
 PAPER_BALANCE_KEY = "paper_balance"
 STRATEGY_KEY = "strategy_config"
+# Durable engine RUNTIME state: run/stop flag, drawdown kill-switch, equity peak.
+# Persisting this is a capital-preservation requirement — see load_engine_runtime.
+ENGINE_RUNTIME_KEY = "engine_runtime"
 # The background monitor loop is a single server-wide task shared by all users,
 # so its tick cadence is a GLOBAL value (not per-user): stored unscoped and read
 # live by monitor_loop each iteration. Clamped to a safe range at read time.
@@ -102,6 +105,28 @@ def save_strategy_configs(
     kv_set(db, _scoped(STRATEGY_KEY, user_id), configs)
 
 
+def load_engine_runtime(db: Session, user_id: Optional[int] = None) -> dict[str, Any]:
+    """The engine's DURABLE run/stop + kill-switch + equity-peak state.
+
+    Persisting this is a capital-preservation requirement, not a convenience: a
+    drawdown kill-switch trip or a manual stop MUST survive a restart, redeploy
+    or engine rebuild. Without it, a rebuilt engine would silently resume — right
+    back into the very drawdown that halted it — and forget the equity peak the
+    drawdown is measured against, resetting the baseline to a lower value and
+    making the safety net blind. Shape: ``{running, killswitch_tripped,
+    peak_equity}``. Returns ``{}`` when nothing has been persisted yet (a brand-
+    new engine), which the caller treats as "no explicit prior state".
+    """
+    data = kv_get(db, _scoped(ENGINE_RUNTIME_KEY, user_id), {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_engine_runtime(
+    db: Session, runtime: dict[str, Any], user_id: Optional[int] = None
+) -> None:
+    kv_set(db, _scoped(ENGINE_RUNTIME_KEY, user_id), runtime)
+
+
 def clamp_monitor_interval(seconds: float) -> float:
     """Clamp a requested monitor cadence into the safe [MIN, MAX] range."""
     try:
@@ -133,7 +158,7 @@ def purge_user_state(db: Session, user_id: int) -> int:
     keys, which have no ``:{id}`` suffix.
     """
     removed = 0
-    for base in (SETTINGS_KEY, PAPER_BALANCE_KEY, STRATEGY_KEY):
+    for base in (SETTINGS_KEY, PAPER_BALANCE_KEY, STRATEGY_KEY, ENGINE_RUNTIME_KEY):
         row = db.get(KeyValue, _scoped(base, user_id))
         if row is not None:
             db.delete(row)

@@ -26,9 +26,11 @@ from app.risk import RiskManager
 from app.notifier import Notifier
 from app.strategies import build_strategy
 from app.state import (
+    load_engine_runtime,
     load_paper_balance,
     load_settings_overrides,
     load_strategy_configs,
+    save_engine_runtime,
     save_paper_balance,
     save_settings_overrides,
     save_strategy_configs,
@@ -67,13 +69,25 @@ class TradingEngine:
         # rather than on a single noisy tick. Keyed by trade id; reset when the flag
         # clears or the trade closes. In-memory: a restart re-arms it harmlessly.
         self._reversal_flags: dict[int, int] = {}
-        # ---- risk-safeguard state (in-memory; reset on restart) ----
+        # ---- risk-safeguard state ----
         # Peak TOTAL equity (free cash + open-position value) seen so far, for the
-        # max-drawdown kill-switch. Seeded on the first drawdown check.
+        # max-drawdown kill-switch. Seeded on the first drawdown check and, once
+        # persisted, RESTORED on restart (see restore_state) so a rebuild never
+        # resets the drawdown baseline to a lower value and blinds the safety net.
         self._peak_equity: float = 0.0
         # True once the drawdown kill-switch has fired. While set, ALL new entries
-        # are blocked (open positions keep their stops); cleared by restarting.
+        # are blocked (open positions keep their stops). DURABLE: a trip survives a
+        # restart/redeploy and requires an explicit human re-arm (reset_killswitch
+        # via POST /api/bot/start) — it is never silently cleared by a rebuild.
         self._killswitch_tripped: bool = False
+        # Whether restore_state found a persisted runtime blob for this account.
+        # The manager uses this to decide the default run/stop for a FRESH engine
+        # (no history -> default running) without ever overriding a persisted stop
+        # or a tripped kill-switch.
+        self._runtime_restored: bool = False
+        # Last equity peak actually written to the KV store, so the monitor tick
+        # can throttle peak persistence (only write on a materially higher peak).
+        self._last_persisted_peak: float = 0.0
         # Per-symbol time of the last LOSING exit, for the re-entry cooldown.
         self._last_loss_exit: dict[str, dt.datetime] = {}
         # Symbols whose price feed is currently unreachable during monitoring, so
@@ -140,6 +154,23 @@ class TradingEngine:
         # Trained strategies saved to this account, so "train once, trade with it"
         # survives restarts instead of being lost when the request returned.
         self.strategy_configs = load_strategy_configs(db, self.user_id)
+        # Durable run/stop + kill-switch + drawdown baseline. A halted or stopped
+        # bot MUST stay that way across a restart/redeploy/rebuild: never
+        # auto-resume into the drawdown that tripped the kill-switch, and never
+        # forget the equity peak the drawdown is measured against. When nothing has
+        # been persisted yet (a brand-new engine), we leave running at its __init__
+        # default (False) and let the manager pick the fresh-engine default.
+        runtime = load_engine_runtime(db, self.user_id)
+        if runtime:
+            self._runtime_restored = True
+            self._peak_equity = float(runtime.get("peak_equity", 0.0) or 0.0)
+            self._last_persisted_peak = self._peak_equity
+            self._killswitch_tripped = bool(runtime.get("killswitch_tripped", False))
+            self.running = bool(runtime.get("running", False))
+        # A tripped kill-switch NEVER auto-resumes — it demands an explicit human
+        # re-arm (reset_killswitch) whatever the persisted/default running flag says.
+        if self._killswitch_tripped:
+            self.running = False
         self._reconcile_live_positions(db)
 
     def _reconcile_live_positions(self, db: Session) -> None:
@@ -533,6 +564,12 @@ class TradingEngine:
             return self._killswitch_tripped
         if equity > self._peak_equity:
             self._peak_equity = equity
+            # Persist the growing drawdown baseline so a rebuild can't reset it to a
+            # lower value (which would blind the kill-switch). Throttled: only write
+            # when the peak climbs materially (>= 0.25%) above the last persisted
+            # value, so the ~5s monitor tick doesn't hammer the KV store.
+            if self._peak_equity >= self._last_persisted_peak * 1.0025:
+                self.persist_runtime(db)
         if self._peak_equity <= 0:
             return False
         drawdown = (self._peak_equity - equity) / self._peak_equity * 100.0
@@ -540,6 +577,9 @@ class TradingEngine:
             self._killswitch_tripped = True
             was_running = self.running
             self.running = False
+            # Durably record the halt BEFORE emitting/notifying so a crash mid-event
+            # can't lose it — a rebuilt engine must see the trip and stay halted.
+            self.persist_runtime(db)
             self._emit(
                 "killswitch",
                 {
@@ -571,15 +611,45 @@ class TradingEngine:
             )
         return False, ""
 
-    def reset_killswitch(self) -> None:
-        """Clear the kill-switch and reseed the equity peak.
+    def reset_killswitch(self, db: Session | None = None) -> None:
+        """Clear the kill-switch and reseed the equity peak (human re-arm).
 
         Called when the operator (re)starts the bot: restarting is the explicit
-        acknowledgement that resumes trading, and the drawdown budget is measured
-        fresh from the equity at restart rather than an old, higher peak.
+        human acknowledgement that resumes trading, and the drawdown budget is
+        measured fresh from the equity at restart rather than an old, higher peak.
+        When ``db`` is supplied the cleared state is persisted immediately, so the
+        re-arm itself survives a later restart/rebuild.
         """
         self._killswitch_tripped = False
         self._peak_equity = 0.0
+        self._last_persisted_peak = 0.0
+        if db is not None:
+            self.persist_runtime(db)
+
+    def persist_runtime(self, db: Session) -> None:
+        """Durably save run/stop + kill-switch + equity peak to the KV store.
+
+        This is the backbone of the durable halt: a restart, redeploy or engine
+        rebuild resumes EXACTLY where the operator left off — a stopped bot stays
+        stopped, and a tripped drawdown kill-switch stays tripped (never silently
+        cleared into the drawdown that caused it). Best-effort: a KV write failure
+        must never crash a trade or a monitor tick, so we log and carry on.
+        """
+        try:
+            save_engine_runtime(
+                db,
+                {
+                    "running": bool(self.running),
+                    "killswitch_tripped": bool(self._killswitch_tripped),
+                    "peak_equity": round(float(self._peak_equity), 2),
+                },
+                self.user_id,
+            )
+            self._last_persisted_peak = self._peak_equity
+        except Exception as exc:  # bookkeeping must never break the trading path
+            logger.warning(
+                "failed to persist engine runtime for user=%s: %s", self.user_id, exc
+            )
 
     def _live_readonly_block(self) -> Optional[str]:
         """Guard for live ORDER PLACEMENT with a read-only key.
@@ -668,7 +738,7 @@ class TradingEngine:
             self.paper_balance = self.settings.paper_starting_balance
             save_paper_balance(db, self.paper_balance, self.user_id)
             self._last_auto_verdict.clear()
-            self.reset_killswitch()
+            self.reset_killswitch(db)
         return {
             "trades_deleted": n_trades,
             "signals_deleted": n_signals,

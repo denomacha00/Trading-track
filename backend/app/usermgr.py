@@ -77,7 +77,15 @@ class EngineManager:
         if self._broadcaster and self._loop:
             eng.attach_broadcaster(self._broadcaster, self._loop)
         eng.restore_state(db)
-        eng.running = True
+        # Preserve the operator's explicit run/stop across restarts, and NEVER
+        # auto-resume a bot that a drawdown kill-switch halted. Only a FRESH engine
+        # (no persisted runtime yet) defaults to running; a persisted stop or a
+        # tripped kill-switch always wins. restore_state has already applied any
+        # persisted running flag and forced running=False on an active trip.
+        if not eng._runtime_restored and not eng._killswitch_tripped:
+            eng.running = True
+        # Persist the (possibly defaulted) state so a later rebuild is durable.
+        eng.persist_runtime(db)
         return eng
 
     def get(self, db: Session, user: User) -> TradingEngine:

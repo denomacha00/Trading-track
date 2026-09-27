@@ -819,6 +819,9 @@ def set_bot_state(
         engine.running = False
     else:
         raise HTTPException(status_code=400, detail="state must be 'start' or 'stop'")
+    # Durably record the operator's run/stop choice (and any kill-switch re-arm) so
+    # a restart, redeploy or engine rebuild can't silently flip it back.
+    engine.persist_runtime(db)
     return {"running": engine.running}
 
 
