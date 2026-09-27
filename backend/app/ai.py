@@ -404,6 +404,51 @@ def _key_family(key: str) -> str:
     return "unrecognized prefix"
 
 
+# --- monitor-narration safety ----------------------------------------
+# The loud monitor lets the LLM REPHRASE a deterministic event line, never
+# restate its numbers. A money bot must not show the operator a figure the
+# account did not actually produce, so before we accept the model's wording we
+# verify every number it printed is one the true FACT already contained. Any
+# invented, altered or rounded figure — or a narration that silently dropped
+# every real number — fails the check and the caller falls back to the exact
+# deterministic text. Matching is by numeric VALUE (commas and currency/percent
+# framing stripped, scientific notation understood) and on the ABSOLUTE value,
+# because the deterministic text mixes sign conventions ("down 45.20 (-1.5%)")
+# that the model naturally re-voices as "down ... 1.5%".
+_NARRATION_NUM_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?")
+
+
+def _narration_numbers(text: str) -> list[float]:
+    """Absolute numeric values in ``text`` (commas stripped, sci-notation ok)."""
+    out: list[float] = []
+    for tok in _NARRATION_NUM_RE.findall(text or ""):
+        try:
+            out.append(abs(float(tok.replace(",", ""))))
+        except ValueError:
+            continue
+    return out
+
+
+def _narration_preserves_numbers(fact: str, line: str) -> bool:
+    """True if ``line`` invents/alters/drops no figure from the true ``fact``.
+
+    The deterministic ``fact`` is ground truth. We accept the model's rephrasing
+    only when every number it prints matches (by value) a number in ``fact``, and
+    when a fact that carries numbers is not narrated with none of them. This is
+    the numeric-honesty guard: the model may change the WORDS, never the MONEY.
+    """
+    fact_nums = _narration_numbers(fact)
+    if not fact_nums:
+        return True  # nothing numeric to protect — a pure rephrase is fine
+    line_nums = _narration_numbers(line)
+    if not line_nums:
+        return False  # dropped every real figure — say it straight instead
+    for v in line_nums:
+        if not any(abs(v - f) <= 1e-9 + 1e-9 * abs(f) for f in fact_nums):
+            return False  # a figure the account never produced — never show it
+    return True
+
+
 class AICommentator:
     """Wraps an OpenAI- or Anthropic-style chat endpoint to narrate + reason."""
 
@@ -633,7 +678,17 @@ class AICommentator:
             return None
         # Strip any stray protocol tag so the spoken line is clean prose only.
         line = re.sub(r"\[\[[^\]]*\]\]", "", line).strip()
-        return line or None
+        if not line:
+            return None
+        # Numeric-honesty guard (M10): the model was asked to keep every number
+        # exactly, but we do not TRUST it to — we VERIFY. If its wording invented,
+        # altered or dropped a figure from the true fact, discard it and let the
+        # caller fall back to the deterministic text verbatim. The event is real
+        # either way; we simply refuse to voice numbers the account never made.
+        if not _narration_preserves_numbers(fact, line):
+            logger.debug("narrate_event rephrase changed a number; using fact verbatim")
+            return None
+        return line
 
     def assess(self, analysis: MarketAnalysis) -> str:
         """Deeper research-style assessment: quality, risks, scenarios, sizing.
