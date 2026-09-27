@@ -44,6 +44,16 @@ class Settings(BaseSettings):
 
     # TradingView webhook
     tradingview_webhook_secret: str = Field(default="change-me")
+    # Webhook REPLAY protection (opt-in). When > 0, an inbound alert whose payload
+    # carries a send-time (TradingView's {{timenow}} placeholder, mapped to a
+    # "timenow"/"timestamp" field) is REJECTED if that time is more than this many
+    # seconds away from now — so a captured webhook URL+body can't be replayed
+    # later to fire a stale trade. 0 (default) disables it: a normal deployment is
+    # completely unaffected, because clock skew or a missing timestamp would
+    # otherwise cause false rejects. Idempotency keys (see WebhookDelivery) already
+    # stop a replay of a KEYED payload regardless of this setting; this closes the
+    # gap for keyless payloads. Turn it on only once your alerts send a timestamp.
+    webhook_max_age_seconds: float = Field(default=0.0)
 
     # Optional AI/LLM commentary. Works with EITHER an OpenAI-compatible
     # chat-completions API OR an Anthropic-native messages API. Leave
@@ -400,7 +410,7 @@ class Settings(BaseSettings):
             "max_drawdown_pct", "max_spread_pct", "reentry_cooldown_minutes",
             "max_consecutive_losses", "atr_stop_mult", "profit_lock_trigger_pct",
             "profit_lock_floor_pct", "paper_taker_fee_pct", "strategy_min_win_rate_pct",
-            "strategy_min_trades", "strategy_max_drawdown_pct",
+            "strategy_min_trades", "strategy_max_drawdown_pct", "webhook_max_age_seconds",
         )
         for name in non_negative:
             val = getattr(self, name)

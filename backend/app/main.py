@@ -29,6 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import __version__
@@ -48,6 +49,7 @@ from app.models import (
     TradeStatus,
     User,
     UserRole,
+    WebhookDelivery,
     _as_utc,
     _utcnow,
 )
@@ -492,6 +494,26 @@ def update_credentials(
     return _me_out(user)
 
 
+@app.post("/api/webhook/rotate", response_model=MeOut)
+def rotate_webhook_token(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    """Mint a fresh webhook token, invalidating the old URL immediately.
+
+    Use this the moment the old webhook URL might have leaked — a shared
+    screenshot, an alert config committed to a repo, a compromised TradingView
+    account. The previous URL stops working the instant this returns (any alert
+    still pointing at it gets a 404), so re-paste the new ``webhook_path`` into
+    your alert(s) right after rotating. This is the only way to revoke a leaked
+    webhook without deleting the account.
+    """
+    user.webhook_token = new_webhook_token()
+    db.commit()
+    db.refresh(user)
+    return _me_out(user)
+
+
 # ---- TradingView webhook (per-user token in the URL) ----------------
 
 
@@ -531,6 +553,23 @@ async def tradingview_webhook(
                     "account not licensed")
         raise HTTPException(status_code=403, detail="Account is not licensed or licence expired")
 
+    # Replay guard (opt-in): reject a payload whose send-time is too far from now,
+    # so a captured URL+body can't be replayed later to fire a stale trade. No-op
+    # unless the operator sets webhook_max_age_seconds > 0.
+    stale = _webhook_replay_stale(data)
+    if stale is not None:
+        _log_signal(db, user.id, "tradingview", signal.symbol, signal.action, safe_raw, False, stale)
+        raise HTTPException(status_code=409, detail=stale)
+
+    # Idempotency: when the alert carries an explicit key, CLAIM it before acting
+    # so a duplicate delivery (sender retry, replay) can never open a second
+    # position. Keyless payloads are not deduped (nothing identifies a repeat).
+    dedup_key = _webhook_dedup_key(data)
+    if dedup_key is not None and not _claim_webhook_delivery(db, user.id, dedup_key):
+        msg = "duplicate ignored: this idempotency key was already processed"
+        _log_signal(db, user.id, "tradingview", signal.symbol, signal.action, safe_raw, False, msg)
+        return ExecutionResult(accepted=False, message=msg, trade=None)
+
     engine = _engine_for(db, user)
     accepted, message, trade = await asyncio.to_thread(
         engine.execute_signal,
@@ -559,6 +598,159 @@ def _log_signal(db, user_id, source, symbol, action, raw, accepted, message) -> 
         )
     )
     db.commit()
+
+
+# ---- Webhook idempotency & replay protection ------------------------
+# A webhook is an at-least-once channel: the sender may deliver the same alert
+# more than once (a retry after a timeout, a duplicated rule, a replay). On a
+# money bot each duplicate that reaches execution is a duplicate position, so we
+# make the endpoint idempotent on an explicit key and (optionally) reject stale
+# replays. See models.WebhookDelivery for the storage rationale.
+
+# How long an idempotency key is remembered. Comfortably longer than any real
+# sender's retry window, so a genuine retry is still recognised as a duplicate;
+# older claims are pruned so the ledger stays small.
+_WEBHOOK_DEDUP_RETENTION_DAYS = 7.0
+
+# Payload fields (compared with separators/case ignored) that carry an explicit
+# idempotency token. First match wins, in this order. Deliberately a NARROW set:
+# only names that unambiguously mean "unique per event" — so a sender opts IN to
+# dedup by choosing one. We pointedly EXCLUDE generic names like ``id`` /
+# ``order_id`` / ``alert_id`` because those are often a STATIC strategy/rule id;
+# treating a static value as an idempotency key would silently ignore every alert
+# after the first and quietly halt trading — worse than the duplicate it guards.
+# A TradingView user gets idempotency by sending e.g. "nonce": "{{timenow}}".
+_WEBHOOK_DEDUP_FIELDS = (
+    "idempotencykey", "dedupkey", "dedupid", "clientorderid", "nonce", "eventid", "uuid",
+)
+
+# Payload fields that carry the alert's SEND time (TradingView's {{timenow}}).
+_WEBHOOK_TS_FIELDS = ("timenow", "timestamp", "sentat", "senttime")
+
+
+def _webhook_norm_fields(data: object) -> dict:
+    """Map a payload's top-level keys to values, keys normalised to lower-case
+    alphanumerics (so ``clientOrderId``/``client_order_id`` collide). First key
+    wins on a collision. Non-dict input yields an empty map."""
+    out: dict = {}
+    if not isinstance(data, dict):
+        return out
+    for k, v in data.items():
+        key = "".join(ch for ch in str(k).lower() if ch.isalnum())
+        if key and key not in out:
+            out[key] = v
+    return out
+
+
+def _webhook_dedup_key(data: object) -> str | None:
+    """Extract an explicit idempotency key from a parsed webhook body, or None.
+
+    Only a genuine scalar (str/int/float, not bool/null) counts, bounded to 200
+    chars. None means the payload named no key — a keyless alert is never deduped.
+    """
+    norm = _webhook_norm_fields(data)
+    for field in _WEBHOOK_DEDUP_FIELDS:
+        if field in norm:
+            v = norm[field]
+            if isinstance(v, bool) or v is None or not isinstance(v, (str, int, float)):
+                continue
+            s = str(v).strip()
+            if s:
+                return s[:200]
+    return None
+
+
+def _coerce_webhook_timestamp(val: object) -> "dt.datetime | None":
+    """Parse one send-time value into an aware UTC datetime, or None.
+
+    Accepts epoch seconds or milliseconds (int/float or a numeric string) and ISO
+    8601 strings (a trailing ``Z`` and naive strings are treated as UTC). Anything
+    unparseable or implausibly old (before 2001) returns None so we never reject
+    on a value we didn't actually understand."""
+    if isinstance(val, bool) or val is None:
+        return None
+    num: float | None = None
+    if isinstance(val, (int, float)):
+        num = float(val)
+    elif isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        try:
+            num = float(s)
+        except ValueError:
+            iso = s[:-1] + "+00:00" if s.endswith(("Z", "z")) else s
+            try:
+                parsed = dt.datetime.fromisoformat(iso)
+            except ValueError:
+                return None
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            return parsed.astimezone(dt.timezone.utc)
+    if num is None:
+        return None
+    if num > 1e12:  # milliseconds since epoch
+        num /= 1000.0
+    if num < 978_307_200:  # < 2001-01-01: not a plausible send time
+        return None
+    try:
+        return dt.datetime.fromtimestamp(num, dt.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _webhook_replay_stale(data: object) -> str | None:
+    """When replay protection is on (webhook_max_age_seconds > 0), return a
+    rejection reason if the payload's send-time is missing or too far from now;
+    otherwise None. Off by default, so a normal deployment is unaffected."""
+    window = get_settings().webhook_max_age_seconds
+    if not window or window <= 0:
+        return None
+    norm = _webhook_norm_fields(data)
+    ts = None
+    for field in _WEBHOOK_TS_FIELDS:
+        if field in norm:
+            ts = _coerce_webhook_timestamp(norm[field])
+            if ts is not None:
+                break
+    if ts is None:
+        return (
+            "replay protection is on but the alert carried no readable timestamp; "
+            'send TradingView\'s {{timenow}} as a "timenow" field in the alert JSON'
+        )
+    age = (_utcnow() - ts).total_seconds()
+    if age > window:
+        return f"stale webhook rejected: alert is {int(age)}s old (limit {int(window)}s)"
+    if age < -window:
+        return f"webhook timestamp is {int(-age)}s in the future (limit {int(window)}s)"
+    return None
+
+
+def _claim_webhook_delivery(db: Session, user_id: int, dedup_key: str) -> bool:
+    """Atomically claim an idempotency key. True on the FIRST sighting of
+    ``(user_id, dedup_key)``; False if already claimed (a duplicate).
+
+    The UNIQUE constraint is the real guard under concurrency: two simultaneous
+    deliveries race to INSERT and the DB lets exactly one commit. Old claims are
+    pruned opportunistically so the ledger can't grow without bound."""
+    try:
+        db.add(WebhookDelivery(user_id=user_id, dedup_key=dedup_key))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return False
+    try:
+        cutoff = _utcnow() - dt.timedelta(days=_WEBHOOK_DEDUP_RETENTION_DAYS)
+        db.execute(
+            delete(WebhookDelivery).where(
+                WebhookDelivery.user_id == user_id,
+                WebhookDelivery.created_at < cutoff,
+            )
+        )
+        db.commit()
+    except Exception:  # pruning is best-effort; never fail a claimed delivery
+        db.rollback()
+    return True
 
 
 # Field names (normalised to lower-case alphanumerics) we must never store from

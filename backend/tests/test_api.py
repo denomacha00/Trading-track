@@ -122,6 +122,53 @@ def test_webhook_rejects_malformed(client):
     assert r.status_code == 400
 
 
+def test_webhook_duplicate_key_ignored(client):
+    # M13 — an alert carrying an explicit idempotency token is executed ONCE; a
+    # duplicate delivery of the same token is ignored, never re-executed. Uses a
+    # close on a symbol with no open position: a deterministic, network-free path.
+    path = _webhook_path(client)
+    body = b'{"nonce":"evt-dup-1","action":"close","symbol":"ZZZ/USDT"}'
+    r1 = client.post(path, content=body)
+    assert r1.status_code == 200
+    assert r1.json()["accepted"] is False
+    assert "no open position" in r1.json()["message"].lower()
+    # Same token again -> already claimed -> reported as a duplicate, not re-run.
+    r2 = client.post(path, content=body)
+    assert r2.status_code == 200
+    assert r2.json()["accepted"] is False
+    assert "duplicate" in r2.json()["message"].lower()
+
+
+def test_webhook_keyless_is_not_deduped(client):
+    # A keyless payload has nothing to identify a repeat by, so BOTH deliveries
+    # reach execution — we never fabricate a key and silently drop real alerts.
+    path = _webhook_path(client)
+    body = b'{"action":"close","symbol":"ZZZ/USDT"}'
+    for _ in range(2):
+        r = client.post(path, content=body)
+        assert r.status_code == 200
+        assert r.json()["accepted"] is False
+        assert "no open position" in r.json()["message"].lower()
+
+
+def test_webhook_rotate_invalidates_old_token(client):
+    # Rotating mints a fresh token and kills the old URL immediately. Run LAST
+    # among webhook tests since it changes the admin's token (others re-read it).
+    old_path = _webhook_path(client)
+    r = client.post("/api/webhook/rotate")
+    assert r.status_code == 200
+    new_path = r.json()["webhook_path"]
+    assert new_path.startswith("/api/webhook/tradingview/")
+    assert new_path != old_path
+    # The old URL is dead the instant rotation returns.
+    dead = client.post(old_path, content=b'{"action":"close","symbol":"ZZZ/USDT"}')
+    assert dead.status_code == 404
+    # The new URL routes to the handler.
+    live = client.post(new_path, content=b'{"action":"close","symbol":"ZZZ/USDT"}')
+    assert live.status_code == 200
+    assert live.json()["accepted"] is False
+
+
 def test_bot_start_stop(client):
     assert client.post("/api/bot/stop").json()["running"] is False
     assert client.post("/api/bot/start").json()["running"] is True

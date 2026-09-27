@@ -5,7 +5,7 @@ import datetime as dt
 import json
 from enum import Enum
 
-from sqlalchemy import DateTime, Float, Integer, String, Text
+from sqlalchemy import DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -266,4 +266,35 @@ class LicenseKey(Base):
     redeemed_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
     redeemed_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+
+class WebhookDelivery(Base):
+    """Idempotency ledger for inbound webhook alerts (TradingView & friends).
+
+    A webhook sender can deliver the SAME alert more than once — a network retry
+    after a timeout, a duplicated alert rule, or a replayed request — and each
+    copy that reaches execution would open a DUPLICATE position with real money.
+    When an alert payload carries an explicit idempotency key (``id`` / ``nonce``
+    / ``idempotency_key`` / ``client_order_id`` / …) the webhook records a claim
+    here BEFORE it executes. The UNIQUE ``(user_id, dedup_key)`` constraint is the
+    real guard: two concurrent deliveries of the same key race to INSERT and the
+    database lets exactly one win, so the loser is ignored instead of re-executed.
+
+    Keyless payloads are deliberately NOT deduped — there is nothing to identify a
+    repeat by, and fabricating a key from the body hash would wrongly block a
+    genuinely-repeated signal (e.g. two separate "buy" pulses). Old claims are
+    pruned on write so the ledger can't grow without bound.
+    """
+
+    __tablename__ = "webhook_deliveries"
+    __table_args__ = (
+        UniqueConstraint("user_id", "dedup_key", name="uq_webhook_delivery_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    dedup_key: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
     )
