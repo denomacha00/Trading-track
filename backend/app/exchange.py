@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from typing import Any, Callable, Optional, TypeVar
 
 import ccxt
@@ -419,6 +420,113 @@ class BinanceConnector:
 
     # ---- Orders ------------------------------------------------------
 
+    @staticmethod
+    def _new_client_order_id(prefix: str = "tt") -> str:
+        """A fresh idempotency key for ONE logical order.
+
+        Binance echoes ``newClientOrderId`` back and rejects a second order that
+        reuses it, so retrying a create with the SAME id can never double-fill —
+        the first attempt owns the id. Kept within Binance's 36-char
+        clientOrderId limit and its allowed charset (alphanumerics + ``-``).
+        """
+        return f"{prefix}-{uuid.uuid4().hex[:24]}"
+
+    @staticmethod
+    def _is_duplicate_order(exc: Exception) -> bool:
+        """True for Binance's duplicate-clientOrderId rejection ("Duplicate order
+        sent.", code -2010). It means a PRIOR attempt of the same logical order
+        already landed, so we must reconcile to that order rather than place a
+        second one.
+        """
+        return "duplicate order" in str(exc).lower()
+
+    def _fetch_by_client_id(
+        self, symbol: str, client_order_id: str
+    ) -> Optional[dict[str, Any]]:
+        """Best-effort fetch of an order by its clientOrderId. Returns the order
+        if the exchange has it, else None. NEVER raises: a failed reconcile must
+        not itself become a reason to risk a second fill.
+        """
+        try:
+            return self._client.fetch_order(
+                None, symbol, {"clientOrderId": client_order_id}
+            )
+        except Exception as exc:
+            logger.warning("reconcile fetch for %s failed: %s", client_order_id, exc)
+            return None
+
+    def _create_order_idempotent(
+        self,
+        symbol: str,
+        type_: str,
+        side: str,
+        amount: float,
+        price: float | None = None,
+        *,
+        attempts: int = 3,
+        base_delay: float = 0.5,
+    ) -> dict[str, Any]:
+        """Place an order with retry that CANNOT double-fill.
+
+        A market/limit CREATE is not safely retryable on its own: a
+        RequestTimeout can arrive AFTER Binance accepted and executed the order
+        (the request landed, the response was lost). A blind retry — what plain
+        ``_with_retry`` around a create would do — then places a SECOND order and
+        doubles the position. For a bot meant to PREVENT account blow-ups that is
+        exactly the wrong failure.
+
+        So we attach a client order id and make the retry idempotent:
+          • the id is generated ONCE and reused on every attempt;
+          • after a transient error, before retrying we FETCH the order by that
+            id; if it exists the create already succeeded → return it, no 2nd
+            order;
+          • if a retry still races and Binance rejects the id as a DUPLICATE, we
+            fetch by the id and return the real (already-placed) order.
+        Non-transient errors (insufficient funds, bad symbol, auth) raise at once.
+        """
+        coid = self._new_client_order_id()
+        params = {"clientOrderId": coid}
+        last_exc: Exception | None = None
+        for i in range(attempts):
+            try:
+                return self._client.create_order(
+                    symbol, type_, side, amount, price, params
+                )
+            except Exception as exc:
+                if self._is_duplicate_order(exc):
+                    # A prior attempt of THIS logical order already landed.
+                    existing = self._fetch_by_client_id(symbol, coid)
+                    if existing:
+                        logger.warning(
+                            "order %s: duplicate rejected, prior attempt landed "
+                            "— using it, not placing again", coid,
+                        )
+                        return existing
+                    raise
+                if not isinstance(exc, _RETRYABLE) or _is_geo_block(exc):
+                    raise
+                last_exc = exc
+                # Transient error: the create MAY have executed before the
+                # response was lost. Reconcile by client id BEFORE risking a
+                # second placement.
+                existing = self._fetch_by_client_id(symbol, coid)
+                if existing:
+                    logger.warning(
+                        "order %s landed despite a transient error — using it, "
+                        "not retrying", coid,
+                    )
+                    return existing
+                if i == attempts - 1:
+                    break
+                delay = base_delay * (2 ** i)
+                logger.warning(
+                    "transient error placing order %s (attempt %d/%d): %s — "
+                    "retrying in %.1fs", coid, i + 1, attempts, exc, delay,
+                )
+                time.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
+
     def create_market_order(
         self, symbol: str, side: str, amount: float
     ) -> dict[str, Any]:
@@ -427,7 +535,7 @@ class BinanceConnector:
             raise RuntimeError("Exchange client not available")
         if not self.has_credentials:
             raise RuntimeError("Binance API credentials are not configured")
-        return _with_retry(lambda: self._client.create_order(symbol, "market", side, amount))
+        return self._create_order_idempotent(symbol, "market", side, amount)
 
     def create_limit_order(
         self, symbol: str, side: str, amount: float, price: float
@@ -445,9 +553,7 @@ class BinanceConnector:
             limit = float(self._client.price_to_precision(symbol, price))
         except Exception:
             limit = price
-        return _with_retry(
-            lambda: self._client.create_order(symbol, "limit", side, amount, limit)
-        )
+        return self._create_order_idempotent(symbol, "limit", side, amount, limit)
 
     def fetch_order(self, order_id: str, symbol: str) -> Optional[dict[str, Any]]:
         """Fetch a single order's current state (status, filled, average price).
