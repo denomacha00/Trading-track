@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -367,6 +367,53 @@ class Settings(BaseSettings):
                 if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
                     v = v[1:-1].strip()
         return v
+
+    @model_validator(mode="after")
+    def _validate_risk_bounds(self) -> "Settings":
+        """Reject a misconfigured risk input at load instead of trading on it.
+
+        A money bot must never START with a degenerate risk setting. We fail
+        fast with a clear message so a fat-fingered env var (DEFAULT_STOP_LOSS_PCT=0,
+        a negative RISK_PER_TRADE_PCT) is caught at boot, not discovered live —
+        a 0% stop places the stop AT entry and knocks the trade out on the first
+        adverse tick; a negative risk % inverts sizing. Fields where 0 means
+        "disabled" (trailing stop, caps, cooldowns, ATR floor) only reject negatives.
+        """
+        # Strictly positive: zero or below is never a valid trading input.
+        positive = (
+            "risk_per_trade_pct", "default_stop_loss_pct", "default_take_profit_pct",
+            "daily_loss_limit_pct", "paper_starting_balance", "max_open_positions",
+            "ai_timeout_seconds", "ai_connect_timeout_seconds", "ai_max_tokens",
+            "access_token_ttl_minutes", "monitor_interval_seconds",
+            "reversal_confirm_count",
+        )
+        for name in positive:
+            val = getattr(self, name)
+            if val is None or val <= 0:
+                raise ValueError(
+                    f"{name} must be greater than 0 (got {val!r}); it controls "
+                    "position sizing or safety timing and cannot be zero/negative."
+                )
+        # 0 legitimately means "disabled" here; only a negative value is invalid.
+        non_negative = (
+            "max_position_pct", "max_total_exposure_pct", "trailing_stop_pct",
+            "max_drawdown_pct", "max_spread_pct", "reentry_cooldown_minutes",
+            "max_consecutive_losses", "atr_stop_mult", "profit_lock_trigger_pct",
+            "profit_lock_floor_pct", "paper_taker_fee_pct", "strategy_min_win_rate_pct",
+            "strategy_min_trades", "strategy_max_drawdown_pct",
+        )
+        for name in non_negative:
+            val = getattr(self, name)
+            if val is not None and val < 0:
+                raise ValueError(
+                    f"{name} must be 0 or greater (got {val!r}); use 0 to disable it."
+                )
+        if not 0.0 <= self.min_signal_confidence <= 1.0:
+            raise ValueError(
+                "min_signal_confidence must be between 0 and 1 (got "
+                f"{self.min_signal_confidence!r})."
+            )
+        return self
 
     @property
     def cors_origin_list(self) -> list[str]:
