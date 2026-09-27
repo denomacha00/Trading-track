@@ -94,3 +94,21 @@ def save_strategy_configs(
     db: Session, configs: dict[str, Any], user_id: Optional[int] = None
 ) -> None:
     kv_set(db, _scoped(STRATEGY_KEY, user_id), configs)
+
+
+def purge_user_state(db: Session, user_id: int) -> int:
+    """Delete every KV row scoped to ``user_id`` (settings, wallet, strategies).
+
+    Called when an account is deleted so no orphaned runtime state — including a
+    simulated wallet balance — outlives the user it belonged to. Returns the
+    number of rows removed. Never touches the legacy global (``user_id=None``)
+    keys, which have no ``:{id}`` suffix.
+    """
+    removed = 0
+    for base in (SETTINGS_KEY, PAPER_BALANCE_KEY, STRATEGY_KEY):
+        row = db.get(KeyValue, _scoped(base, user_id))
+        if row is not None:
+            db.delete(row)
+            removed += 1
+    db.commit()
+    return removed

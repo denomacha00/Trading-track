@@ -927,3 +927,115 @@ def test_paper_reset_endpoint_shape(client):
     assert r.status_code == 200
     for k in ("trades_deleted", "signals_deleted", "paper_balance"):
         assert k in r.json()
+
+
+# ---- Security hardening (redaction, limit clamps, account teardown) ----
+
+def test_redact_raw_masks_nested_secrets():
+    # A secret buried inside nested dicts/lists must be masked too, not just at
+    # the top level — otherwise it would rest in the signal log in plaintext.
+    import json
+    from app.main import _redact_raw
+    body = json.dumps({
+        "action": "buy",
+        "meta": {"apiKey": "AKIA-real-key", "deep": {"token": "t0ken"}},
+        "legs": [{"password": "hunter2"}, {"symbol": "BTC/USDT"}],
+    })
+    redacted = _redact_raw(body)
+    out = json.loads(redacted)
+    assert out["action"] == "buy"                              # non-secret kept
+    assert out["meta"]["apiKey"] == "***redacted***"           # nested dict
+    assert out["meta"]["deep"]["token"] == "***redacted***"    # deeply nested
+    assert out["legs"][0]["password"] == "***redacted***"      # inside a list
+    assert out["legs"][1]["symbol"] == "BTC/USDT"              # non-secret in list
+    assert "AKIA-real-key" not in redacted and "hunter2" not in redacted
+
+# __SEC_APPEND__
+
+def test_negative_limit_does_not_dump_all_rows(client):
+    # A negative ?limit becomes SQL "LIMIT -1", which SQLite treats as "no limit"
+    # (ALL rows). The list endpoints clamp with max(1, ...) so a hostile client
+    # can't page an entire table in one request.
+    from app.database import SessionLocal
+    from app.models import Trade, TradeStatus
+    from sqlalchemy import select, delete as sql_delete
+    c = _sub_client("neg-limit@example.com")
+    _, uid = _engine_by_email("neg-limit@example.com")
+    db = SessionLocal()
+    try:
+        for sym in ("BTC/USDT", "ETH/USDT", "SOL/USDT"):
+            db.add(Trade(user_id=uid, symbol=sym, side="buy", amount=0.1,
+                         entry_price=100.0, status=TradeStatus.open.value,
+                         mode="paper"))
+        db.commit()
+        clamped = c.get("/api/trades?limit=-1").json()
+        assert len(clamped) == 1              # clamped to 1, NOT all 3 rows
+        assert len(c.get("/api/signals?limit=-1").json()) <= 1
+    finally:
+        db.execute(sql_delete(Trade).where(Trade.user_id == uid))
+        db.commit()
+        db.close()
+
+# __SEC_APPEND2__
+
+def test_purge_user_state_removes_only_scoped_kv():
+    # Deleting an account must clear its scoped KV (settings, wallet, strategies)
+    # and leave the legacy global (user_id=None) state untouched.
+    from app.database import SessionLocal
+    from app import state
+    db = SessionLocal()
+    uid = 999321  # an id no signed-up user in this suite owns
+    try:
+        state.save_settings_overrides(db, {"trading_mode": "paper"}, uid)
+        state.save_paper_balance(db, 4242.0, uid)
+        state.save_strategy_configs(db, {"BTC/USDT": {"strategy": "sma"}}, uid)
+        state.save_paper_balance(db, 111.0, None)  # global — must survive
+        assert state.purge_user_state(db, uid) == 3
+        assert state.load_settings_overrides(db, uid) == {}
+        assert state.load_strategy_configs(db, uid) == {}
+        assert state.load_paper_balance(db, -1.0, uid) == -1.0    # gone -> default
+        assert state.load_paper_balance(db, -1.0, None) == 111.0  # global intact
+    finally:
+        state.purge_user_state(db, uid)
+        db.close()
+
+# __SEC_APPEND3__
+
+def test_admin_delete_user_cascades_data(client):
+    # Deleting a user must remove their trades/signals/alerts + KV state (no FK
+    # cascade exists on these tables) and free any licence key they redeemed, so
+    # nothing orphaned outlives the account or leaks to a re-used id.
+    from app.database import SessionLocal
+    from app.models import Trade, SignalLog, PriceAlert, TradeStatus
+    from app import state
+    from sqlalchemy import select
+    email = "cascade-del@example.com"
+    _sub_client(email)
+    _, uid = _engine_by_email(email)
+    db = SessionLocal()
+    try:
+        db.add(Trade(user_id=uid, symbol="BTC/USDT", side="buy", amount=0.1,
+                     entry_price=100.0, status=TradeStatus.open.value, mode="paper"))
+        db.add(SignalLog(user_id=uid, source="manual", symbol="BTC/USDT",
+                         action="buy", raw="{}", accepted=1))
+        db.add(PriceAlert(user_id=uid, symbol="BTC/USDT", condition="above",
+                          price=1.0, status="armed"))
+        db.commit()
+        state.save_paper_balance(db, 5000.0, uid)
+    finally:
+        db.close()
+    r = client.delete(f"/api/admin/users/{uid}")  # module client is the admin
+    assert r.status_code == 200 and r.json()["deleted"] == uid
+    db = SessionLocal()
+    try:
+        assert db.scalars(select(Trade).where(Trade.user_id == uid)).all() == []
+        assert db.scalars(select(SignalLog).where(SignalLog.user_id == uid)).all() == []
+        assert db.scalars(select(PriceAlert).where(PriceAlert.user_id == uid)).all() == []
+        assert state.load_paper_balance(db, -1.0, uid) == -1.0  # KV purged
+    finally:
+        db.close()
+    assert all(u["id"] != uid for u in client.get("/api/admin/users").json())
+
+
+
+

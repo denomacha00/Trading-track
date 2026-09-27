@@ -55,6 +55,21 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(dk, expected)
 
 
+# A throwaway hash of a value no one logs in with, computed once at import. The
+# login path verifies against THIS when no account matches, so "no such user" and
+# "user exists, wrong password" take the same PBKDF2 time — closing the timing
+# side-channel an attacker could otherwise use to enumerate valid accounts.
+_DUMMY_HASH = hash_password("timing-equalizer-not-a-real-account-secret")
+
+
+def dummy_verify(password: str) -> None:
+    """Burn the same work :func:`verify_password` does, then discard it.
+
+    Call on the no-such-user branch of login so both branches take ~equal time.
+    """
+    verify_password(password, _DUMMY_HASH)
+
+
 # ---- JWT (HS256, minimal, no external dep) ---------------------------
 
 

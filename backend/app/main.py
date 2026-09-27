@@ -28,7 +28,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app import __version__
@@ -83,6 +83,7 @@ from app.schemas import (
 )
 from app.security import (
     create_access_token,
+    dummy_verify,
     encrypt_secret,
     hash_license_key,
     hash_password,
@@ -92,6 +93,7 @@ from app.security import (
     verify_password,
 )
 from app.usermgr import get_manager
+from app.state import purge_user_state
 from app.learn import PARAM_GRIDS, train
 from app.news import fetch_market_news
 from app.performance import compute_performance
@@ -121,7 +123,7 @@ def _engine_for(db: Session, user: User):
 def _analysis_for(engine, symbol: str, timeframe: str = "1h", limit: int = 200):
     """Fetch candles via a user's connector and run deterministic analysis."""
     try:
-        raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, min(limit, 1000))
+        raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, max(1, min(limit, 1000)))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"OHLCV unavailable: {exc}")
     if not raw:
@@ -294,12 +296,19 @@ _USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,64}$")
 
 
 def _enforce_rate_limit(
-    request: Request, bucket: str, *, limit: int, window_seconds: float
+    request: Request, bucket: str, *, limit: int, window_seconds: float,
+    subject: str | None = None,
 ) -> None:
-    """Reject with HTTP 429 once ``limit`` hits for this IP+bucket are exceeded."""
+    """Reject with HTTP 429 once ``limit`` hits for this bucket are exceeded.
+
+    Keyed by ``subject`` when given (e.g. an authenticated user id) so a shared
+    NAT/office IP can't exhaust one member's budget for everyone; falls back to
+    the source IP for pre-auth endpoints (signup/login) where there is no user.
+    """
     if not get_settings().rate_limit_enabled:
         return
-    key = f"{bucket}:{client_ip(request)}"
+    who = subject if subject else client_ip(request)
+    key = f"{bucket}:{who}"
     if not limiter.hit(key, limit=limit, window_seconds=window_seconds):
         raise HTTPException(
             status_code=429,
@@ -423,7 +432,15 @@ def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
             or_(func.lower(User.email) == ident, func.lower(User.username) == ident)
         )
     ).first()
-    if not user or not verify_password(req.password, user.password_hash):
+    # Verify in constant-ish time whether or not the account exists: on a miss we
+    # still run one PBKDF2 (dummy_verify) so response time can't reveal which
+    # usernames/emails are real. Same 401 message either way.
+    if user is None:
+        dummy_verify(req.password)
+        raise HTTPException(
+            status_code=401, detail="Invalid username/email or password"
+        )
+    if not verify_password(req.password, user.password_hash):
         raise HTTPException(
             status_code=401, detail="Invalid username/email or password"
         )
@@ -551,22 +568,38 @@ _SENSITIVE_KEYS = {
 }
 
 
+def _redact_obj(obj):
+    """Recursively mask secret-like keys anywhere in a parsed JSON structure.
+
+    Walks nested dicts and lists so a secret buried under e.g. ``{"data":
+    {"apiKey": ...}}`` is masked too, not just top-level fields.
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            norm = "".join(ch for ch in str(k).lower() if ch.isalnum())
+            if norm in _SENSITIVE_KEYS:
+                out[k] = "***redacted***"
+            else:
+                out[k] = _redact_obj(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact_obj(v) for v in obj]
+    return obj
+
+
 def _redact_raw(raw: str) -> str:
     """Scrub secret-like fields from a webhook body before it is persisted.
 
-    Best-effort and fail-safe: parse JSON and mask sensitive keys; if the body
-    isn't JSON we can't locate a secret inside it, so we store only its size
-    rather than the bytes. We never keep a plaintext secret at rest.
+    Best-effort and fail-safe: parse JSON and mask sensitive keys at any depth;
+    if the body isn't JSON we can't locate a secret inside it, so we store only
+    its size rather than the bytes. We never keep a plaintext secret at rest.
     """
     try:
         data = json.loads(raw)
     except Exception:
         return f"<non-JSON payload, {len(raw)} bytes (redacted)>"
-    if isinstance(data, dict):
-        for k in list(data.keys()):
-            norm = "".join(ch for ch in str(k).lower() if ch.isalnum())
-            if norm in _SENSITIVE_KEYS:
-                data[k] = "***redacted***"
+    data = _redact_obj(data)
     try:
         return json.dumps(data)
     except Exception:
@@ -697,7 +730,7 @@ def list_trades(
     stmt = select(Trade).where(Trade.user_id == user.id)
     if status:
         stmt = stmt.where(Trade.status == status)
-    stmt = stmt.order_by(Trade.opened_at.desc()).limit(min(limit, 500))
+    stmt = stmt.order_by(Trade.opened_at.desc()).limit(max(1, min(limit, 500)))
     return list(db.scalars(stmt).all())
 
 
@@ -723,7 +756,7 @@ def list_signals(
         select(SignalLog)
         .where(SignalLog.user_id == user.id)
         .order_by(SignalLog.created_at.desc())
-        .limit(min(limit, 200))
+        .limit(max(1, min(limit, 200)))
     )
     return list(db.scalars(stmt).all())
 
@@ -978,7 +1011,7 @@ def ohlcv(
 ):
     engine = _engine_for(db, user)
     try:
-        raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, min(limit, 1000))
+        raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, max(1, min(limit, 1000)))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"OHLCV unavailable: {exc}")
     return [
@@ -1066,7 +1099,7 @@ def backtest(
         timeframe = saved_cfg.get("timeframe", timeframe)
         saved_params = saved_cfg.get("params") or {}
     try:
-        raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, min(limit, 1000))
+        raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, max(1, min(limit, 1000)))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"OHLCV unavailable: {exc}")
     if not raw:
@@ -1138,9 +1171,10 @@ def ai_ask(
     db: Session = Depends(get_db),
     user: User = Depends(require_licensed_user),
 ):
-    # The AI key is a shared, operator-funded resource. Rate-limit per IP and
+    # The AI key is a shared, operator-funded resource. Rate-limit per USER (not
+    # per IP, so one member on a shared office/NAT IP can't starve the rest) and
     # cap the prompt length so a single account can't run up the operator's bill.
-    _enforce_rate_limit(request, "ai", limit=20, window_seconds=60)
+    _enforce_rate_limit(request, "ai", limit=20, window_seconds=60, subject=f"u{user.id}")
     question = str(payload.get("question", "")).strip()
     if not question:
         raise HTTPException(status_code=400, detail="question is required")
@@ -1658,7 +1692,7 @@ def ai_chat(
     executes anything — the operator confirms on a card and the frontend then calls
     the normal authenticated endpoint.
     """
-    _enforce_rate_limit(request, "ai", limit=20, window_seconds=60)
+    _enforce_rate_limit(request, "ai", limit=20, window_seconds=60, subject=f"u{user.id}")
     question = str(payload.get("question", "")).strip()
     if not question:
         raise HTTPException(status_code=400, detail="question is required")
@@ -1761,7 +1795,7 @@ def ai_health(
     "unreachable" — instead of a silent failure. Rate-limited because it costs
     a provider call.
     """
-    _enforce_rate_limit(request, "ai", limit=20, window_seconds=60)
+    _enforce_rate_limit(request, "ai", limit=20, window_seconds=60, subject=f"u{user.id}")
     return _engine_for(db, user).ai.health()
 
 
@@ -1803,7 +1837,7 @@ def train_strategy(
     tp = s.default_take_profit_pct if take_profit_pct is None else take_profit_pct
     trail = s.trailing_stop_pct if trailing_stop_pct is None else trailing_stop_pct
     try:
-        raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, min(limit, 1000))
+        raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, max(1, min(limit, 1000)))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"OHLCV unavailable: {exc}")
     if not raw:
@@ -1970,7 +2004,21 @@ def admin_delete_user(
     target = db.get(User, user_id)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
+    # Tear down the account fully. user_id on these rows is a plain indexed column
+    # (not a FK with ON DELETE CASCADE), so nothing is removed for us — without
+    # this, a deleted user's trades/signals/alerts and their KV state (including a
+    # simulated wallet) would be orphaned in the DB, and a re-used id could inherit
+    # them. Free any licence key they redeemed so it can be reissued.
     get_manager().drop(target.id)
+    db.execute(delete(Trade).where(Trade.user_id == target.id))
+    db.execute(delete(SignalLog).where(SignalLog.user_id == target.id))
+    db.execute(delete(PriceAlert).where(PriceAlert.user_id == target.id))
+    db.execute(
+        update(LicenseKey)
+        .where(LicenseKey.redeemed_by == target.id)
+        .values(redeemed_by=None)
+    )
+    purge_user_state(db, target.id)
     db.delete(target)
     db.commit()
     return {"deleted": user_id}
