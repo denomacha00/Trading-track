@@ -90,6 +90,38 @@ def _score(total_return_pct: float, max_drawdown_pct: float, num_trades: int) ->
     return total_return_pct - 0.5 * max_drawdown_pct
 
 
+def _overfit_gap(
+    in_sample_return_pct: float,
+    in_sample_bars: int,
+    oos_return_pct: float,
+    oos_bars: int,
+) -> float | None:
+    """The overfit gap measured on a LIKE-FOR-LIKE window.
+
+    The in-sample and out-of-sample periods are different lengths (the split is
+    chronological, e.g. 70/30), so their raw *total* returns are NOT comparable:
+    the longer in-sample window compounds over more bars and posts a bigger total
+    even when the per-bar performance is identical — subtracting the two totals
+    would fake an overfit gap out of nothing. Instead take the in-sample GEOMETRIC
+    per-bar growth, project it over the OOS window's own length, and compare that
+    to the actual OOS return. Positive => the strategy underperformed its
+    in-sample pace out-of-sample (the real overfitting signal), now measured on
+    equal ground and in the same units as ``validation_return_pct``.
+
+    Returns None when it can't be computed honestly — either window empty, or an
+    in-sample total loss (growth factor <= 0) where a real per-bar root doesn't
+    exist. Never a fabricated 0.
+    """
+    if in_sample_bars <= 0 or oos_bars <= 0:
+        return None
+    growth = 1.0 + in_sample_return_pct / 100.0
+    if growth <= 0:
+        return None
+    per_bar = growth ** (1.0 / in_sample_bars)
+    projected_oos_pct = (per_bar ** oos_bars - 1.0) * 100.0
+    return projected_oos_pct - oos_return_pct
+
+
 def train(
     candles: pd.DataFrame,
     strategy: str,
@@ -185,9 +217,13 @@ def train(
             candidate.validation_num_trades = v.num_trades
             candidate.validation_win_rate_pct = round(v.win_rate_pct, 2)
             candidate.validation_max_drawdown_pct = round(v.max_drawdown_pct, 2)
-            candidate.overfit_gap_pct = round(
-                result.total_return_pct - v.total_return_pct, 2
+            # Like-for-like: project the in-sample per-bar pace over the OOS
+            # window instead of subtracting totals from unequal-length windows.
+            gap = _overfit_gap(
+                result.total_return_pct, len(train_df),
+                v.total_return_pct, len(valid_df),
             )
+            candidate.overfit_gap_pct = round(gap, 2) if gap is not None else None
         candidates.append(candidate)
 
     candidates.sort(key=lambda c: c.score, reverse=True)

@@ -5426,7 +5426,12 @@ function TrainPanel({
                     <th className="mono">Max DD %</th>
                     <th className="mono">Trades</th>
                     <th className="mono">Val. return %</th>
-                    <th className="mono">Overfit gap</th>
+                    <th
+                      className="mono"
+                      title="In-sample pace projected onto the validation window, minus the actual validation return. Higher = the setup did better in training than out-of-sample (more overfit). Compared like-for-like, not raw totals from unequal windows."
+                    >
+                      Overfit gap
+                    </th>
                   </tr>
                 </thead>
                 <tbody>

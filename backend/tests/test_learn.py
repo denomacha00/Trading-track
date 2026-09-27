@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
-from app.learn import train
+from app.learn import _overfit_gap, train
 
 
 def _candles(prices: list[float]) -> pd.DataFrame:
@@ -82,7 +83,61 @@ def test_train_rsi_grid_respects_bounds():
 
 
 def test_train_unknown_strategy():
-    import pytest
-
     with pytest.raises(ValueError):
         train(_candles(_trending_prices()), "does_not_exist")
+
+
+# ---- overfit gap: like-for-like, not a window-length artifact (L9) --------
+# The chronological split makes the in-sample and out-of-sample windows unequal
+# lengths (e.g. 70/30). Subtracting their raw totals used to fake an overfit gap
+# purely from the longer window compounding more. _overfit_gap normalises to the
+# in-sample per-bar pace, projects it over the OOS window, and compares like for
+# like.
+
+def test_overfit_gap_zero_when_per_bar_pace_identical():
+    # Same geometric per-bar growth in both windows => genuinely no overfitting,
+    # even though the windows are different lengths and post very different totals.
+    per_bar = 1.001
+    is_bars, oos_bars = 700, 300
+    is_ret = (per_bar ** is_bars - 1) * 100
+    oos_ret = (per_bar ** oos_bars - 1) * 100
+    gap = _overfit_gap(is_ret, is_bars, oos_ret, oos_bars)
+    assert gap == pytest.approx(0.0, abs=1e-6)
+    # The old total-minus-total math would have reported a large phantom gap
+    # that is nothing but the window-length mismatch.
+    assert (is_ret - oos_ret) > 60
+
+
+def test_overfit_gap_positive_when_in_sample_outperforms():
+    is_bars, oos_bars = 700, 300
+    is_ret = (1.002 ** is_bars - 1) * 100   # faster per-bar pace in-sample
+    oos_ret = (1.001 ** oos_bars - 1) * 100  # slower out-of-sample
+    gap = _overfit_gap(is_ret, is_bars, oos_ret, oos_bars)
+    assert gap > 0
+
+
+def test_overfit_gap_negative_when_oos_outperforms():
+    is_bars, oos_bars = 700, 300
+    is_ret = (1.001 ** is_bars - 1) * 100
+    oos_ret = (1.002 ** oos_bars - 1) * 100  # held up BETTER out-of-sample
+    gap = _overfit_gap(is_ret, is_bars, oos_ret, oos_bars)
+    assert gap < 0
+
+
+def test_overfit_gap_none_on_in_sample_total_loss():
+    # Growth factor <= 0 has no real per-bar root -> refuse, never fabricate a 0.
+    assert _overfit_gap(-100.0, 700, 5.0, 300) is None
+    assert _overfit_gap(-150.0, 700, 5.0, 300) is None
+
+
+def test_overfit_gap_none_on_empty_window():
+    assert _overfit_gap(50.0, 0, 5.0, 300) is None
+    assert _overfit_gap(50.0, 700, 5.0, 0) is None
+
+
+def test_train_reports_bounded_overfit_gap():
+    # End to end: the reported gap is the like-for-like figure, so it stays on the
+    # same scale as the OOS return rather than the inflated in-sample total.
+    report = train(_candles(_trending_prices(300)), "ma_cross")
+    assert report.best is not None
+    assert report.best.overfit_gap_pct is not None
