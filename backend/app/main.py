@@ -284,8 +284,8 @@ def _me_out(user: User) -> MeOut:
         webhook_path=_webhook_path(user.webhook_token),
         binance_keys_set=bool(user.binance_api_key_enc and user.binance_api_secret_enc),
         binance_testnet=bool(user.binance_testnet),
-        ai_key_set=bool(gs.ai_api_key),
-        ai_model=gs.ai_model or "",
+        ai_key_set=bool(gs.ai_api_key or gs.ai_fallback_api_key),
+        ai_model=gs.ai_model or gs.ai_fallback_model or "",
         secrets_storage_enabled=secrets_enabled(gs.secret_key),
     )
 
@@ -844,9 +844,9 @@ def _settings_out(engine, user: User) -> SettingsOut:
         ai_trade_confirm=getattr(s, "ai_trade_confirm", False),
         ai_monitor_enabled=getattr(s, "ai_monitor_enabled", False),
         ai_autopilot_enabled=getattr(s, "ai_autopilot_enabled", False),
-        ai_enabled=bool(s.ai_api_key),
+        ai_enabled=bool(s.ai_api_key or getattr(s, "ai_fallback_api_key", "")),
         ai_model=s.ai_model,
-        ai_style=engine.ai._style() if s.ai_api_key else "",
+        ai_style=engine.ai._style() if (s.ai_api_key or getattr(s, "ai_fallback_api_key", "")) else "",
         notifications_enabled=engine.notifier.enabled,
         api_key_set=bool(user.binance_api_key_enc and user.binance_api_secret_enc),
         webhook_path=_webhook_path(user.webhook_token),

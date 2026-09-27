@@ -244,11 +244,48 @@ _SAFE_STARTER = (
 )
 
 
-# Flat-object only: the action JSON never nests, so [^{}] safely bounds it and we
-# can't accidentally swallow surrounding prose. Case-insensitive, whitespace-lax.
-_ACTION_TAG_RE = re.compile(
-    r"\[\[\s*action\s*:\s*(\{[^{}]*\})\s*\]\]", re.IGNORECASE | re.DOTALL
-)
+# The action tag wraps ONE JSON object: [[action:{...}]]. That object routinely
+# nests — a `settings` action carries a `"changes":{...}` dict (see _ACTION_GUIDE)
+# — and its free-text `reason` may itself contain braces or brackets. A flat
+# `\{[^{}]*\}` class (or a naive non-greedy `.*?`) truncates or misses those, which
+# silently drops every settings proposal and leaks the raw tag into the reply. So
+# we locate the `[[action:` prefix, then walk the JSON with a string-aware brace
+# counter to find its true end. Case-insensitive, whitespace-lax.
+_ACTION_OPEN_RE = re.compile(r"\[\[\s*action\s*:\s*", re.IGNORECASE)
+_ACTION_CLOSE_RE = re.compile(r"\s*\]\]")
+
+
+def _scan_json_object(text: str, start: int) -> int:
+    """Index just past the ``{...}`` object that begins at ``text[start]``.
+
+    String-aware brace matching (handles nesting to any depth, and braces/brackets
+    inside JSON string values) so we find the object's real end. Returns -1 if
+    ``start`` isn't an opening brace or the object never closes.
+    """
+    if start >= len(text) or text[start] != "{":
+        return -1
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return -1
 
 
 def strip_action_tag(text: str) -> tuple[str, Optional[dict]]:
@@ -262,12 +299,19 @@ def strip_action_tag(text: str) -> tuple[str, Optional[dict]]:
     """
     if not text:
         return text, None
-    m = _ACTION_TAG_RE.search(text)
+    m = _ACTION_OPEN_RE.search(text)
     if not m:
         return text, None
-    clean = (text[: m.start()] + text[m.end() :]).strip()
+    obj_start = m.end()
+    obj_end = _scan_json_object(text, obj_start)
+    if obj_end < 0:
+        return text, None
+    close = _ACTION_CLOSE_RE.match(text, obj_end)
+    if not close:
+        return text, None
+    clean = (text[: m.start()] + text[close.end() :]).strip()
     try:
-        obj = json.loads(m.group(1))
+        obj = json.loads(text[obj_start:obj_end])
     except (ValueError, TypeError):
         return clean, None
     return clean, (obj if isinstance(obj, dict) else None)
@@ -351,23 +395,132 @@ class AICommentator:
         # Human-readable reason the last provider call failed (no secrets). Lets
         # the UI/assistant say WHY the AI didn't answer instead of a vague retry.
         self._last_error: str = ""
+        # Which provider actually answered the last successful call ("primary" or
+        # "fallback"), or "" if none did. Diagnostics only — never a secret.
+        self._last_provider: str = ""
 
     def reload(self, settings: Settings) -> None:
         self._settings = settings
 
     @property
     def available(self) -> bool:
-        return bool(self._settings.ai_api_key)
+        # AI is usable if EITHER the primary or the fallback provider has a key.
+        return bool(
+            self._settings.ai_api_key
+            or getattr(self._settings, "ai_fallback_api_key", "")
+        )
 
-    def _style(self) -> str:
-        style = (self._settings.ai_api_style or "auto").lower()
+    @staticmethod
+    def _resolve_style(style: str, model: str, base_url: str) -> str:
+        """Resolve a provider's send style: explicit wins, else infer from model/url."""
+        style = (style or "auto").lower()
         if style in ("openai", "anthropic"):
             return style
-        return (
-            "anthropic"
-            if _looks_anthropic(self._settings.ai_model, self._settings.ai_base_url)
-            else "openai"
+        return "anthropic" if _looks_anthropic(model, base_url) else "openai"
+
+    def _style(self) -> str:
+        # The PRIMARY provider's resolved style (kept for callers/UI that read it).
+        return self._resolve_style(
+            self._settings.ai_api_style,
+            self._settings.ai_model,
+            self._settings.ai_base_url,
         )
+
+    def _providers(self) -> list[dict[str, str]]:
+        """Ordered providers to try: PRIMARY first, then the optional FALLBACK.
+
+        Each entry is a non-secret-labelled provider config (its key is included
+        only to send the request, never logged). The fallback is present ONLY when
+        its own key is set, so with no fallback configured this is a one-element
+        list and behaviour is identical to the original single-provider path.
+        """
+        s = self._settings
+        out: list[dict[str, str]] = []
+        if s.ai_api_key:
+            out.append(
+                {
+                    "label": "primary",
+                    "key": s.ai_api_key,
+                    "base_url": s.ai_base_url,
+                    "model": s.ai_model,
+                    "style": self._resolve_style(s.ai_api_style, s.ai_model, s.ai_base_url),
+                }
+            )
+        fb_key = getattr(s, "ai_fallback_api_key", "")
+        if fb_key:
+            fb_base = getattr(s, "ai_fallback_base_url", "") or s.ai_base_url
+            fb_model = getattr(s, "ai_fallback_model", "") or s.ai_model
+            fb_style = getattr(s, "ai_fallback_api_style", "auto")
+            out.append(
+                {
+                    "label": "fallback",
+                    "key": fb_key,
+                    "base_url": fb_base,
+                    "model": fb_model,
+                    "style": self._resolve_style(fb_style, fb_model, fb_base),
+                }
+            )
+        return out
+
+    def _post_once(
+        self,
+        prov: dict[str, str],
+        system: str,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+    ) -> Optional[str]:
+        """One real request to a SINGLE provider.
+
+        Raises on any transport/HTTP error (the caller records it and may fall
+        back to the next provider); returns the reply text, or None if the
+        provider answered but with no usable content.
+        """
+        base = (prov["base_url"] or "").rstrip("/")
+        # Fast failover: cap CONNECT time so a down/unreachable provider is dropped
+        # quickly and the SAME request can retry the next provider — while a
+        # healthy-but-slow response still gets the full read budget.
+        read_to = self._settings.ai_timeout_seconds
+        connect_to = getattr(self._settings, "ai_connect_timeout_seconds", 5.0) or 5.0
+        connect_to = min(connect_to, read_to)
+        timeout = httpx.Timeout(connect=connect_to, read=read_to, write=read_to, pool=connect_to)
+        with httpx.Client(timeout=timeout) as client:
+            if prov["style"] == "anthropic":
+                resp = client.post(
+                    base + "/messages",
+                    headers={
+                        "x-api-key": prov["key"],
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": prov["model"],
+                        "max_tokens": max_tokens,
+                        "system": system,
+                        "messages": messages,
+                    },
+                )
+                resp.raise_for_status()
+                return _extract_anthropic_text(resp.json())
+            # OpenAI-compatible chat completions
+            resp = client.post(
+                base + "/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {prov['key']}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": prov["model"],
+                    "messages": [
+                        {"role": "system", "content": system},
+                        *messages,
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": max_tokens,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"].strip()
 
     def _post(
         self,
@@ -378,72 +531,51 @@ class AICommentator:
     ) -> Optional[str]:
         """Send a conversation and return the text reply, or None on failure.
 
-        ``history`` (already sanitised prior turns) is prepended before the live
-        ``user`` turn so the assistant has real conversational memory. Adjacent
-        same-role turns are coalesced here so the message list strictly
-        alternates — the Anthropic messages API rejects two same-role turns in a
-        row, and the boundary between a trailing user turn in history and the
-        live question is exactly where that would happen.
+        Tries the PRIMARY provider first; if it fails (or answers with nothing)
+        AND a FALLBACK provider is configured, the SAME request is retried once
+        against the fallback so the assistant keeps working while the primary is
+        down. ``history`` (already-sanitised prior turns) is prepended before the
+        live ``user`` turn so the assistant has real conversational memory.
+        Adjacent same-role turns are coalesced so the list strictly alternates —
+        the Anthropic messages API rejects two same-role turns in a row.
         """
-        if not self.available:
+        providers = self._providers()
+        if not providers:
             self._last_error = "no AI key configured"
+            self._last_provider = ""
             return None
-        self._last_error = ""
         max_tokens = max_tokens or self._settings.ai_max_tokens
-        base = self._settings.ai_base_url.rstrip("/")
-        timeout = self._settings.ai_timeout_seconds
-        # Build the alternating message list: prior turns + the live question.
+        # Build the alternating message list ONCE and reuse it for every provider.
         messages: list[dict[str, str]] = []
         for turn in (history or []) + [{"role": "user", "content": user}]:
             if messages and messages[-1]["role"] == turn["role"]:
                 messages[-1]["content"] += "\n\n" + turn["content"]
             else:
                 messages.append({"role": turn["role"], "content": turn["content"]})
-        try:
-            with httpx.Client(timeout=timeout) as client:
-                if self._style() == "anthropic":
-                    resp = client.post(
-                        base + "/messages",
-                        headers={
-                            "x-api-key": self._settings.ai_api_key,
-                            "anthropic-version": "2023-06-01",
-                            "content-type": "application/json",
-                        },
-                        json={
-                            "model": self._settings.ai_model,
-                            "max_tokens": max_tokens,
-                            "system": system,
-                            "messages": messages,
-                        },
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    return _extract_anthropic_text(data)
-                # OpenAI-compatible chat completions
-                resp = client.post(
-                    base + "/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self._settings.ai_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": self._settings.ai_model,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            *messages,
-                        ],
-                        "temperature": 0.2,
-                        "max_tokens": max_tokens,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                return data["choices"][0]["message"]["content"].strip()
-        except Exception as exc:
-            self._last_error = _describe_ai_error(exc)
-            # Log the category, never the key or full payload.
-            logger.warning("AI request failed: %s", self._last_error)
-            return None
+        errors: list[str] = []
+        for prov in providers:
+            try:
+                text = self._post_once(prov, system, messages, max_tokens)
+                if text:
+                    self._last_error = ""
+                    self._last_provider = prov["label"]
+                    if prov["label"] != "primary":
+                        # A trade might be riding on this — make the failover visible
+                        # in the logs (never the key or payload).
+                        logger.info(
+                            "AI answered via the %s provider after the primary failed",
+                            prov["label"],
+                        )
+                    return text
+                errors.append(f"{prov['label']}: provider answered with no usable text")
+            except Exception as exc:  # noqa: BLE001 — categorised, secret-free below
+                reason = _describe_ai_error(exc)
+                errors.append(f"{prov['label']}: {reason}")
+                logger.warning("AI request via %s provider failed: %s", prov["label"], reason)
+        # Every configured provider failed. Compose a combined, secret-free reason.
+        self._last_error = "; ".join(errors) if errors else "AI request failed"
+        self._last_provider = ""
+        return None
 
     # ---- public API --------------------------------------------------
 
@@ -606,13 +738,69 @@ class AICommentator:
             "AI_API_KEY / AI_BASE_URL / AI_MODEL / AI_API_STYLE settings."
         )
 
-    def health(self) -> dict[str, Any]:
-        """Live check that the configured AI provider actually answers.
+    def _diagnose(self, prov: dict[str, str]) -> str:
+        """Secret-free misconfig hint for a provider that failed to answer.
 
-        Makes ONE tiny real request (no fabrication). Returns non-secret status
-        the UI can show so "the AI isn't working" becomes a concrete reason
-        (bad key, wrong model, unreachable) instead of a mystery. The API key
-        itself is never included.
+        The classic smoking gun is a key/style mismatch (an Anthropic sk-ant-… key
+        sent OpenAI-style, or a Claude model sent openai-style), which returns 401
+        with a perfectly real key. Never reveals key characters — only its public
+        prefix FAMILY vs the send STYLE.
+        """
+        style = prov["style"]
+        family = _key_family(prov["key"])
+        looks_anth = _looks_anthropic(prov["model"], prov["base_url"])
+        if family.startswith("anthropic") and style != "anthropic":
+            return (
+                " — this key is an Anthropic key (sk-ant-…) but is being sent "
+                f"{style}-style; set its style to anthropic"
+            )
+        if style == "openai" and looks_anth:
+            return (
+                " — a Claude model is being sent openai-style; gateways that serve "
+                "Claude usually need the anthropic style"
+            )
+        if family == "unrecognized prefix":
+            return " — the key's format isn't a known OpenAI/Anthropic prefix"
+        return ""
+
+    def _probe_one(self, prov: dict[str, str]) -> dict[str, Any]:
+        """Make ONE tiny real request to a provider and report non-secret status."""
+        st: dict[str, Any] = {
+            "label": prov["label"],
+            "ok": False,
+            "model": prov["model"],
+            "base_url": prov["base_url"],
+            "style": prov["style"],
+            "detail": "",
+        }
+        try:
+            text = self._post_once(
+                prov,
+                _SYSTEM_ASSISTANT,
+                [{"role": "user", "content": "Reply with exactly: ok"}],
+                5,
+            )
+            if text:
+                st["ok"] = True
+                st["detail"] = (
+                    f"reachable and the key works ({prov['style']} style, "
+                    f"model {prov['model']})"
+                )
+            else:
+                st["detail"] = "the provider answered but returned no usable text"
+        except Exception as exc:  # noqa: BLE001 — categorised, secret-free
+            st["detail"] = _describe_ai_error(exc) + self._diagnose(prov)
+        return st
+
+    def health(self) -> dict[str, Any]:
+        """Live check that a configured AI provider actually answers.
+
+        Probes EACH configured provider (primary, then fallback if set) with one
+        tiny real request — no fabrication — so "the AI isn't working" becomes a
+        concrete per-provider reason. Top-level ``ok`` is True if ANY provider
+        answers (that's all it takes to keep the assistant alive), and the
+        per-provider results are returned under ``providers``. No API key is ever
+        included.
         """
         status: dict[str, Any] = {
             "enabled": self.available,
@@ -621,53 +809,22 @@ class AICommentator:
             "base_url": self._settings.ai_base_url,
             "style": self._style(),
             "detail": "",
+            "providers": [],
         }
-        if not self.available:
+        providers = self._providers()
+        if not providers:
             status["detail"] = (
-                "No AI key configured. The operator sets AI_API_KEY (and "
-                "optionally AI_BASE_URL / AI_MODEL / AI_API_STYLE) on the server."
+                "No AI key configured. The operator sets AI_API_KEY (and, for a "
+                "backup, AI_FALLBACK_API_KEY / AI_FALLBACK_BASE_URL / "
+                "AI_FALLBACK_MODEL / AI_FALLBACK_API_STYLE) on the server."
             )
             return status
-        reply = self._post(_SYSTEM_ASSISTANT, "Reply with exactly: ok", max_tokens=5)
-        if reply:
-            status["ok"] = True
-            status["detail"] = (
-                f"AI provider reachable and the key works ({self._style()} style, "
-                f"model {self._settings.ai_model})."
-            )
-        else:
-            # Reveal the RESOLVED provider settings (never the key) so a
-            # misconfiguration is self-evident. The key FAMILY (from its public
-            # prefix) vs the send STYLE is the usual smoking gun: an OpenAI key
-            # (sk-…) sent anthropic-style — or a Claude key (sk-ant-…) sent
-            # openai-style to api.openai.com — returns 401 with a real key.
-            style = self._style()
-            family = _key_family(self._settings.ai_api_key)
-            looks_anth = _looks_anthropic(
-                self._settings.ai_model, self._settings.ai_base_url
-            )
-            hint = ""
-            if family.startswith("anthropic") and style != "anthropic":
-                hint = (
-                    " — your key is an Anthropic key (sk-ant-…) but it's being "
-                    f"sent {style}-style; set AI_API_STYLE=anthropic"
-                )
-            elif style == "openai" and looks_anth:
-                # A Claude model over openai-style is the usual misconfig; note
-                # that an sk-… key sent anthropic-style is NOT flagged, because
-                # Claude-serving gateways legitimately use sk-… keys that way.
-                hint = (
-                    " — a Claude model is being sent openai-style; gateways that "
-                    "serve Claude usually need AI_API_STYLE=anthropic"
-                )
-            elif family == "unrecognized prefix":
-                hint = " — the key's format isn't a known OpenAI/Anthropic prefix"
-            status["detail"] = (
-                f"{self._last_error or 'AI request failed'} "
-                f"[resolved: style={style}, key={family}, "
-                f"model={self._settings.ai_model or '(unset)'}, "
-                f"base_url={self._settings.ai_base_url or '(unset)'}]{hint}"
-            )
+        probes = [self._probe_one(p) for p in providers]
+        status["providers"] = probes
+        status["ok"] = any(p["ok"] for p in probes)
+        status["detail"] = " | ".join(
+            f"{p['label']} {'OK' if p['ok'] else 'FAIL'}: {p['detail']}" for p in probes
+        )
         return status
 
     def confirm_trade(self, analysis: MarketAnalysis) -> tuple[bool, str]:

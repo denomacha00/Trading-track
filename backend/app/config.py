@@ -52,12 +52,35 @@ class Settings(BaseSettings):
     ai_base_url: str = Field(default="https://api.openai.com/v1")
     ai_model: str = Field(default="gpt-4o-mini")
     ai_timeout_seconds: float = Field(default=45.0)
+    # Fast-failover connect timeout (seconds). A DOWN/unreachable primary provider
+    # (the classic "justrouter is down" case) is abandoned after this many seconds
+    # so the SAME request fails over to the secondary provider fast — instead of the
+    # client hanging for the full ai_timeout_seconds. Caps CONNECT time only, so a
+    # healthy provider (connects in <1s) is never affected and a slow-but-alive
+    # response still gets the full read budget. Lower it for snappier failover.
+    ai_connect_timeout_seconds: float = Field(default=5.0)
     # Provider API style: "auto" (infer from model/base_url), "openai", or
     # "anthropic". Auto picks Anthropic when the model looks like a Claude model
     # or the base URL is anthropic-flavoured; otherwise OpenAI chat-completions.
     ai_api_style: str = Field(default="auto")
     # Token budget for AI replies. Higher = more room to reason/research.
     ai_max_tokens: int = Field(default=1024)
+
+    # OPTIONAL SECONDARY (FALLBACK) AI provider — a backup so the assistant keeps
+    # working mid-trade if the PRIMARY provider goes down. Mirrors the public
+    # market-data fallback above: when a PRIMARY request fails for any reason
+    # (provider down/5xx, rate-limited 429, edge/WAF block, timeout, unreachable),
+    # the SAME request is transparently retried ONCE against this provider so chat,
+    # analysis and the trade-review veto don't go dark. Leave ai_fallback_api_key
+    # EMPTY to disable — behaviour is then byte-for-byte what it is today. It is
+    # only ever a backstop: a healthy primary is never sent here, this provider can
+    # use a totally different vendor/style, and (like the primary) it can only
+    # narrate/answer/veto — it never places a trade. Same key handling as the
+    # primary (whitespace/quote/NAME= cleaning) so a pasted Railway value works.
+    ai_fallback_api_key: str = Field(default="")
+    ai_fallback_base_url: str = Field(default="https://api.openai.com/v1")
+    ai_fallback_model: str = Field(default="gpt-4o-mini")
+    ai_fallback_api_style: str = Field(default="auto")
 
     # Risk management
     max_open_positions: int = Field(default=5)
@@ -215,7 +238,9 @@ class Settings(BaseSettings):
     rate_limit_enabled: bool = Field(default=True)
 
     @field_validator(
-        "ai_api_key", "ai_base_url", "ai_model", "ai_api_style", mode="before"
+        "ai_api_key", "ai_base_url", "ai_model", "ai_api_style",
+        "ai_fallback_api_key", "ai_fallback_base_url", "ai_fallback_model",
+        "ai_fallback_api_style", mode="before"
     )
     @classmethod
     def _clean_ai_env(cls, v: object) -> object:

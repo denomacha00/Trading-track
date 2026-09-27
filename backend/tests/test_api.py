@@ -725,6 +725,65 @@ def test_ai_chat_returns_validated_proposed_action(client, monkeypatch):
     }
 
 
+def test_ai_chat_returns_validated_settings_action(client, monkeypatch):
+    # Regression for the "says yes, does nothing" bug: a `settings` proposal nests
+    # a "changes":{...} object. The old flat-only tag matcher couldn't span the
+    # inner braces, so it dropped the whole proposal AND left the raw tag in the
+    # reply — no Confirm card rendered, so there was nothing to tap and the change
+    # never applied. The endpoint must now strip the tag and return the validated
+    # action; and when the operator confirms, PATCH /api/settings must APPLY it.
+    engine, _ = _admin_engine()
+
+    def fake_chat(question, **kwargs):
+        return (
+            "I'll cap your total open exposure at 20% as a guardrail.\n"
+            '[[action:{"type":"settings","changes":{"max_total_exposure_pct":20.0},'
+            '"reason":"cap exposure during the proving run"}]]'
+        )
+
+    monkeypatch.setattr(engine.ai, "chat", fake_chat)
+    r = client.post("/api/ai/chat", json={"question": "cap my exposure at 20%"})
+    assert r.status_code == 200
+    body = r.json()
+    assert "[[action" not in body["reply"]  # tag hidden, not leaked into the bubble
+    action = body["proposed_action"]
+    assert action is not None  # a Confirm card WILL render now (the fix)
+    assert action["type"] == "settings"
+    assert action["changes"] == {"max_total_exposure_pct": 20.0}
+
+    # Confirm path: the frontend PATCHes exactly action["changes"] — it must land.
+    original = client.get("/api/settings").json()["max_total_exposure_pct"]
+    try:
+        r2 = client.patch("/api/settings", json=action["changes"])
+        assert r2.status_code == 200
+        assert r2.json()["max_total_exposure_pct"] == 20.0
+    finally:
+        client.patch("/api/settings", json={"max_total_exposure_pct": original})
+
+
+def test_ai_chat_proposes_every_action_type(client, monkeypatch):
+    # "Can it act on ALL it's told?" — every documented action shape must survive
+    # the real endpoint as a non-None, correctly-typed proposal, never silently
+    # dropped. This guards the whole tag protocol on the actual wire format (the
+    # gap that let the nested `settings` shape slip through unnoticed).
+    engine, _ = _admin_engine()
+    cases = [
+        ('[[action:{"type":"order","side":"buy","symbol":"BTC/USDT","amount":null}]]', "order"),
+        ('[[action:{"type":"settings","changes":{"max_total_exposure_pct":20.0}}]]', "settings"),
+        ('[[action:{"type":"bot","state":"start"}]]', "bot"),
+        ('[[action:{"type":"alert","symbol":"BTC/USDT","condition":"above","price":65000}]]', "alert"),
+        ('[[action:{"type":"train","symbol":"BTC/USDT","strategy":"ma_cross","timeframe":"1h"}]]', "train"),
+    ]
+    for tag, expected_type in cases:
+        monkeypatch.setattr(engine.ai, "chat", lambda q, _t=tag, **k: f"On it.\n{_t}")
+        r = client.post("/api/ai/chat", json={"question": "do it"})
+        assert r.status_code == 200
+        body = r.json()
+        assert "[[action" not in body["reply"], f"{expected_type}: raw tag leaked into reply"
+        assert body["proposed_action"] is not None, f"{expected_type}: proposal was dropped"
+        assert body["proposed_action"]["type"] == expected_type
+
+
 def test_ai_chat_no_action_when_none_proposed(client, monkeypatch):
     engine, _ = _admin_engine()
     monkeypatch.setattr(engine.ai, "chat", lambda q, **k: "Momentum looks weak; I'd wait.")

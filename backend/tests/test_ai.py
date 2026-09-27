@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from app.ai import AICommentator, _extract_anthropic_text, _looks_anthropic, _sanitize_history
@@ -23,6 +24,12 @@ def _settings(**over):
         ai_api_style="auto",
         ai_timeout_seconds=30.0,
         ai_max_tokens=256,
+        # Fallback provider OFF by default, so these settings behave exactly like
+        # a single-provider setup unless a test opts a fallback in.
+        ai_fallback_api_key="",
+        ai_fallback_base_url="https://api.example.com/v1",
+        ai_fallback_model="gpt-4o-mini",
+        ai_fallback_api_style="auto",
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -114,6 +121,18 @@ def test_openai_hits_chat_completions(monkeypatch):
     assert cap["headers"]["Authorization"] == "Bearer sk-test"
     assert cap["body"]["model"] == "gpt-4o-mini"
     assert cap["body"]["messages"][0]["role"] == "system"
+
+
+def test_connect_timeout_is_bounded_for_fast_failover(monkeypatch):
+    # A DOWN primary must be abandoned on a short CONNECT budget so the request
+    # fails over fast, instead of the client hanging for the full read timeout.
+    _patch_httpx(monkeypatch, {"choices": [{"message": {"content": "hi"}}]})
+    ai = AICommentator(_settings(ai_model="gpt-4o-mini", ai_timeout_seconds=30.0))
+    ai.ask("x")
+    t = _FakeClient.captured["timeout"]
+    assert isinstance(t, httpx.Timeout)
+    assert t.connect == 5.0   # fast connect cap (default)
+    assert t.read == 30.0     # full read budget preserved for a slow-but-alive reply
 
 
 # ---- Anthropic path --------------------------------------------------
@@ -307,4 +326,180 @@ def test_strip_action_tag_malformed_json_is_safe():
 
 def test_strip_action_tag_empty_input():
     assert strip_action_tag("") == ("", None)
+
+
+def test_strip_action_tag_extracts_nested_settings():
+    # Regression: a `settings` action nests a "changes":{...} object. The old
+    # flat-only matcher (\{[^{}]*\}) couldn't span the inner braces, so it dropped
+    # the whole proposal AND leaked the raw tag into the visible reply — the
+    # Confirm card never rendered and the change never applied ("you did nothing").
+    reply = (
+        "I'll cap your total open exposure at 20% as a guardrail.\n"
+        '[[action:{"type":"settings","changes":{"max_total_exposure_pct":20.0},'
+        '"reason":"Cap total exposure during the proving run"}]]'
+    )
+    clean, obj = strip_action_tag(reply)
+    assert "[[action" not in clean  # hidden from the user, never shown raw
+    assert clean.startswith("I'll cap your total open exposure")
+    assert obj == {
+        "type": "settings",
+        "changes": {"max_total_exposure_pct": 20.0},
+        "reason": "Cap total exposure during the proving run",
+    }
+
+
+def test_strip_action_tag_reason_with_braces_and_brackets():
+    # The free-text reason may itself contain braces/brackets; string-aware
+    # scanning must not end the object early on them.
+    reply = (
+        "Tightening your stop.\n"
+        '[[action:{"type":"settings","changes":{"default_stop_loss_pct":2.0},'
+        '"reason":"was {loose} [per plan]"}]]'
+    )
+    clean, obj = strip_action_tag(reply)
+    assert "[[action" not in clean
+    assert obj["changes"] == {"default_stop_loss_pct": 2.0}
+    assert obj["reason"] == "was {loose} [per plan]"
+
+
+# ---- secondary (fallback) AI provider --------------------------------------
+# A backup provider that transparently picks up when the PRIMARY is down, so the
+# assistant keeps working mid-trade. Only ever a backstop: a healthy primary is
+# never sent to it, and it can still only answer — never place a trade.
+
+
+class _RecordingClient:
+    """A fake httpx.Client that plays a queued SEQUENCE of behaviours.
+
+    Every ``with httpx.Client(...)`` in ai.py makes a fresh instance, so the
+    queue + call log are class-level (shared) to span the primary AND fallback
+    attempts within one request. Each queued behaviour is ("ok", payload) or
+    ("raise", exception).
+    """
+
+    calls: list = []
+    behaviors: list = []
+
+    def __init__(self, timeout=None):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def post(self, url, headers=None, json=None):
+        _RecordingClient.calls.append({"url": url, "headers": headers, "body": json})
+        assert _RecordingClient.behaviors, "more provider calls than behaviours queued"
+        kind, val = _RecordingClient.behaviors.pop(0)
+        if kind == "raise":
+            raise val
+        return _FakeResp(val)
+
+
+def _install_sequence(monkeypatch, behaviors):
+    _RecordingClient.calls = []
+    _RecordingClient.behaviors = list(behaviors)
+    import app.ai as ai_mod
+
+    monkeypatch.setattr(ai_mod.httpx, "Client", lambda timeout=None: _RecordingClient())
+
+
+_OPENAI_OK = ("ok", {"choices": [{"message": {"content": "primary answer"}}]})
+_ANTHROPIC_FB_OK = ("ok", {"content": [{"type": "text", "text": "fallback answer"}]})
+
+
+def _dual_settings(**over):
+    """Primary = OpenAI-style, Fallback = Anthropic-style — deliberately different
+    vendors so a test also proves each provider is routed with its OWN style/key."""
+    return _settings(
+        ai_api_key="sk-primary",
+        ai_base_url="https://primary.example.com/v1",
+        ai_model="gpt-4o-mini",
+        ai_fallback_api_key="sk-ant-fallback",
+        ai_fallback_base_url="https://fallback.example.com",
+        ai_fallback_model="claude-opus-4-8",
+        ai_fallback_api_style="auto",
+        **over,
+    )
+
+
+def test_available_true_with_only_fallback():
+    ai = AICommentator(_settings(ai_api_key="", ai_fallback_api_key="sk-fb"))
+    assert ai.available is True
+    provs = ai._providers()
+    assert [p["label"] for p in provs] == ["fallback"]
+
+
+def test_fallback_picks_up_when_primary_fails(monkeypatch):
+    # Primary raises (provider down); fallback answers. The SAME request must be
+    # retried against the fallback, routed with the fallback's own key + style.
+    _install_sequence(monkeypatch, [("raise", httpx.ConnectError("primary down")), _ANTHROPIC_FB_OK])
+    ai = AICommentator(_dual_settings())
+    out = ai.chat("how is my bot doing?")
+    assert out == "fallback answer"
+    assert ai._last_provider == "fallback"
+    calls = _RecordingClient.calls
+    assert len(calls) == 2
+    # First attempt: primary, OpenAI-style, primary key.
+    assert calls[0]["url"] == "https://primary.example.com/v1/chat/completions"
+    assert calls[0]["headers"]["Authorization"] == "Bearer sk-primary"
+    # Second attempt: fallback, Anthropic-style (Claude model), fallback key.
+    assert calls[1]["url"] == "https://fallback.example.com/messages"
+    assert calls[1]["headers"]["x-api-key"] == "sk-ant-fallback"
+    assert "Authorization" not in calls[1]["headers"]
+
+
+def test_primary_ok_means_fallback_is_never_called(monkeypatch):
+    # A healthy primary must NOT leak the request to the fallback provider.
+    _install_sequence(monkeypatch, [_OPENAI_OK, _ANTHROPIC_FB_OK])
+    ai = AICommentator(_dual_settings())
+    out = ai.chat("hi")
+    assert out == "primary answer"
+    assert ai._last_provider == "primary"
+    assert len(_RecordingClient.calls) == 1  # fallback untouched
+
+
+def test_both_providers_down_reports_both_reasons(monkeypatch):
+    _install_sequence(
+        monkeypatch,
+        [("raise", httpx.ConnectError("primary down")), ("raise", httpx.TimeoutException("fb slow"))],
+    )
+    ai = AICommentator(_dual_settings())
+    msg = ai.ask("trend?")  # returns "AI request failed: <reason>." on total failure
+    assert len(_RecordingClient.calls) == 2
+    assert "primary" in ai._last_error and "fallback" in ai._last_error
+    assert "AI request failed" in msg
+
+
+def test_health_probes_each_provider(monkeypatch):
+    _install_sequence(monkeypatch, [_OPENAI_OK, _ANTHROPIC_FB_OK])
+    ai = AICommentator(_dual_settings())
+    h = ai.health()
+    assert h["ok"] is True
+    labels = [p["label"] for p in h["providers"]]
+    assert labels == ["primary", "fallback"]
+    assert all(p["ok"] for p in h["providers"])
+
+
+def test_health_ok_if_only_fallback_answers(monkeypatch):
+    # Primary probe fails, fallback probe works -> overall ok (assistant survives).
+    _install_sequence(monkeypatch, [("raise", httpx.ConnectError("down")), _ANTHROPIC_FB_OK])
+    ai = AICommentator(_dual_settings())
+    h = ai.health()
+    assert h["ok"] is True
+    assert h["providers"][0]["ok"] is False
+    assert h["providers"][1]["ok"] is True
+
+
+def test_single_provider_behaviour_unchanged(monkeypatch):
+    # With no fallback configured, exactly one attempt is made (byte-for-byte the
+    # old single-provider path).
+    _install_sequence(monkeypatch, [_OPENAI_OK])
+    ai = AICommentator(_settings())  # fallback key empty by default
+    out = ai.ask("x?")
+    assert out == "primary answer"
+    assert len(_RecordingClient.calls) == 1
+    assert ai._last_provider == "primary"
 
