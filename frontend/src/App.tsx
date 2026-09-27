@@ -726,7 +726,7 @@ function Dashboard({
   // up alongside the entry line and read as "SL 12,098 (-2.0%)" / "TP (+4.0%)".
   const chartPriceLines = useMemo(() => {
     const sym = symbol.toUpperCase()
-    const lines: { price: number; color?: string; title?: string; dashed?: boolean; width?: 1 | 2 | 3 | 4 }[] = []
+    const lines: { price: number; color?: string; title?: string; dashed?: boolean; width?: 1 | 2 | 3 | 4; scale?: boolean }[] = []
     for (const a of alerts) {
       if (a.status !== 'armed' || a.symbol.toUpperCase() !== sym) continue
       lines.push({ price: a.price, color: '#f0a020', title: `Alert ${a.condition} ${fmt(a.price)}` })
@@ -741,9 +741,9 @@ function Dashboard({
     for (const t of trades) {
       if (t.status !== 'open' || t.symbol.toUpperCase() !== sym) continue
       const entry = t.entry_price
-      if (entry) lines.push({ price: entry, color: '#3b82f6', title: `Entry ${fmt(entry)}`, dashed: false, width: 2 })
-      if (t.stop_loss) lines.push({ price: t.stop_loss, color: '#ea3943', width: 2, title: `SL ${fmt(t.stop_loss)}${gap(t.stop_loss, entry)}` })
-      if (t.take_profit) lines.push({ price: t.take_profit, color: '#16c784', width: 2, title: `TP ${fmt(t.take_profit)}${gap(t.take_profit, entry)}` })
+      if (entry) lines.push({ price: entry, color: '#3b82f6', title: `Entry ${fmt(entry)}`, dashed: false, width: 2, scale: true })
+      if (t.stop_loss) lines.push({ price: t.stop_loss, color: '#ea3943', width: 2, scale: true, title: `SL ${fmt(t.stop_loss)}${gap(t.stop_loss, entry)}` })
+      if (t.take_profit) lines.push({ price: t.take_profit, color: '#16c784', width: 2, scale: true, title: `TP ${fmt(t.take_profit)}${gap(t.take_profit, entry)}` })
     }
     return lines
   }, [alerts, trades, symbol])

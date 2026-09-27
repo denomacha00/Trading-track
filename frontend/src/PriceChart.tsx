@@ -4,6 +4,7 @@ import {
   ColorType,
   CrosshairMode,
   LineStyle,
+  type AutoscaleInfo,
   type CandlestickData,
   type HistogramData,
   type IChartApi,
@@ -45,6 +46,36 @@ import {
 // latest bar), and a countdown shows the time left on the forming candle — the
 // same read-outs a TradingView chart gives you. Colours come from the active
 // theme's CSS variables so it re-themes with the rest of the app.
+// Widen the price series' auto-scale range so it also brackets `levels` — the
+// open position's entry / stop / target. Without this the vertical axis fits
+// only the visible candles, so on a tight timeframe (e.g. 5m, where price has
+// barely moved) a stop or target sitting a few % away falls OFF the top/bottom
+// of the chart and can't be scrolled to. Including the levels keeps them in
+// view on every timeframe. Style/scale only — it never invents a level; it just
+// stretches the window to whatever real numbers were handed in.
+function extendAutoscale(base: AutoscaleInfo | null, levels: number[]): AutoscaleInfo | null {
+  let lo = Infinity
+  let hi = -Infinity
+  for (const p of levels) {
+    if (Number.isFinite(p) && p > 0) {
+      lo = Math.min(lo, p)
+      hi = Math.max(hi, p)
+    }
+  }
+  if (lo === Infinity) return base // no levels to honour → leave the fit untouched
+  if (base) {
+    return {
+      priceRange: {
+        minValue: Math.min(base.priceRange.minValue, lo),
+        maxValue: Math.max(base.priceRange.maxValue, hi),
+      },
+      margins: base.margins,
+    }
+  }
+  // No candle range yet (data still loading): still bracket the levels alone.
+  return { priceRange: { minValue: lo, maxValue: hi } }
+}
+
 type Palette = {
   bg: string
   text: string
@@ -198,8 +229,10 @@ export function PriceChart({
   // is a genuine number from the user's OWN data — nothing decorative or faked.
   // `dashed` / `width` let a caller make a line stand out (e.g. an open
   // position's entry / stop / target) versus a faint reference (armed alerts).
-  // Both are style only — they never change WHICH real number is drawn.
-  priceLines?: { price: number; color?: string; title?: string; dashed?: boolean; width?: 1 | 2 | 3 | 4 }[]
+  // `scale: true` also pins the level inside the vertical auto-fit so it stays
+  // on-screen on any timeframe. All three are style/scale only — they never
+  // change WHICH real number is drawn.
+  priceLines?: { price: number; color?: string; title?: string; dashed?: boolean; width?: 1 | 2 | 3 | 4; scale?: boolean }[]
   // Which moving-average / band / VWAP overlays to draw, all computed from the
   // real candles above. Undefined = none (unchanged plain chart).
   indicators?: IndicatorPrefs
@@ -231,6 +264,9 @@ export function PriceChart({
   // Horizontal price lines we've drawn (alert / SL / TP / entry markers), kept so
   // we can clear and redraw them when the set changes.
   const priceLineObjsRef = useRef<IPriceLine[]>([])
+  // Levels the vertical auto-scale must keep in view (open position entry/stop/
+  // target). Read live by the series' autoscaleInfoProvider; see extendAutoscale.
+  const scaleLevelsRef = useRef<number[]>([])
   // Indicator overlay line series (EMA/SMA/Bollinger/VWAP), keyed so we can add,
   // update, or remove one without disturbing the candles or the others.
   const overlayRef = useRef<Map<string, ISeriesApi<'Line'>>>(new Map())
@@ -356,6 +392,10 @@ export function PriceChart({
       borderVisible: false,
       wickUpColor: p.up,
       wickDownColor: p.down,
+      // Keep the open position's entry/stop/target inside the vertical fit on
+      // every timeframe (reads scaleLevelsRef live; updated by the effect below).
+      autoscaleInfoProvider: (orig: () => AutoscaleInfo | null) =>
+        extendAutoscale(orig(), scaleLevelsRef.current),
     })
     // Leave room at the bottom for the volume histogram (its own overlay scale).
     series.priceScale().applyOptions({ scaleMargins: { top: 0.08, bottom: 0.26 } })
@@ -814,7 +854,7 @@ export function PriceChart({
   // changes (via a stable key) so live ticks never churn them. Every level is a
   // real number from the user's own data — the chart never invents a line.
   const priceLinesKey = JSON.stringify(
-    (priceLines ?? []).map((l) => [l.price, l.color, l.title, l.dashed, l.width]),
+    (priceLines ?? []).map((l) => [l.price, l.color, l.title, l.dashed, l.width, l.scale]),
   )
   useEffect(() => {
     const series = seriesRef.current
@@ -840,6 +880,17 @@ export function PriceChart({
         }),
       )
     }
+    // Pin the flagged levels (open-position entry/stop/target) into the vertical
+    // auto-fit, then re-apply the provider so the axis rescales immediately —
+    // without this a far-off stop/target on a tight timeframe stays off-screen
+    // until the next candle tick. Style/scale only; no level is invented.
+    scaleLevelsRef.current = (priceLines ?? [])
+      .filter((pl) => pl.scale && Number.isFinite(pl.price) && pl.price > 0)
+      .map((pl) => pl.price)
+    series.applyOptions({
+      autoscaleInfoProvider: (orig: () => AutoscaleInfo | null) =>
+        extendAutoscale(orig(), scaleLevelsRef.current),
+    })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [priceLinesKey])
 
