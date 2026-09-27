@@ -110,6 +110,23 @@ from app.logging_config import configure_logging
 configure_logging(get_settings().log_format, get_settings().log_level)
 logger = logging.getLogger("tranding_track")
 
+
+def _upstream_error(
+    message: str, exc: Exception, *, status_code: int = 502
+) -> HTTPException:
+    """Log a full upstream (exchange/ccxt) exception server-side, return a clean
+    HTTPException for the client.
+
+    Raw exchange/ccxt error text can leak internals to the caller — request URLs,
+    ccxt/exchange class names, account-permission hints, occasionally fragments of
+    the outgoing request. The operator still needs the real cause, so the full
+    exception (with its type) goes to the server log; the client only ever sees
+    the stable, generic ``message``. Never embeds the raw ``exc`` in the response.
+    """
+    logger.warning("%s: %s: %s", message, type(exc).__name__, exc)
+    return HTTPException(status_code=status_code, detail=message)
+
+
 # Per-user webhook path template. The unguessable token in the URL is what
 # authenticates the alert to a specific user's account.
 WEBHOOK_PATH_TEMPLATE = "/api/webhook/tradingview/{token}"
@@ -136,7 +153,7 @@ def _analysis_for(engine, symbol: str, timeframe: str = "1h", limit: int = 200):
     try:
         raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, max(1, min(limit, 1000)))
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"OHLCV unavailable: {exc}")
+        raise _upstream_error("OHLCV unavailable", exc)
     if not raw:
         raise HTTPException(status_code=502, detail="No candle data returned")
     df = pd.DataFrame(
@@ -1090,7 +1107,7 @@ def list_symbols(
     try:
         symbols = engine.connector.list_symbols(quote=quote)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Could not list symbols: {exc}")
+        raise _upstream_error("Could not list symbols", exc)
     return {"symbols": symbols, "quote": (quote or "USDT").upper()}
 
 
@@ -1215,9 +1232,8 @@ def update_settings(
         try:
             access = engine.connector.check_trading_access()
         except Exception as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Can't verify live account access right now: {exc}",
+            raise _upstream_error(
+                "Can't verify live account access right now", exc
             )
         if not access.get("can_read_account"):
             raise HTTPException(
@@ -1311,7 +1327,7 @@ def ticker(
     try:
         t = engine.connector.fetch_ticker(symbol.upper())
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Ticker unavailable: {exc}")
+        raise _upstream_error("Ticker unavailable", exc)
     # Never fabricate a price: if the exchange gives us no last/close, report the
     # ticker as unavailable (502) so the UI shows its stale/offline state rather
     # than a fake $0.00. A money task must not show a figure that isn't real.
@@ -1342,7 +1358,7 @@ def ohlcv(
     try:
         raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, max(1, min(limit, 1000)))
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"OHLCV unavailable: {exc}")
+        raise _upstream_error("OHLCV unavailable", exc)
     return [
         {"time": int(c[0] / 1000), "open": c[1], "high": c[2],
          "low": c[3], "close": c[4], "volume": c[5]}
@@ -1370,7 +1386,7 @@ def orderbook(
     try:
         ob = engine.connector.fetch_order_book(symbol.upper(), min(max(limit, 1), 100))
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Order book unavailable: {exc}")
+        raise _upstream_error("Order book unavailable", exc)
 
     def _levels(rows: object) -> list[dict[str, float]]:
         out: list[dict[str, float]] = []
@@ -1430,7 +1446,7 @@ def backtest(
     try:
         raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, max(1, min(limit, 1000)))
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"OHLCV unavailable: {exc}")
+        raise _upstream_error("OHLCV unavailable", exc)
     if not raw:
         raise HTTPException(status_code=502, detail="No candle data returned")
     df = pd.DataFrame(
@@ -2368,7 +2384,7 @@ def train_strategy(
     try:
         raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, max(1, min(limit, 1000)))
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"OHLCV unavailable: {exc}")
+        raise _upstream_error("OHLCV unavailable", exc)
     if not raw:
         raise HTTPException(status_code=502, detail="No candle data returned")
     df = pd.DataFrame(

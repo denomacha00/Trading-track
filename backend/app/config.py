@@ -42,8 +42,10 @@ class Settings(BaseSettings):
     # so a healthy Binance deployment is completely unaffected.
     market_data_fallback_id: str = Field(default="kucoin")
 
-    # TradingView webhook
-    tradingview_webhook_secret: str = Field(default="change-me")
+    # TradingView webhook. NOTE: a webhook alert authenticates by the unguessable
+    # per-user token embedded in its URL (User.webhook_token) — that token IS the
+    # shared secret, rotatable via POST /api/webhook/rotate. There is deliberately
+    # no global signing secret (TradingView can't HMAC-sign its payloads anyway).
     # Webhook REPLAY protection (opt-in). When > 0, an inbound alert whose payload
     # carries a send-time (TradingView's {{timenow}} placeholder, mapped to a
     # "timenow"/"timestamp" field) is REJECTED if that time is more than this many
@@ -322,10 +324,12 @@ class Settings(BaseSettings):
     log_format: str = Field(default="text")
     log_level: str = Field(default="INFO")
 
-    # API auth: if set, all mutating/control endpoints require this key via the
-    # `X-API-Key` header. Empty = open (fine for localhost-only dev). Set this
-    # before exposing the API on any network.
-    api_key: str = Field(default="")
+    # API auth is per-user and JWT-based: every mutating/control endpoint depends
+    # on get_current_user / require_licensed_user / require_admin (a signed HS256
+    # access token), and each webhook authenticates by its per-user URL token.
+    # There is deliberately no global X-API-Key knob — a single shared key would
+    # add nothing over the per-user tokens and, left as a dead default, would
+    # falsely imply the API is locked down when it is the JWT layer doing that.
 
     # ---- Multi-user auth & licensing --------------------------------
     # Master secret used to (a) sign JWT access tokens and (b) derive the

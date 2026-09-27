@@ -108,6 +108,26 @@ def test_exchange_access_shape(client):
     assert isinstance(body["detail"], str) and body["detail"]
 
 
+def test_upstream_exchange_error_is_sanitized(client, monkeypatch):
+    # A raw ccxt/exchange exception must NOT leak to the client (it can carry
+    # request URLs, exchange class names, account/permission hints). The client
+    # gets a stable generic message; the real cause only goes to the server log.
+    from app.exchange import BinanceConnector
+
+    sentinel = "https://internal.exchange/api?apiKey=LEAKED-SECRET-TOKEN"
+
+    def _boom(self, *a, **k):
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr(BinanceConnector, "fetch_ohlcv", _boom, raising=True)
+    r = client.get("/api/ohlcv/BTC/USDT?timeframe=1h&limit=50")
+    assert r.status_code == 502
+    assert r.json()["detail"] == "OHLCV unavailable"
+    # The raw exception text (and its secret) must be absent from the response.
+    assert "LEAKED-SECRET-TOKEN" not in r.text
+    assert sentinel not in r.text
+
+
 def test_webhook_unknown_token(client):
     r = client.post(
         "/api/webhook/tradingview/nope-not-a-real-token",
