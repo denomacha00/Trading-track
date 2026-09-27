@@ -12,7 +12,17 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from app.ai import AICommentator, _extract_anthropic_text, _extract_openai_text, _looks_anthropic, _sanitize_history, _strip_reasoning
+from app.ai import (
+    AICommentator,
+    _IDENTITY,
+    _SYSTEM_ANALYST,
+    _SYSTEM_ASSISTANT,
+    _extract_anthropic_text,
+    _extract_openai_text,
+    _looks_anthropic,
+    _sanitize_history,
+    _strip_reasoning,
+)
 from app.analysis import Factor, MarketAnalysis
 
 
@@ -237,6 +247,45 @@ def test_strip_reasoning_conservative_without_final_marker():
 
 def test_strip_reasoning_empty_and_none():
     assert _strip_reasoning("") is None
+
+
+# ---- identity / white-label (owner = Denis Macharia, never the AI provider) ---
+# The deployed bot presents as built/owned by Denis Macharia. The assistant may
+# admit it's an AI but must never name the underlying model/vendor, and shares
+# the owner's contact only when asked. These lock the _IDENTITY clause into both
+# system prompts AND verify it is actually sent on the wire.
+
+
+def test_identity_clause_is_in_both_system_prompts():
+    for prompt in (_SYSTEM_ANALYST, _SYSTEM_ASSISTANT):
+        assert _IDENTITY in prompt
+        assert "Denis Macharia" in prompt
+        assert "+254703285246" in prompt
+    # The rule that powers the white-label: never name the model/provider.
+    low = _IDENTITY.lower()
+    assert "never" in low and "provider" in low
+
+
+def test_identity_sent_on_wire_via_ask(monkeypatch):
+    # ask() uses the ANALYST system prompt; the identity clause must reach the
+    # provider so "who built you?" can be answered as Denis Macharia.
+    _patch_httpx(monkeypatch, {"choices": [{"message": {"content": "ok"}}]})
+    ai = AICommentator(_settings(ai_model="gpt-4o-mini"))
+    ai.ask("who built you?")
+    system_msg = _FakeClient.captured["body"]["messages"][0]
+    assert system_msg["role"] == "system"
+    assert "Denis Macharia" in system_msg["content"]
+    assert "+254703285246" in system_msg["content"]
+
+
+def test_identity_sent_on_wire_via_chat(monkeypatch):
+    # chat() uses the ASSISTANT system prompt; same guarantee on the chat path.
+    _patch_httpx(monkeypatch, {"choices": [{"message": {"content": "ok"}}]})
+    ai = AICommentator(_settings(ai_model="gpt-4o-mini"))
+    ai.chat("who owns this app?")
+    system_msg = _FakeClient.captured["body"]["messages"][0]
+    assert system_msg["role"] == "system"
+    assert "Denis Macharia" in system_msg["content"]
     assert _strip_reasoning(None) is None
     assert _strip_reasoning("<think>only scratchpad, no answer</think>") is None
 
