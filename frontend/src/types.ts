@@ -430,6 +430,13 @@ export type WsMessage =
         accepted: boolean
         message: string
         confidence?: number
+        // Present on autonomous analyzer verdicts: the timeframe the decision was
+        // made on, and the REAL factors that drove it (name, direction, weight) —
+        // sent verbatim from the analyzer so the UI can show WHY it decided and
+        // light up the matching chart indicators. Never fabricated; absent on raw
+        // external (e.g. TradingView) alerts.
+        timeframe?: string
+        factors?: { name: string; signal: 'buy' | 'sell' | 'hold'; weight: number }[]
       }
     }
   // A proactive assistant call-out pushed from the server: a fired price alert

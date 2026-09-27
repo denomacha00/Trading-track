@@ -1518,7 +1518,7 @@ class TradingEngine:
         # shows an honest timeline of autonomous decisions, not just TradingView
         # alerts. Logging must never break the trading loop.
         try:
-            self._log_auto_verdict(db, symbol.upper(), analysis, ok, msg)
+            self._log_auto_verdict(db, symbol.upper(), analysis, ok, msg, timeframe)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("verdict logging failed for %s: %s", symbol, exc)
         return ok, msg
@@ -1595,7 +1595,8 @@ class TradingEngine:
         return False, f"{symbol}: sell signal, no long to close"
 
     def _log_auto_verdict(
-        self, db: Session, symbol: str, analysis, acted: bool, message: str
+        self, db: Session, symbol: str, analysis, acted: bool, message: str,
+        timeframe: str = "1h",
     ) -> None:
         """Record an autonomous verdict — but only when it CHANGES for a symbol.
 
@@ -1623,6 +1624,15 @@ class TradingEngine:
         db.add(log)
         db.commit()
         db.refresh(log)
+        # The real factors that drove THIS decision (name, direction, weight).
+        # Sent verbatim from the analyzer so the UI can show the operator WHY the
+        # brain decided — and map factors to the matching chart indicators —
+        # without re-fetching. Nothing here is fabricated: it is the analysis
+        # that was just made. Kept compact (no free-text detail) for the wire.
+        factors = [
+            {"name": f.name, "signal": f.signal, "weight": round(f.weight, 3)}
+            for f in getattr(analysis, "factors", [])
+        ]
         self._emit(
             "signal",
             {
@@ -1633,6 +1643,8 @@ class TradingEngine:
                 "accepted": bool(acted),
                 "confidence": round(analysis.confidence, 3),
                 "message": detail,
+                "timeframe": timeframe,
+                "factors": factors,
             },
         )
 
@@ -1652,7 +1664,7 @@ class TradingEngine:
         try:
             self._log_auto_verdict(
                 db, symbol.upper(), analysis, False,
-                "monitoring — autonomous execution off",
+                "monitoring — autonomous execution off", timeframe,
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("verdict logging failed for %s: %s", symbol, exc)

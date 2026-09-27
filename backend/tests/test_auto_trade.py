@@ -201,3 +201,56 @@ def test_ai_approve_allows_autonomous_buy(db):
     ).all()
     assert len(open_trades) == 1
     assert open_trades[0].side == "buy"
+
+
+# Every analyzer factor name the engine can emit. The live 'signal' event must
+# only ever carry names from THIS set — proof the "watch the bot think" chart is
+# fed the analyzer's real reasoning, never an invented factor.
+_KNOWN_FACTORS = {
+    "regime", "trend", "rsi", "macd", "momentum", "volatility", "shock", "volume",
+}
+
+
+def test_autonomous_signal_emit_carries_timeframe_and_real_factors(db):
+    # The live 'signal' event that drives the "watch the bot think" chart must
+    # carry the decision's real timeframe and its REAL analyzer factors (each with
+    # name/signal/weight) — sent verbatim so the UI can show the true "why" and
+    # light up the matching indicators. Nothing here is fabricated.
+    conn = FakeConnector({"1h": _uptrend(), "15m": _uptrend()})
+    eng = _engine(conn, auto_confirm_timeframe="")
+    captured: list[tuple[str, dict]] = []
+    # Capture what the engine would broadcast (no real socket/loop in tests).
+    eng._emit = lambda event, payload: captured.append((event, payload))  # type: ignore[method-assign]
+    # Use 15m (not the "1h" default) so a correct timeframe can only come from the
+    # argument being threaded through, never a hardcoded fallback.
+    ok, msg = eng.auto_trade_symbol(db, "BTC/USDT", "15m")
+    assert ok is True, msg
+    signal_emits = [p for (e, p) in captured if e == "signal"]
+    assert len(signal_emits) == 1
+    payload = signal_emits[0]
+    assert payload["symbol"] == "BTC/USDT"
+    assert payload["action"] == "buy"
+    assert payload["timeframe"] == "15m"
+    factors = payload["factors"]
+    assert isinstance(factors, list) and factors  # real reasoning, not empty
+    names = {f["name"] for f in factors}
+    assert names and names.issubset(_KNOWN_FACTORS)  # only real analyzer factors
+    for f in factors:
+        assert set(f) == {"name", "signal", "weight"}
+        assert f["signal"] in ("buy", "sell", "hold")
+        assert isinstance(f["weight"], (int, float))
+
+
+def test_observe_emit_carries_factors_without_acting(db):
+    # Observe mode (autonomous execution off) still emits the enriched signal so
+    # the chart can visualise the brain's read — but accepted is False (no trade).
+    conn = FakeConnector({"1h": _uptrend()})
+    eng = _engine(conn, auto_confirm_timeframe="")
+    captured: list[tuple[str, dict]] = []
+    eng._emit = lambda event, payload: captured.append((event, payload))  # type: ignore[method-assign]
+    ok, _ = eng.observe_symbol(db, "BTC/USDT", "1h")
+    assert ok is True
+    payload = next(p for (e, p) in captured if e == "signal")
+    assert payload["accepted"] is False
+    assert payload["timeframe"] == "1h"
+    assert {f["name"] for f in payload["factors"]}.issubset(_KNOWN_FACTORS)

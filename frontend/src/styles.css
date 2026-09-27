@@ -791,6 +791,76 @@ th.mono {
   color: #fff;
 }
 
+/* "Watch the bot think" banner: a transient, VIEW-ONLY overlay shown while the
+   chart is briefly driven to match a real autonomous decision (its symbol, the
+   verdict, and the factors behind it), then auto-reverts. Every value in it is
+   the analyzer's real output — nothing here is fabricated. */
+.think-banner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-bottom: 10px;
+  padding: 7px 11px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel-2));
+  font-size: 12.5px;
+  color: var(--text);
+  animation: think-pop 0.18s ease-out;
+}
+.think-banner .tb-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--accent);
+  font-weight: 600;
+}
+.think-banner .tb-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: think-pulse 1.1s ease-in-out infinite;
+}
+.think-banner .tb-verdict.buy { color: var(--green); }
+.think-banner .tb-verdict.sell { color: var(--red); }
+.think-banner .tb-verdict.hold { color: var(--muted); }
+.think-factors {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.think-chip {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  white-space: nowrap;
+}
+.think-chip.buy {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 45%, var(--border));
+}
+.think-chip.sell {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 45%, var(--border));
+}
+.think-note {
+  color: var(--muted);
+  margin-left: auto;
+}
+@keyframes think-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+@keyframes think-pop {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: none; }
+}
+
 /* "Indicators" dropdown (bot chart). */
 .ind-menu {
   position: relative;

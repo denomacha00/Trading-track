@@ -31,6 +31,24 @@ const TRADE_EVENTS: ReadonlySet<string> = new Set([
   'stop_trailed',
 ])
 
+// Which chart overlays correspond to each REAL analyzer factor, for the
+// "watch the bot think" view. When a factor drove a decision we light up exactly
+// the indicators that show it — trend → the moving averages, regime → the
+// 200 SMA, rsi/macd → their oscillators, volatility → Bollinger Bands, volume →
+// the volume panel. `momentum` and `shock` have no dedicated overlay (they're
+// read from price/volatility that other rows already draw), so they map to
+// nothing rather than lighting up something misleading. Honest by construction:
+// we never show an indicator for a factor the analyzer didn't actually report.
+const FACTOR_INDICATORS: Record<string, (keyof IndicatorPrefs)[]> = {
+  trend: ['ema9', 'ema21', 'sma50'],
+  regime: ['sma200'],
+  rsi: ['rsi'],
+  macd: ['macd'],
+  volatility: ['bb'],
+  volume: ['volume'],
+}
+
+
 function fmt(n: number | null | undefined, dp = 2): string {
   if (n === null || n === undefined || Number.isNaN(n)) return '-'
   return n.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp })
@@ -247,6 +265,33 @@ function Dashboard({
   // View-history for the assistant's chart commands, so "undo" steps the chart
   // back one change. Each entry is the view as it was BEFORE a change we applied.
   const chartUndoRef = useRef<{ symbol: string; timeframe: string; indicators: IndicatorPrefs }[]>([])
+  // "Watch the bot think": when ON, each autonomous verdict briefly drives the
+  // chart to the symbol it just decided on and lights up the indicators for the
+  // REAL factors behind that call — so you can SEE why it acted — then it
+  // auto-reverts to your own view a few seconds later. Opt-in and OFF by default
+  // (it temporarily moves your chart), and it only ever changes what you're
+  // LOOKING AT — it places no orders and changes no settings.
+  const [watchThinking, setWatchThinking] = useState<boolean>(
+    () => localStorage.getItem('tt.watchThinking') === '1',
+  )
+  // The decision currently on screen (for the "thinking" banner), or null when the
+  // overlay is idle. Every figure here is the analyzer's real output, not invented.
+  const [thinkingInfo, setThinkingInfo] = useState<{
+    symbol: string
+    timeframe: string
+    verdict: string
+    confidence: number | null
+    acted: boolean
+    factors: { name: string; signal: 'buy' | 'sell' | 'hold'; weight: number }[]
+  } | null>(null)
+  // The operator's OWN view, snapshotted when a thinking overlay first takes over,
+  // so it can be restored exactly when the overlay ends. Kept separate from the
+  // assistant's undo stack — this is transient and never surfaced as "undo".
+  const thinkingSnapRef = useRef<{ symbol: string; timeframe: string; indicators: IndicatorPrefs } | null>(null)
+  const thinkingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    localStorage.setItem('tt.watchThinking', watchThinking ? '1' : '0')
+  }, [watchThinking])
   useEffect(() => {
     localStorage.setItem('tt.chartView', chartView)
   }, [chartView])
@@ -318,6 +363,75 @@ function Dashboard({
     if (chartView !== 'bot') setChartView('bot')
     return `Chart updated: ${parts.join(' · ')}.`
   }
+  // Restore the operator's own view after a "thinking" overlay, and clear the
+  // banner + timer. Safe to call when nothing is active (no-op).
+  const revertThinking = () => {
+    if (thinkingTimerRef.current) {
+      clearTimeout(thinkingTimerRef.current)
+      thinkingTimerRef.current = null
+    }
+    const snap = thinkingSnapRef.current
+    thinkingSnapRef.current = null
+    setThinkingInfo(null)
+    if (snap) {
+      setSymbol(snap.symbol)
+      setTimeframe(snap.timeframe)
+      setIndicators(snap.indicators)
+    }
+  }
+  // Briefly visualise ONE real autonomous decision on the chart: switch to the
+  // symbol/timeframe it was made on and turn on the indicators for the factors
+  // that actually drove it, so the operator can see WHY. The very first decision
+  // in a burst snapshots the operator's own view; each new decision re-arms a
+  // timer that reverts to that snapshot once the bot goes quiet. Only what the
+  // operator LOOKS AT changes — no order, no setting. Nothing shown is invented:
+  // the symbol, timeframe and factors are exactly what the analyzer emitted.
+  const visualizeDecision = (d: {
+    symbol: string
+    timeframe?: string
+    confidence?: number
+    accepted: boolean
+    action: string
+    factors?: { name: string; signal: 'buy' | 'sell' | 'hold'; weight: number }[]
+  }) => {
+    const factors = d.factors ?? []
+    // Map the real factors to their chart indicators (deduped). Factors with no
+    // dedicated overlay (momentum/shock) simply contribute nothing.
+    const wanted: Partial<IndicatorPrefs> = {}
+    for (const f of factors) {
+      for (const key of FACTOR_INDICATORS[f.name] ?? []) wanted[key] = true
+    }
+    // Snapshot the operator's own view ONCE, before the first override of a burst.
+    if (!thinkingSnapRef.current) {
+      thinkingSnapRef.current = { symbol, timeframe, indicators }
+    }
+    if (d.symbol && d.symbol !== symbol) setSymbol(d.symbol)
+    if (d.timeframe && d.timeframe !== timeframe) setTimeframe(d.timeframe)
+    if (Object.keys(wanted).length) setIndicators((cur) => ({ ...cur, ...wanted }))
+    if (chartView !== 'bot') setChartView('bot')
+    setThinkingInfo({
+      symbol: d.symbol,
+      timeframe: d.timeframe ?? timeframe,
+      verdict: d.action,
+      confidence: typeof d.confidence === 'number' ? d.confidence : null,
+      acted: d.accepted,
+      factors,
+    })
+    // Re-arm the auto-revert: the overlay clears a few seconds after the LAST
+    // decision, so a run of quick verdicts stays up, then tidies itself away.
+    if (thinkingTimerRef.current) clearTimeout(thinkingTimerRef.current)
+    thinkingTimerRef.current = setTimeout(revertThinking, 7000)
+  }
+  // If "watch the bot think" is switched off — or the component unmounts — while
+  // an overlay is showing, put the operator's own view back at once instead of
+  // leaving the chart on the bot's last pick (the pending timer is cleared too).
+  useEffect(() => {
+    if (!watchThinking) revertThinking()
+    return () => {
+      if (thinkingTimerRef.current) clearTimeout(thinkingTimerRef.current)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [watchThinking])
   // Wall-clock of the last status we received (WS push or poll), so the bot
   // activity strip can show an honest "updated Ns ago" heartbeat.
   const [statusTs, setStatusTs] = useState(0)
@@ -472,6 +586,10 @@ function Dashboard({
         // rejected alert is still visible.
         if (m.data.source === 'analyzer') {
           if (m.data.accepted) showToast('ok', m.data.message)
+          // When "watch the bot think" is on, briefly paint this real decision on
+          // the chart (its symbol + the indicators for the factors that drove it),
+          // then auto-revert. Only ever changes the view — never money or settings.
+          if (watchThinking) visualizeDecision(m.data)
         } else {
           showToast(m.data.accepted ? 'ok' : 'error', m.data.message)
         }
@@ -1077,6 +1195,23 @@ function Dashboard({
                     </button>
                   </div>
                 )}
+                {chartView === 'bot' && (
+                  <div className="chart-view-toggle" role="group" aria-label="Watch the bot think">
+                    <button
+                      type="button"
+                      className={`cvt-btn${watchThinking ? ' active' : ''}`}
+                      aria-pressed={watchThinking}
+                      onClick={() => setWatchThinking((v) => !v)}
+                      title={
+                        watchThinking
+                          ? 'Stop auto-showing the bot’s live decisions on the chart'
+                          : 'When the bot makes an autonomous call, briefly jump the chart to that symbol and light up the indicators behind it, then revert. View only — moves no money.'
+                      }
+                    >
+                      🧠 Watch
+                    </button>
+                  </div>
+                )}
                 <div className="chart-view-toggle" role="tablist" aria-label="Chart view">
                   <button
                     type="button"
@@ -1104,6 +1239,38 @@ function Dashboard({
                 stale={tickerStale && !streamingLive}
                 live={streamingLive}
               />
+              {chartView === 'bot' && thinkingInfo && (
+                <div className="think-banner" role="status" aria-live="polite">
+                  <span className="tb-live">
+                    <span className="tb-dot" aria-hidden="true" />
+                    Bot decided
+                  </span>
+                  <span>
+                    <b>{thinkingInfo.symbol}</b> · {thinkingInfo.timeframe} →{' '}
+                    <b className={`tb-verdict ${thinkingInfo.verdict}`}>
+                      {thinkingInfo.verdict.toUpperCase()}
+                    </b>
+                    {thinkingInfo.confidence !== null &&
+                      ` · ${Math.round(thinkingInfo.confidence * 100)}% confident`}
+                  </span>
+                  {thinkingInfo.factors.length > 0 && (
+                    <span className="think-factors">
+                      {thinkingInfo.factors
+                        .filter((f) => f.signal !== 'hold' || f.weight !== 0)
+                        .slice(0, 7)
+                        .map((f) => (
+                          <span key={f.name} className={`think-chip ${f.signal}`}>
+                            {f.name}
+                            {f.signal === 'buy' ? ' ▲' : f.signal === 'sell' ? ' ▼' : ''}
+                          </span>
+                        ))}
+                    </span>
+                  )}
+                  <span className="think-note">
+                    {thinkingInfo.acted ? 'acted' : 'no trade'} · view only, auto-reverts
+                  </span>
+                </div>
+              )}
               {chartView === 'tv' ? (
                 <TradingViewChart symbol={symbol} timeframe={timeframe} theme={theme} />
               ) : candles.length ? (
