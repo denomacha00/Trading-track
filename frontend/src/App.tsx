@@ -3737,6 +3737,37 @@ function getSpeechRecognition(): (new () => SpeechRec) | null {
   return w.SpeechRecognition || w.webkitSpeechRecognition || null
 }
 
+// Copy text to the clipboard with a legacy fallback. Returns whether it landed.
+// The async Clipboard API is preferred, but it rejects (not merely "is absent")
+// without transient user activation in some in-app webviews and on insecure
+// origins — so a rejection falls through to a hidden-textarea execCommand copy.
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // fall through to the legacy path
+  }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.top = '0'
+    ta.style.left = '0'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.focus()
+    ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok
+  } catch {
+    return false
+  }
+}
+
 function AssistantPanel({
   symbol,
   timeframe,
@@ -3782,6 +3813,10 @@ function AssistantPanel({
   const [useSymbol, setUseSymbol] = useState(true)
   const [useNews, setUseNews] = useState(false)
   const [listening, setListening] = useState(false)
+  // Which message currently shows a "Copied ✓" tick. Held by object REFERENCE (not
+  // index) so a live-monitor push that reindexes the transcript can't move the tick
+  // onto the wrong bubble.
+  const [copied, setCopied] = useState<ChatMsg | null>(null)
   const recRef = useRef<SpeechRec | null>(null)
   const listRef = useRef<HTMLDivElement | null>(null)
   // Ids of auto (autopilot) actions we've already kicked off, so the effect that
@@ -3862,6 +3897,30 @@ function AssistantPanel({
     } finally {
       setBusy(false)
     }
+  }
+
+  // Copy a message's text to the clipboard. Tries the async Clipboard API first,
+  // then falls back to a hidden-textarea execCommand copy — because writeText
+  // REJECTS (not just "is absent") without transient activation in some mobile
+  // webviews and on insecure origins. Shows a brief tick on success; a genuine
+  // double-failure surfaces as a toast, never a thrown error.
+  const copyMsg = async (m: ChatMsg) => {
+    const text = m.text || ''
+    if (!text) return
+    if (await copyToClipboard(text)) {
+      setCopied(m)
+      window.setTimeout(() => setCopied((c) => (c === m ? null : c)), 1200)
+    } else {
+      onError('Could not copy that message to the clipboard.')
+    }
+  }
+
+  // Remove one message from the transcript. Filters by object IDENTITY (not index)
+  // so a concurrent live-monitor push that slices/reindexes `turns` can't delete the
+  // wrong bubble. Persists through the shared setTurns (24h browser-local store).
+  const deleteMsg = (m: ChatMsg) => {
+    setCopied((c) => (c === m ? null : c))
+    setTurns((arr) => arr.filter((x) => x !== m))
   }
 
   // Mark a turn's action with a new lifecycle state (so its card can't be re-run
@@ -4145,6 +4204,26 @@ function AssistantPanel({
                   })()}
                   {t.usedNews && <div className="bubble-note">grounded in live news</div>}
                   {t.live && <div className="bubble-note">🔔 live monitor</div>}
+                  <div className="bubble-actions">
+                    <button
+                      type="button"
+                      className="bubble-act"
+                      title="Copy this message"
+                      aria-label="Copy this message"
+                      onClick={() => copyMsg(t)}
+                    >
+                      {copied === t ? '✓ Copied' : 'Copy'}
+                    </button>
+                    <button
+                      type="button"
+                      className="bubble-act danger"
+                      title="Delete this message"
+                      aria-label="Delete this message"
+                      onClick={() => deleteMsg(t)}
+                    >
+                      Delete
+                    </button>
+                  </div>
                 </div>
               ))
             )}
