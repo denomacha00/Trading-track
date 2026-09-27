@@ -367,6 +367,38 @@ def test_chat_no_history_is_single_user_turn(monkeypatch):
     assert roles == ["system", "user"]
 
 
+def test_chat_attaches_image_openai_style(monkeypatch):
+    # Vision on the OpenAI path: the live user turn becomes multimodal content with
+    # an image_url data-URL; earlier turns and the system prompt are untouched.
+    _patch_httpx(monkeypatch, {"choices": [{"message": {"content": "a green candle"}}]})
+    ai = AICommentator(_settings(ai_model="gpt-4o-mini"))
+    ai.chat("what do you see?", image={"data": "aGVsbG8=", "media_type": "image/png"})
+    last = _FakeClient.captured["body"]["messages"][-1]
+    assert last["role"] == "user"
+    assert isinstance(last["content"], list)
+    text_block, img_block = last["content"]
+    assert text_block["type"] == "text" and "what do you see?" in text_block["text"]
+    assert img_block == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,aGVsbG8="},
+    }
+
+
+def test_chat_attaches_image_anthropic_style(monkeypatch):
+    # Same attach on the Anthropic path uses the native image/source-base64 block.
+    _patch_httpx(monkeypatch, {"content": [{"type": "text", "text": "ok"}]})
+    ai = AICommentator(_settings(ai_model="claude-opus-4-8"))
+    ai.chat("read this", image={"data": "aGVsbG8=", "media_type": "image/jpeg"})
+    last = _FakeClient.captured["body"]["messages"][-1]
+    assert last["role"] == "user"
+    text_block, img_block = last["content"]
+    assert text_block["type"] == "text" and "read this" in text_block["text"]
+    assert img_block == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/jpeg", "data": "aGVsbG8="},
+    }
+
+
 # ---- action tag parsing (the assistant's "hands") --------------------------
 # The assistant proposes an action by emitting a hidden [[action:{json}]] tag;
 # strip_action_tag pulls it out. It must be defensive: a garbled tag must never

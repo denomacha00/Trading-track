@@ -244,6 +244,10 @@ export const api = {
     timeframe?: string
     include_news?: boolean
     history?: { role: 'user' | 'assistant'; content: string }[]
+    // An optional attached image the AI reads (vision). `data` is raw base64 (no
+    // data: prefix); `media_type` is the real MIME (always image/jpeg here — the
+    // client re-encodes on attach). The backend validates + size-caps it.
+    image?: { data: string; media_type: string }
   }) =>
     req<{
       reply: string

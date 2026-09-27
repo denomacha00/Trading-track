@@ -78,6 +78,20 @@ describe('chatHistory persistence', () => {
     expect((back[0] as any).actionState).toBeUndefined()
   })
 
+  it('strips an attached image on save (keeps text, drops the base64)', () => {
+    saveTurns(U, [
+      turn({
+        role: 'you',
+        text: 'what do you see in this chart?',
+        image: { data: 'AAAABBBBCCCC', mediaType: 'image/jpeg' },
+      } as StoredTurn),
+    ])
+    const back = loadTurns(U)
+    expect(back).toHaveLength(1)
+    expect(back[0].text).toBe('what do you see in this chart?')
+    expect((back[0] as any).image).toBeUndefined()
+  })
+
   it('keeps only the most recent 300 turns', () => {
     const many = Array.from({ length: 350 }, (_, i) => turn({ text: `m${i}` }))
     saveTurns(U, many)

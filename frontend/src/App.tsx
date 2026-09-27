@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type Dispatch, type KeyboardEvent as ReactKeyboardEvent, type SetStateAction } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type Dispatch, type KeyboardEvent as ReactKeyboardEvent, type SetStateAction } from 'react'
 import { api, setToken, getToken, setAuthFailureHandler } from './api'
 import { PriceChart, TF_SECONDS } from './PriceChart'
 import { TradingViewChart } from './TradingViewChart'
@@ -208,6 +208,11 @@ type ChatMsg = ChatTurn & {
   action?: ProposedAction
   actionState?: 'pending' | 'running' | 'done' | 'dismissed'
   live?: boolean
+  // A user-attached image (chart/screenshot) the AI read. `data` is raw base64,
+  // `mediaType` its MIME. Shown as a thumbnail in the bubble; NOT persisted (see
+  // chatHistory) — the base64 would blow the localStorage quota, so it's a
+  // this-session convenience only.
+  image?: { data: string; mediaType: string }
   // When this turn was created (unix ms). Used to age the persisted transcript
   // out after 24h (see chatHistory). Stamped at creation; absent on old data.
   ts?: number
@@ -601,6 +606,15 @@ function Dashboard({
     setNotifUnread((u) => Math.min(u + 1, 999))
     setTimeout(() => setToast(null), 4000)
   }, [])
+
+  // A STABLE error handler for the read-only data panels (Performance, History,
+  // News). Passing this instead of an inline `(m) => showToast('error', m)` keeps
+  // the panels' props referentially equal across renders, so — combined with
+  // React.memo on those panels — the dashboard's frequent live polls (ticker
+  // every 3s, candles, socket pushes) no longer force those panels to re-render.
+  // That's the "Performance reacting to the whole dashboard" jank, fixed at the
+  // source: the panel now only re-renders on its OWN data, never on price ticks.
+  const showPanelError = useCallback((m: string) => showToast('error', m), [showToast])
 
   // Read a line aloud via the browser's Web Speech API — ONLY when the user has
   // turned voice on (OFF by default) and the browser supports it. Shared by the
@@ -1708,13 +1722,13 @@ function Dashboard({
               )}
               {tab === 'signals' && <SignalsTable signals={signals} />}
               {tab === 'performance' && (
-                <PerformancePanel onError={(m) => showToast('error', m)} />
+                <PerformancePanel onError={showPanelError} />
               )}
               {tab === 'history' && (
                 <HistoryPanel
                   trades={trades}
                   signals={signals}
-                  onError={(m) => showToast('error', m)}
+                  onError={showPanelError}
                 />
               )}
               {tab === 'assistant' && (
@@ -1733,7 +1747,7 @@ function Dashboard({
                   onError={(m) => showToast('error', m)}
                 />
               )}
-              {tab === 'news' && <NewsPanel onError={(m) => showToast('error', m)} />}
+              {tab === 'news' && <NewsPanel onError={showPanelError} />}
               {tab === 'analyze' && (
                 <AnalyzePanel
                   symbol={symbol}
@@ -3148,7 +3162,12 @@ function fmtHold(seconds: number | null): string {
 // backend from CLOSED trades only. Read-only: this panel never places or
 // changes an order. Paper and live are shown separately so simulated gains are
 // never mistaken for real money, and undefined metrics stay "—" (never faked).
-function PerformancePanel({ onError }: { onError: (msg: string) => void }) {
+// Memoized so the dashboard's live polls (ticker every 3s, candles, socket
+// pushes) never re-render this panel: with a stable `onError` prop it re-renders
+// only when its OWN data loads. Fixes the "Performance reacts to the whole
+// dashboard" flicker.
+const PerformancePanel = memo(PerformancePanelImpl)
+function PerformancePanelImpl({ onError }: { onError: (msg: string) => void }) {
   const [perf, setPerf] = useState<Performance | null>(null)
   const [loading, setLoading] = useState(true)
   const [failed, setFailed] = useState(false)
@@ -3387,7 +3406,10 @@ type HistEvent =
   | { kind: 'signal'; ts: number; t: string; symbol: string | null; action: string | null; source: string; accepted: number; confidence: number | null }
   | { kind: 'alert'; ts: number; t: string; symbol: string; condition: string; price: number; hit: number | null }
 
-function HistoryPanel({
+// Memoized (see PerformancePanel): with stable `onError` it re-renders only when
+// its trades/signals props actually change, not on every dashboard price tick.
+const HistoryPanel = memo(HistoryPanelImpl)
+function HistoryPanelImpl({
   trades,
   signals,
   onError,
@@ -3768,6 +3790,45 @@ async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
+// Read an attached image, downscale it to at most `maxDim` px on its longest side
+// and re-encode as JPEG, returning raw base64 (no data: prefix) + its media type.
+// Downscaling keeps the upload small (charts compress well) and re-encoding strips
+// EXIF/orientation metadata so nothing personal rides along. Throws a plain-English
+// Error the caller surfaces as a toast; never returns fabricated bytes.
+async function downscaleImage(
+  file: File,
+  maxDim = 1024,
+  quality = 0.85,
+): Promise<{ data: string; mediaType: string }> {
+  if (!file.type.startsWith('image/')) throw new Error('That file is not an image.')
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const fr = new FileReader()
+    fr.onload = () => resolve(String(fr.result))
+    fr.onerror = () => reject(new Error('Could not read that image file.'))
+    fr.readAsDataURL(file)
+  })
+  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const im = new Image()
+    im.onload = () => resolve(im)
+    im.onerror = () => reject(new Error('That image could not be loaded.'))
+    im.src = dataUrl
+  })
+  const longest = Math.max(img.width, img.height) || 1
+  const scale = Math.min(1, maxDim / longest)
+  const width = Math.max(1, Math.round(img.width * scale))
+  const height = Math.max(1, Math.round(img.height * scale))
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('Your browser could not process the image.')
+  ctx.drawImage(img, 0, 0, width, height)
+  const out = canvas.toDataURL('image/jpeg', quality)
+  const comma = out.indexOf(',')
+  if (comma < 0 || !out.startsWith('data:image/jpeg')) throw new Error('Could not encode the image.')
+  return { data: out.slice(comma + 1), mediaType: 'image/jpeg' }
+}
+
 function AssistantPanel({
   symbol,
   timeframe,
@@ -3817,6 +3878,11 @@ function AssistantPanel({
   // index) so a live-monitor push that reindexes the transcript can't move the tick
   // onto the wrong bubble.
   const [copied, setCopied] = useState<ChatMsg | null>(null)
+  // A pending image attachment (chart/screenshot) to send with the next question.
+  // Held until Send, shown as a thumbnail above the composer; cleared on send or ✕.
+  const [attachment, setAttachment] = useState<{ data: string; mediaType: string; name: string } | null>(null)
+  const [attaching, setAttaching] = useState(false)
+  const fileRef = useRef<HTMLInputElement | null>(null)
   const recRef = useRef<SpeechRec | null>(null)
   const listRef = useRef<HTMLDivElement | null>(null)
   // Ids of auto (autopilot) actions we've already kicked off, so the effect that
@@ -3842,7 +3908,11 @@ function AssistantPanel({
 
   const send = async (q: string) => {
     const question = q.trim()
-    if (!question || busy) return
+    const img = attachment
+    // Allow sending with just an image (a chart to "read") — fall back to a
+    // neutral ask so the request is never empty. Never invent market specifics.
+    if ((!question && !img) || busy) return
+    const asked = question || 'Please read this image and tell me what you see.'
     // Prior turns become the conversation history the assistant reads, so it can
     // follow a multi-step task instead of answering each question cold. Captured
     // BEFORE we append this question (setTurns is async), so it's exactly the
@@ -3855,16 +3925,26 @@ function AssistantPanel({
         role: m.role === 'ai' ? ('assistant' as const) : ('user' as const),
         content: m.text,
       }))
-    setTurns((t) => [...t, { role: 'you', text: question, ts: Date.now() }])
+    setTurns((t) => [
+      ...t,
+      {
+        role: 'you',
+        text: asked,
+        image: img ? { data: img.data, mediaType: img.mediaType } : undefined,
+        ts: Date.now(),
+      },
+    ])
     setInput('')
+    setAttachment(null)
     setBusy(true)
     try {
       const res = await api.aiChat({
-        question,
+        question: asked,
         symbol: useSymbol ? symbol : undefined,
         timeframe: useSymbol ? timeframe : undefined,
         include_news: useNews,
         history,
+        image: img ? { data: img.data, media_type: img.mediaType } : undefined,
       })
       // Extract any hidden navigation action; the spoken/shown text is the reply
       // with the tag removed, and a button lets the user actually go there. A
@@ -3921,6 +4001,29 @@ function AssistantPanel({
   const deleteMsg = (m: ChatMsg) => {
     setCopied((c) => (c === m ? null : c))
     setTurns((arr) => arr.filter((x) => x !== m))
+  }
+
+  // Attach an image the AI can read. Validates it's an image, caps the raw file at
+  // 12 MB (pre-downscale), then downscales+re-encodes to a small JPEG. Any failure
+  // surfaces as a toast — never a silent drop or a fabricated attachment.
+  const pickImage = async (file: File) => {
+    if (!file.type.startsWith('image/')) {
+      onError('Please choose an image file (PNG, JPG, WebP…).')
+      return
+    }
+    if (file.size > 12 * 1024 * 1024) {
+      onError('That image is larger than 12 MB — please pick a smaller one.')
+      return
+    }
+    setAttaching(true)
+    try {
+      const { data, mediaType } = await downscaleImage(file)
+      setAttachment({ data, mediaType, name: file.name || 'image' })
+    } catch (e) {
+      onError((e as Error).message || 'Could not attach that image.')
+    } finally {
+      setAttaching(false)
+    }
   }
 
   // Mark a turn's action with a new lifecycle state (so its card can't be re-run
@@ -4147,6 +4250,13 @@ function AssistantPanel({
                 <div key={i} className={`bubble ${t.role}`}>
                   <div className="bubble-role">{t.role === 'you' ? 'You' : '🤖 AI'}</div>
                   <div className="bubble-text">{t.text}</div>
+                  {t.image && (
+                    <img
+                      className="bubble-img"
+                      src={`data:${t.image.mediaType};base64,${t.image.data}`}
+                      alt="attached image"
+                    />
+                  )}
                   {t.nav && (
                     <button
                       type="button"
@@ -4264,7 +4374,48 @@ function AssistantPanel({
             )}
           </div>
 
+          {attachment && (
+            <div className="chat-attach">
+              <img
+                className="chat-attach-thumb"
+                src={`data:${attachment.mediaType};base64,${attachment.data}`}
+                alt="attachment preview"
+              />
+              <span className="chat-attach-name">{attachment.name}</span>
+              <button
+                type="button"
+                className="chat-attach-x"
+                onClick={() => setAttachment(null)}
+                title="Remove attachment"
+                aria-label="Remove attachment"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
           <div className="chat-input">
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/*"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const f = e.target.files?.[0]
+                if (f) void pickImage(f)
+                e.target.value = ''
+              }}
+            />
+            <button
+              type="button"
+              className="btn mic"
+              onClick={() => fileRef.current?.click()}
+              disabled={busy || attaching}
+              title="Attach an image (chart or screenshot) for the AI to read"
+              aria-label="Attach an image"
+            >
+              {attaching ? '…' : '📎'}
+            </button>
             {speechSupported && (
               <button
                 type="button"
@@ -4286,7 +4437,7 @@ function AssistantPanel({
             <button
               className="btn primary"
               onClick={() => send(input)}
-              disabled={busy || !input.trim()}
+              disabled={busy || (!input.trim() && !attachment)}
             >
               {busy ? '…' : 'Send'}
             </button>
@@ -4305,7 +4456,10 @@ function AssistantPanel({
 // Dedicated News dashboard: its own tab so headlines get full width instead of
 // sharing the assistant column. Real public-feed items only — an empty list
 // means the feeds were unreachable (never fabricated).
-function NewsPanel({ onError }: { onError: (msg: string) => void }) {
+// Memoized (see PerformancePanel): a stable `onError` keeps it from re-rendering
+// on the dashboard's live price polls; it refreshes on its own 60s cadence.
+const NewsPanel = memo(NewsPanelImpl)
+function NewsPanelImpl({ onError }: { onError: (msg: string) => void }) {
   const [news, setNews] = useState<NewsItem[]>([])
   const [newsErrors, setNewsErrors] = useState<string[]>([])
   const [newsLoading, setNewsLoading] = useState(false)

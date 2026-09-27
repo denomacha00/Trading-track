@@ -585,15 +585,48 @@ class AICommentator:
         self,
         prov: dict[str, str],
         system: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         max_tokens: int,
+        image: dict[str, str] | None = None,
     ) -> Optional[str]:
         """One real request to a SINGLE provider.
 
         Raises on any transport/HTTP error (the caller records it and may fall
         back to the next provider); returns the reply text, or None if the
         provider answered but with no usable content.
+
+        When ``image`` (a validated ``{"data": base64, "media_type": mime}``) is
+        given it is attached to the LIVE (last) user turn as a multimodal content
+        block, formatted for THIS provider's style — Anthropic ``image``/base64 vs
+        OpenAI ``image_url`` data-URL. Built into a LOCAL copy so the shared
+        ``messages`` list (reused across providers of possibly different styles)
+        is never mutated into the wrong format.
         """
+        send_messages: list[dict[str, Any]] = messages
+        if image is not None and messages:
+            last = messages[-1]
+            text = last.get("content", "")
+            if not isinstance(text, str):
+                text = ""
+            if prov["style"] == "anthropic":
+                content: Any = [
+                    {"type": "text", "text": text},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image["media_type"],
+                            "data": image["data"],
+                        },
+                    },
+                ]
+            else:
+                data_url = f"data:{image['media_type']};base64,{image['data']}"
+                content = [
+                    {"type": "text", "text": text},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ]
+            send_messages = messages[:-1] + [{"role": last["role"], "content": content}]
         base = (prov["base_url"] or "").rstrip("/")
         # Fast failover: cap CONNECT time so a down/unreachable provider is dropped
         # quickly and the SAME request can retry the next provider — while a
@@ -615,7 +648,7 @@ class AICommentator:
                         "model": prov["model"],
                         "max_tokens": max_tokens,
                         "system": system,
-                        "messages": messages,
+                        "messages": send_messages,
                     },
                 )
                 resp.raise_for_status()
@@ -631,7 +664,7 @@ class AICommentator:
                     "model": prov["model"],
                     "messages": [
                         {"role": "system", "content": system},
-                        *messages,
+                        *send_messages,
                     ],
                     "temperature": 0.2,
                     "max_tokens": max_tokens,
@@ -647,6 +680,7 @@ class AICommentator:
         user: str,
         max_tokens: int | None = None,
         history: list[dict[str, str]] | None = None,
+        image: dict[str, str] | None = None,
     ) -> Optional[str]:
         """Send a conversation and return the text reply, or None on failure.
 
@@ -657,6 +691,9 @@ class AICommentator:
         live ``user`` turn so the assistant has real conversational memory.
         Adjacent same-role turns are coalesced so the list strictly alternates —
         the Anthropic messages API rejects two same-role turns in a row.
+
+        ``image`` (validated base64 + media_type) rides on the LIVE user turn only;
+        it is formatted per-provider inside ``_post_once`` so history stays text.
         """
         providers = self._providers()
         if not providers:
@@ -665,7 +702,7 @@ class AICommentator:
             return None
         max_tokens = max_tokens or self._settings.ai_max_tokens
         # Build the alternating message list ONCE and reuse it for every provider.
-        messages: list[dict[str, str]] = []
+        messages: list[dict[str, Any]] = []
         for turn in (history or []) + [{"role": "user", "content": user}]:
             if messages and messages[-1]["role"] == turn["role"]:
                 messages[-1]["content"] += "\n\n" + turn["content"]
@@ -674,7 +711,7 @@ class AICommentator:
         errors: list[str] = []
         for prov in providers:
             try:
-                text = self._post_once(prov, system, messages, max_tokens)
+                text = self._post_once(prov, system, messages, max_tokens, image=image)
                 if text:
                     self._last_error = ""
                     self._last_provider = prov["label"]
@@ -799,6 +836,7 @@ class AICommentator:
         bot_context: str | None = None,
         news: list[dict] | None = None,
         history: Any = None,
+        image: dict[str, str] | None = None,
     ) -> str:
         """Assistant answer grounded in the user's OWN bot state + optional news.
 
@@ -862,6 +900,16 @@ class AICommentator:
             "operator stays in control of every order. Weigh downside first and "
             "never promise profit."
         )
+        if image is not None:
+            # The live user turn carries an attached image. Tell the model to read
+            # ONLY what is actually visible — never invent a level, price or detail
+            # it cannot see (honest-data rule extends to vision).
+            prompt += (
+                "\n\nThe user attached an IMAGE (e.g. a chart or screenshot). Read "
+                "it carefully and base your answer strictly on what is genuinely "
+                "visible in it. If something is unreadable or absent, say so — do "
+                "not guess prices, levels, dates or numbers you cannot actually see."
+            )
         # System prompt = who you are + how the app works + how to navigate it +
         # how to propose real actions + how to keep a beginner safe, so the
         # assistant can explain the product, drive the UI, and act on the account
@@ -879,7 +927,7 @@ class AICommentator:
             + "\n\n"
             + _ICT_GUIDE
         )
-        reply = self._post(system, prompt, history=_sanitize_history(history))
+        reply = self._post(system, prompt, history=_sanitize_history(history), image=image)
         if reply is not None:
             return reply
         return (

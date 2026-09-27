@@ -8,6 +8,8 @@ their own in-memory :class:`TradingEngine` and a unique TradingView webhook URL.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import datetime as dt
 import json
 import logging
@@ -2065,6 +2067,41 @@ def _normalize_proposed_action(raw: dict | None, engine) -> dict | None:
     return None
 
 
+# Vision attachments the assistant can read. Kept small and STRICTLY validated:
+# the frontend downscales/re-encodes to JPEG, but the client is never trusted, so
+# the media type is re-checked against a tight allowlist and the DECODED size is
+# capped — a huge or bogus payload can't burden the provider or this process.
+# Returns a clean {"data", "media_type"} dict or raises HTTPException(400/413).
+_CHAT_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+_CHAT_IMAGE_MAX_BYTES = 6 * 1024 * 1024  # 6 MB decoded — generous for a downscaled chart
+
+
+def _validate_chat_image(raw: object) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="image must be an object")
+    media_type = str(raw.get("media_type", "")).strip().lower()
+    data = raw.get("data")
+    if media_type not in _CHAT_IMAGE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="image type must be one of: " + ", ".join(sorted(_CHAT_IMAGE_TYPES)),
+        )
+    if not isinstance(data, str) or not data:
+        raise HTTPException(status_code=400, detail="image data is required")
+    # Bound the base64 string BEFORE decoding so a giant payload can't cost work.
+    if len(data) > _CHAT_IMAGE_MAX_BYTES * 2:
+        raise HTTPException(status_code=413, detail="image is too large (max 6 MB)")
+    try:
+        decoded = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="image data is not valid base64")
+    if not decoded:
+        raise HTTPException(status_code=400, detail="image data is empty")
+    if len(decoded) > _CHAT_IMAGE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="image is too large (max 6 MB)")
+    return {"data": data, "media_type": media_type}
+
+
 @app.post("/api/ai/chat")
 def ai_chat(
     payload: dict,
@@ -2092,6 +2129,12 @@ def ai_chat(
     engine = _engine_for(db, user)
     symbol = payload.get("symbol")
     timeframe = payload.get("timeframe", "1h")
+    # An optional attached image the assistant reads (vision). Validated + size
+    # capped; a bad shape is a 400, never a 500 or a silent drop.
+    image = None
+    raw_image = payload.get("image")
+    if raw_image is not None:
+        image = _validate_chat_image(raw_image)
     # Only compute analysis if a symbol was given; a bad symbol shouldn't 502 the
     # whole chat, so degrade gracefully to no-analysis context.
     analysis = None
@@ -2158,6 +2201,7 @@ def ai_chat(
         bot_context=bot_context,
         news=news or None,
         history=history,
+        image=image,
     )
     # The reply may carry a hidden [[action:{...}]] tag proposing a real action.
     # Strip it (never shown raw) and validate it into a safe, typed proposal the UI

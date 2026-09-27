@@ -949,6 +949,68 @@ def test_ai_chat_no_action_when_none_proposed(client, monkeypatch):
     assert r.json()["proposed_action"] is None
 
 
+def test_ai_chat_passes_valid_image_through_to_model(client, monkeypatch):
+    # An attached photo (vision) must reach the model as a clean {data, media_type}
+    # dict — validated, not silently dropped. "aGVsbG8=" is base64("hello").
+    engine, _ = _admin_engine()
+    seen: dict[str, object] = {}
+
+    def fake_chat(question, **kwargs):
+        seen["image"] = kwargs.get("image")
+        return "I can see the chart you attached."
+
+    monkeypatch.setattr(engine.ai, "chat", fake_chat)
+    r = client.post(
+        "/api/ai/chat",
+        json={
+            "question": "what do you see?",
+            "image": {"data": "aGVsbG8=", "media_type": "image/png"},
+        },
+    )
+    assert r.status_code == 200
+    assert seen["image"] == {"data": "aGVsbG8=", "media_type": "image/png"}
+
+
+def test_ai_chat_rejects_bad_image_shape(client, monkeypatch):
+    # Bad shapes are a clean 400 (never a 500 or a silent drop): non-object,
+    # disallowed media type, missing data, and non-base64 data.
+    engine, _ = _admin_engine()
+    monkeypatch.setattr(engine.ai, "chat", lambda q, **k: "unused")
+    base = {"question": "look"}
+    assert client.post("/api/ai/chat", json={**base, "image": "notanobject"}).status_code == 400
+    assert client.post(
+        "/api/ai/chat", json={**base, "image": {"data": "aGVsbG8=", "media_type": "image/tiff"}}
+    ).status_code == 400
+    assert client.post(
+        "/api/ai/chat", json={**base, "image": {"media_type": "image/png"}}
+    ).status_code == 400
+    assert client.post(
+        "/api/ai/chat", json={**base, "image": {"data": "@@not base64@@", "media_type": "image/png"}}
+    ).status_code == 400
+
+
+def test_ai_chat_rejects_oversize_image(client, monkeypatch):
+    # Both size guards return 413: the pre-decode string-length bound AND the
+    # decoded-bytes bound. Shrink the cap so the test stays fast (no 6 MB alloc).
+    from app import main as main_mod
+
+    engine, _ = _admin_engine()
+    monkeypatch.setattr(engine.ai, "chat", lambda q, **k: "unused")
+    monkeypatch.setattr(main_mod, "_CHAT_IMAGE_MAX_BYTES", 4)
+    # String longer than cap*2 (=8) short-circuits before decode.
+    r_str = client.post(
+        "/api/ai/chat",
+        json={"question": "x", "image": {"data": "aGVsbG8gd29ybGQ=", "media_type": "image/png"}},
+    )
+    assert r_str.status_code == 413
+    # "aGVsbG8=" is 8 chars (<= cap*2) but decodes to 5 bytes (> cap) => decoded guard.
+    r_dec = client.post(
+        "/api/ai/chat",
+        json={"question": "x", "image": {"data": "aGVsbG8=", "media_type": "image/png"}},
+    )
+    assert r_dec.status_code == 413
+
+
 def test_ai_chat_news_grounded_action_is_never_auto(client, monkeypatch):
     # M11: news is untrusted third-party text (a prompt-injection surface). Even
     # with autopilot ON on a paper account — where a paper order would normally

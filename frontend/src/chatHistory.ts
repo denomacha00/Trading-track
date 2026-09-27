@@ -26,6 +26,10 @@ export type StoredTurn = ChatTurn & {
   id?: unknown
   nav?: unknown
   live?: boolean
+  // A user-attached image (raw base64). STRIPPED on save (see prune): it's large
+  // binary that would blow the localStorage quota, so the thumbnail is a
+  // this-session convenience only — the message text is what persists as memory.
+  image?: unknown
 }
 
 const CHAT_KEY = 'tt.chat.v1'
@@ -43,7 +47,11 @@ function prune(turns: StoredTurn[], now: number): StoredTurn[] {
     if (!t || (t.role !== 'you' && t.role !== 'ai') || typeof t.text !== 'string') continue
     const ts = typeof t.ts === 'number' && Number.isFinite(t.ts) ? t.ts : now
     if (now - ts > TTL_MS) continue
-    out.push(t.ts === ts ? t : { ...t, ts })
+    // Never persist attached image bytes — large base64 would blow the quota and
+    // isn't needed as memory. Drop it (and stamp the ts) by always cloning.
+    const { image, ...rest } = t
+    void image
+    out.push({ ...rest, ts })
   }
   return out.slice(-MAX_TURNS)
 }
