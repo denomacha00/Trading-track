@@ -877,6 +877,33 @@ class AICommentator:
             return False, f"AI veto: {reason}"
         return True, f"AI approved: {reason}"
 
+    def pretrade_analysis(self, analysis: MarketAnalysis) -> str:
+        """A short, grounded rationale for an ENTRY the brain is about to take.
+
+        Explanatory only — it does NOT decide or veto (that is ``confirm_trade``);
+        it explains WHY, in plain language, for an operator who doesn't read charts.
+        Grounded strictly in the real factors and the account's real risk rules, so
+        it can't invent a number or a reason. Returns "" if the AI is unavailable or
+        errors, so the caller can proceed on the deterministic decision with no note
+        (fails safe — an entry is never blocked by this).
+        """
+        if not self.available:
+            return ""
+        prompt = (
+            "The deterministic engine has DECIDED to open this position (you are "
+            "NOT being asked to approve or change it). In 2-3 plain sentences, "
+            "explain to a non-expert WHY this is a reasonable entry and what the "
+            "main risk is, using only the factors and rules below. Do not invent "
+            "numbers, do not promise profit, do not tell them to override any rule.\n\n"
+            + self._analysis_block(analysis)
+            + "\n\n"
+            + self._risk_block()
+        )
+        try:
+            return (self._post(_SYSTEM_ANALYST, prompt, max_tokens=220) or "").strip()
+        except Exception:
+            return ""
+
     @staticmethod
     def _analysis_block(analysis: MarketAnalysis) -> str:
         factors = "\n".join(

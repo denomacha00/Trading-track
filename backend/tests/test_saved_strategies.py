@@ -73,6 +73,9 @@ def _engine(**over) -> TradingEngine:
         default_take_profit_pct=4.0,
         paper_starting_balance=10_000.0,
         min_signal_confidence=0.1,
+        # These tests isolate the regime/override logic, so keep the separate
+        # validation gate OFF here; it has its own dedicated tests below.
+        require_strategy_validation=False,
     )
     base.update(over)
     return TradingEngine(Settings(**base), _Conn(), user_id=None)
@@ -197,3 +200,109 @@ def test_broken_saved_strategy_falls_back_to_analyzer(db, monkeypatch):
     before = analysis.verdict
     out = eng._apply_saved_strategy("BTC/USDT", _UP, analysis)
     assert out.verdict == before
+
+
+# ---- validation gate (the honest stand-in for "make it 95% correct") -----
+# We never fabricate an accuracy figure. Instead, a saved strategy only earns
+# the right to drive a NEW long once its REAL, out-of-sample backtest metrics
+# clear the operator's thresholds. Unproven -> defer to the analyzer.
+
+
+_GOOD_METRICS = {
+    "validation_return_pct": 12.0,   # out-of-sample split present and positive
+    "win_rate_pct": 58.0,
+    "num_trades": 30,
+    "max_drawdown_pct": 9.0,
+    "overfit_gap_pct": 4.0,
+}
+
+
+def test_validate_passes_with_real_oos_metrics():
+    eng = _engine(
+        require_strategy_validation=True,
+        strategy_min_return_pct=0.0,
+        strategy_min_trades=5,
+    )
+    ok, reason, detail = eng._validate_saved_strategy(
+        {"strategy": "ma_cross", "params": {}, "metrics": _GOOD_METRICS}
+    )
+    assert ok is True
+    assert reason == "validated"
+    assert detail["return_basis"] == "out-of-sample"
+
+
+def test_validate_fails_closed_without_metrics():
+    # No metrics at all -> unproven -> refuse (fail CLOSED), never assume good.
+    eng = _engine(require_strategy_validation=True)
+    ok, reason, detail = eng._validate_saved_strategy({"strategy": "ma_cross"})
+    assert ok is False
+    assert "no backtest metrics" in reason
+    assert detail == {}
+
+
+def test_validate_fails_on_in_sample_only():
+    # A strategy with only an in-sample return (no out-of-sample split) is not
+    # trustworthy for real money — the gate demands an out-of-sample number.
+    eng = _engine(require_strategy_validation=True, strategy_min_return_pct=0.0)
+    ok, reason, _ = eng._validate_saved_strategy(
+        {"strategy": "ma_cross", "metrics": {"total_return_pct": 40.0, "num_trades": 20}}
+    )
+    assert ok is False
+    assert "out-of-sample" in reason
+
+
+def test_validate_fails_when_below_thresholds():
+    eng = _engine(
+        require_strategy_validation=True,
+        strategy_min_return_pct=20.0,   # demand more than the strategy delivered
+        strategy_min_win_rate_pct=70.0,
+        strategy_min_trades=100,
+    )
+    ok, reason, _ = eng._validate_saved_strategy(
+        {"strategy": "ma_cross", "metrics": _GOOD_METRICS}
+    )
+    assert ok is False
+    assert "return" in reason and "win rate" in reason and "trades" in reason
+
+
+def test_gate_on_defers_unvalidated_buy_to_analyzer(db, monkeypatch):
+    # Opted in + gate ON + no metrics: a saved BUY is NOT taken; we fall back to
+    # the deterministic analyzer verdict instead of trading an unproven edge.
+    eng = _engine(use_saved_strategy=True, require_strategy_validation=True)
+    eng.strategy_configs["BTC/USDT"] = {"strategy": "ma_cross", "params": {}}
+    _stub(monkeypatch, "buy")
+    analysis = MarketAnalyzer().analyze(_UP, "BTC/USDT")
+    before = analysis.verdict
+    out = eng._apply_saved_strategy("BTC/USDT", _UP, analysis)
+    assert out.verdict == before          # analyzer keeps the wheel
+    assert out.confidence != 1.0          # not the forced saved-strategy confidence
+    assert "not validated" in out.summary
+
+
+def test_gate_on_takes_validated_buy(db, monkeypatch):
+    # Same setup but WITH passing out-of-sample metrics -> the saved BUY drives.
+    eng = _engine(
+        use_saved_strategy=True,
+        require_strategy_validation=True,
+        strategy_min_return_pct=0.0,
+        strategy_min_trades=5,
+    )
+    eng.strategy_configs["BTC/USDT"] = {
+        "strategy": "ma_cross", "params": {}, "metrics": _GOOD_METRICS
+    }
+    _stub(monkeypatch, "buy")
+    analysis = MarketAnalyzer().analyze(_UP, "BTC/USDT")
+    out = eng._apply_saved_strategy("BTC/USDT", _UP, analysis)
+    assert out.verdict == "buy"
+    assert out.confidence == 1.0
+
+
+def test_gate_never_blocks_a_sell(db, monkeypatch):
+    # Reducing risk is never gated: an unvalidated saved SELL is still honoured.
+    eng = _engine(use_saved_strategy=True, require_strategy_validation=True)
+    eng.strategy_configs["BTC/USDT"] = {"strategy": "ma_cross", "params": {}}
+    _stub(monkeypatch, "sell")
+    analysis = MarketAnalyzer().analyze(_UP, "BTC/USDT")
+    out = eng._apply_saved_strategy("BTC/USDT", _UP, analysis)
+    assert out.verdict == "sell"
+    assert out.confidence == 1.0

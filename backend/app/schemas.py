@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -197,6 +197,19 @@ class BotStatus(BaseModel):
     unrealized_pnl: float
     day_pnl: float
     max_open_positions: int
+    # Risk-safeguard + autopilot visibility (all optional so older callers/tests
+    # that only assert the core keys keep passing).
+    killswitch: bool = False
+    max_drawdown_pct: float = 0.0
+    peak_equity: float = 0.0
+    auto_trade_enabled: bool = False
+    consecutive_losses: int = 0
+    max_consecutive_losses: int = 0
+    entries_paused: bool = False
+    entries_pause_reason: Optional[str] = None
+    # Per-symbol regime snapshots: {SYMBOL: {regime, detail, protective_hold,
+    # entries_paused, verdict, at}}. Empty until the monitor has analysed a symbol.
+    regimes: dict[str, Any] = Field(default_factory=dict)
 
 
 class SettingsOut(BaseModel):
@@ -217,11 +230,27 @@ class SettingsOut(BaseModel):
     auto_confirm_timeframe: str
     use_saved_strategy: bool = False
     ai_trade_confirm: bool = False
+    ai_pretrade_analysis: bool = False
     ai_monitor_enabled: bool = False
     ai_autopilot_enabled: bool = False
     ai_enabled: bool
     ai_model: str = ""
     ai_style: str = ""
+    # Visible pause/resume + saved-strategy validation gate.
+    auto_pause_in_bear: bool = True
+    require_strategy_validation: bool = True
+    strategy_min_return_pct: float = 0.0
+    strategy_min_win_rate_pct: float = 0.0
+    strategy_min_trades: int = 5
+    strategy_max_drawdown_pct: float = 0.0
+    # Profit-lock / early profit-take (autopilot).
+    profit_lock_enabled: bool = False
+    profit_lock_trigger_pct: float = 1.0
+    profit_lock_floor_pct: float = 0.3
+    take_profit_on_reversal: bool = False
+    reversal_confirm_count: int = 2
+    # Global background monitor cadence (seconds).
+    monitor_interval_seconds: float = 5.0
     notifications_enabled: bool
     api_key_set: bool
     webhook_path: str
@@ -242,11 +271,30 @@ class SettingsUpdate(BaseModel):
     auto_confirm_timeframe: Optional[str] = None
     use_saved_strategy: Optional[bool] = None
     ai_trade_confirm: Optional[bool] = None
+    ai_pretrade_analysis: Optional[bool] = None
     ai_monitor_enabled: Optional[bool] = None
     ai_autopilot_enabled: Optional[bool] = None
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=100)
     max_total_exposure_pct: Optional[float] = Field(default=None, ge=0, le=1000)
     paper_taker_fee_pct: Optional[float] = Field(default=None, ge=0, le=5)
+    # Visible pause/resume + saved-strategy validation gate.
+    auto_pause_in_bear: Optional[bool] = None
+    require_strategy_validation: Optional[bool] = None
+    strategy_min_return_pct: Optional[float] = Field(default=None, ge=-100, le=1000)
+    strategy_min_win_rate_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    strategy_min_trades: Optional[int] = Field(default=None, ge=0, le=100000)
+    strategy_max_drawdown_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    # Profit-lock / early profit-take (autopilot). The engine additionally clamps
+    # the effective floor/trigger to clear round-trip fees, so a tiny value here
+    # can never "lock" a fee-loss — but keep trigger > floor for the stop to sit
+    # below price.
+    profit_lock_enabled: Optional[bool] = None
+    profit_lock_trigger_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    profit_lock_floor_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    take_profit_on_reversal: Optional[bool] = None
+    reversal_confirm_count: Optional[int] = Field(default=None, ge=1, le=20)
+    # Global background monitor cadence (seconds); clamped to [3, 60] server-side.
+    monitor_interval_seconds: Optional[float] = Field(default=None, ge=3, le=60)
 
 
 class AlertCreate(BaseModel):

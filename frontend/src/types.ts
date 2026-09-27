@@ -2,6 +2,19 @@
 
 import type { IndicatorPrefs } from './indicators'
 
+// Per-symbol market-regime snapshot the bot publishes so the UI can SHOW it
+// standing aside in a bad market and re-engaging in a good one (the visible
+// pause/resume). Pure observation of the analyzer's own regime factor — nothing
+// fabricated. Empty until the monitor has analysed that symbol at least once.
+export interface RegimeSnapshot {
+  regime: 'bull' | 'bear' | 'neutral'
+  detail: string
+  protective_hold: boolean
+  entries_paused: boolean
+  verdict: 'buy' | 'sell' | 'hold'
+  at: string
+}
+
 export interface BotStatus {
   running: boolean
   trading_mode: string
@@ -14,6 +27,20 @@ export interface BotStatus {
   unrealized_pnl: number
   day_pnl: number
   max_open_positions: number
+  // Risk-safeguard + autopilot visibility. All optional so older payloads
+  // (and tests that assert only the core keys) keep parsing.
+  killswitch?: boolean
+  max_drawdown_pct?: number
+  peak_equity?: number
+  auto_trade_enabled?: boolean
+  consecutive_losses?: number
+  max_consecutive_losses?: number
+  // True when NEW entries are halted (kill-switch, consecutive-loss breaker, or
+  // the bot is stopped); `entries_pause_reason` is the plain-language why.
+  entries_paused?: boolean
+  entries_pause_reason?: string | null
+  // Per-symbol regime snapshots, keyed by SYMBOL. Empty until analysed.
+  regimes?: Record<string, RegimeSnapshot>
 }
 
 export interface Trade {
@@ -162,9 +189,43 @@ export interface Settings {
   // paper<->live are NEVER autopiloted; those always need an explicit confirm.
   // Opt-in and OFF by default.
   ai_autopilot_enabled: boolean
+  // When on AND autonomous trading is on, the AI writes a short, grounded
+  // rationale BEFORE each autonomous entry (explaining the analyzer's own
+  // decision to a non-expert). It can never invent a number or override a risk
+  // gate — a failure just falls back to the plain summary. Off by default.
+  ai_pretrade_analysis: boolean
   ai_enabled: boolean
   ai_model?: string
   ai_style?: string
+  // ---- Autopilot safety / pause-resume (safe defaults for non-traders) ----
+  // Stand aside for NEW longs while price is in a bear regime; resume in a bull.
+  // On by default — capital preservation is the safe stance.
+  auto_pause_in_bear: boolean
+  // Require a saved strategy to pass a REAL out-of-sample backtest (the
+  // thresholds below) before it may drive autonomous BUYS. On by default; a
+  // SELL/exit is never gated. This is the honest stand-in for "95% correct":
+  // we never fabricate accuracy, we refuse to auto-trade an unproven edge.
+  require_strategy_validation: boolean
+  strategy_min_return_pct: number
+  strategy_min_win_rate_pct: number
+  strategy_min_trades: number
+  strategy_max_drawdown_pct: number
+  // ---- Profit-lock / early profit-take (autopilot) ----
+  // Ratchet a winning long's stop up into profit once it's up enough. The engine
+  // AUTOMATICALLY clamps the effective trigger/floor to clear round-trip fees, so
+  // a tiny value here can never lock in a fee-loss (you don't have to do the fee
+  // math — keep trigger > floor so the locked stop sits below price).
+  profit_lock_enabled: boolean
+  profit_lock_trigger_pct: number
+  profit_lock_floor_pct: number
+  // Actively bank a NET-positive winner when the read turns bearish and STAYS
+  // bearish for `reversal_confirm_count` reads (anti-whipsaw). OFF => the trade
+  // runs to its stop/target ("it must finish"). Only ever sells a real winner.
+  take_profit_on_reversal: boolean
+  reversal_confirm_count: number
+  // Background monitor cadence (seconds); server clamps to [3, 60]. This is a
+  // GLOBAL setting (one shared monitor loop), not per-symbol.
+  monitor_interval_seconds: number
   notifications_enabled: boolean
   api_key_set: boolean
   webhook_path: string
@@ -298,6 +359,35 @@ export interface Performance extends PerfBucket {
   by_symbol: PerfSymbol[]
 }
 
+// Real, explainable analytics for a backtest run — every figure derived from the
+// run's own trades/equity curve, nothing invented. `profit_factor` is null when
+// there were no losing trades (shown as "-", never a fake ratio) and
+// `avg_hold_seconds`/`buy_hold_return_pct` are null when they can't be measured.
+export interface BacktestAnalytics {
+  wins: number
+  losses: number
+  breakeven: number
+  gross_profit: number
+  gross_loss: number
+  profit_factor: number | null
+  avg_win: number
+  avg_loss: number
+  avg_trade_pnl: number
+  expectancy_pct: number
+  avg_trade_return_pct: number
+  largest_win: number
+  largest_loss: number
+  avg_bars_held: number
+  avg_hold_seconds: number | null
+  fees_pct_of_start: number
+  buy_hold_return_pct: number | null
+  vs_buy_hold_pct: number | null
+  beat_buy_hold: boolean
+  profitable: boolean
+  bars: number
+  explanation: string
+}
+
 export interface BacktestResult {
   symbol: string
   strategy: string
@@ -318,6 +408,10 @@ export interface BacktestResult {
   // rather than the raw picker selection — so the UI can label it honestly.
   used_saved?: boolean
   equity_curve: number[]
+  // Deeper real analytics + a plain-language read of what happened. Optional so
+  // an older backend without them still parses.
+  analytics?: BacktestAnalytics
+  explanation?: string
 }
 
 export interface StrategyInfo {
@@ -357,6 +451,24 @@ export interface TrainingReport {
 // measured results from the training run that produced it (never fabricated);
 // older saves may omit some fields. This is the answer to "where did the
 // strategies I trained go" — they live on the account, keyed by symbol.
+// The verdict of the validation gate for a saved strategy, computed from its
+// REAL measured metrics (never fabricated). `will_auto_trade` is the bottom line
+// the UI shows: whether this strategy's BUY will actually be trusted right now.
+export interface SavedStrategyValidation {
+  ok: boolean
+  reason: string
+  gate_enabled: boolean
+  use_saved_strategy: boolean
+  will_auto_trade: boolean
+  // Present only when the strategy carries metrics (absent when it has none yet).
+  return_pct?: number
+  return_basis?: 'out-of-sample' | 'in-sample only'
+  win_rate_pct?: number
+  num_trades?: number
+  max_drawdown_pct?: number
+  overfit_gap_pct?: number | null
+}
+
 export interface SavedStrategy {
   symbol: string
   strategy: string
@@ -372,6 +484,8 @@ export interface SavedStrategy {
     overfit_gap_pct?: number | null
   }
   trained_at?: string
+  // Whether this strategy has earned the right to drive autonomous BUYS.
+  validation?: SavedStrategyValidation
 }
 
 export interface AnalysisFactor {
@@ -418,6 +532,14 @@ export type WsMessage =
   | { event: 'order_pending'; data: { id: number; symbol: string; side: string; limit_price: number } }
   | { event: 'order_canceled'; data: { id: number; symbol: string } }
   | { event: 'stop_trailed'; data: { id: number; symbol: string; stop_loss: number } }
+  // The autopilot ratcheted a winning long's stop up into profit (fee-aware): a
+  // pullback now banks the gain instead of giving it back. `locked_pct` is the
+  // profit floor above entry that the raised stop now guarantees.
+  | { event: 'profit_locked'; data: { id: number; symbol: string; stop_loss: number; locked_pct: number } }
+  // A grounded, plain-language rationale the AI wrote BEFORE an autonomous entry
+  // (it explains the analyzer's own decision; it never invents a number or forces
+  // the trade). `confidence` is the analyzer's real 0..1 score for that entry.
+  | { event: 'pretrade_analysis'; data: { symbol: string; text: string; confidence: number } }
   | { event: 'reconcile_closed'; data: { symbol: string; db_amount: number; exchange_amount: number; pnl: number } }
   | { event: 'reconcile_adjusted'; data: { symbol: string; db_amount: number; exchange_amount: number } }
   | {

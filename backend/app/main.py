@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 
 from app import __version__
 from app.ai import strip_action_tag
-from app.backtest import run_backtest
+from app.backtest import run_backtest, summarize_backtest
 from app.config import get_settings
 from app.database import get_db, init_db
 from app.deps import get_current_user, require_admin, require_licensed_user
@@ -93,7 +93,7 @@ from app.security import (
     verify_password,
 )
 from app.usermgr import get_manager
-from app.state import purge_user_state
+from app.state import load_monitor_interval, purge_user_state, save_monitor_interval
 from app.learn import PARAM_GRIDS, train
 from app.news import fetch_market_news
 from app.performance import compute_performance
@@ -822,8 +822,14 @@ def set_bot_state(
     return {"running": engine.running}
 
 
-def _settings_out(engine, user: User) -> SettingsOut:
+def _settings_out(engine, user: User, db: Session | None = None) -> SettingsOut:
     s = engine.settings
+    # Monitor cadence is a GLOBAL, server-wide value (one shared loop), so show the
+    # real stored value rather than a per-engine copy when we have a db handle.
+    monitor_interval = (
+        load_monitor_interval(db, getattr(s, "monitor_interval_seconds", 5.0))
+        if db is not None else getattr(s, "monitor_interval_seconds", 5.0)
+    )
     return SettingsOut(
         trading_mode=s.trading_mode,
         binance_testnet=s.binance_testnet,
@@ -842,11 +848,24 @@ def _settings_out(engine, user: User) -> SettingsOut:
         auto_confirm_timeframe=s.auto_confirm_timeframe,
         use_saved_strategy=getattr(s, "use_saved_strategy", False),
         ai_trade_confirm=getattr(s, "ai_trade_confirm", False),
+        ai_pretrade_analysis=getattr(s, "ai_pretrade_analysis", False),
         ai_monitor_enabled=getattr(s, "ai_monitor_enabled", False),
         ai_autopilot_enabled=getattr(s, "ai_autopilot_enabled", False),
         ai_enabled=bool(s.ai_api_key or getattr(s, "ai_fallback_api_key", "")),
         ai_model=s.ai_model,
         ai_style=engine.ai._style() if (s.ai_api_key or getattr(s, "ai_fallback_api_key", "")) else "",
+        auto_pause_in_bear=getattr(s, "auto_pause_in_bear", True),
+        require_strategy_validation=getattr(s, "require_strategy_validation", True),
+        strategy_min_return_pct=getattr(s, "strategy_min_return_pct", 0.0),
+        strategy_min_win_rate_pct=getattr(s, "strategy_min_win_rate_pct", 0.0),
+        strategy_min_trades=getattr(s, "strategy_min_trades", 5),
+        strategy_max_drawdown_pct=getattr(s, "strategy_max_drawdown_pct", 0.0),
+        profit_lock_enabled=getattr(s, "profit_lock_enabled", False),
+        profit_lock_trigger_pct=getattr(s, "profit_lock_trigger_pct", 1.0),
+        profit_lock_floor_pct=getattr(s, "profit_lock_floor_pct", 0.3),
+        take_profit_on_reversal=getattr(s, "take_profit_on_reversal", False),
+        reversal_confirm_count=getattr(s, "reversal_confirm_count", 2),
+        monitor_interval_seconds=monitor_interval,
         notifications_enabled=engine.notifier.enabled,
         api_key_set=bool(user.binance_api_key_enc and user.binance_api_secret_enc),
         webhook_path=_webhook_path(user.webhook_token),
@@ -858,7 +877,7 @@ def _settings_out(engine, user: User) -> SettingsOut:
 def get_settings_endpoint(
     db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
-    return _settings_out(_engine_for(db, user), user)
+    return _settings_out(_engine_for(db, user), user, db)
 
 
 @app.patch("/api/settings", response_model=SettingsOut)
@@ -908,8 +927,13 @@ def update_settings(
     for key, value in data.items():
         setattr(s, key, value)
     engine.apply_settings(s)
+    # Monitor cadence is GLOBAL (one shared background loop for all users): persist
+    # it to the unscoped KV the loop reads live, NOT as a per-user override.
+    interval = data.pop("monitor_interval_seconds", None)
+    if interval is not None:
+        setattr(s, "monitor_interval_seconds", save_monitor_interval(db, interval))
     engine.persist_settings(db, data)
-    return _settings_out(engine, user)
+    return _settings_out(engine, user, db)
 
 
 # ---- Price alerts ---------------------------------------------------
@@ -1121,6 +1145,9 @@ def backtest(
         take_profit_pct=tp,
         trailing_stop_pct=trail,
     )
+    # Real, explainable analytics + a plain-language read of what happened. Every
+    # figure comes from the trades above — nothing here is invented.
+    analytics = summarize_backtest(result, df, timeframe=timeframe)
     return {
         "symbol": symbol.upper(),
         "strategy": strategy,
@@ -1137,6 +1164,8 @@ def backtest(
         "take_profit_pct": tp,
         "trailing_stop_pct": trail,
         "equity_curve": [round(e, 2) for e in result.equity_curve],
+        "analytics": analytics,
+        "explanation": analytics["explanation"],
     }
 
 
@@ -1525,13 +1554,27 @@ _AI_SETTINGS_FLOAT = {
     "max_total_exposure_pct",
     "min_signal_confidence",
     "paper_taker_fee_pct",
+    # Profit-lock + saved-strategy gate + monitor cadence (all risk-management
+    # knobs, safe for the AI to propose; the schema PATCH re-validates ranges and
+    # the engine clamps profit-lock to clear fees).
+    "profit_lock_trigger_pct",
+    "profit_lock_floor_pct",
+    "strategy_min_return_pct",
+    "strategy_min_win_rate_pct",
+    "strategy_max_drawdown_pct",
+    "monitor_interval_seconds",
 }
-_AI_SETTINGS_INT = {"max_open_positions"}
+_AI_SETTINGS_INT = {"max_open_positions", "strategy_min_trades", "reversal_confirm_count"}
 _AI_SETTINGS_BOOL = {
     "auto_trade_enabled",
     "use_saved_strategy",
     "ai_trade_confirm",
+    "ai_pretrade_analysis",
     "ai_monitor_enabled",
+    "auto_pause_in_bear",
+    "require_strategy_validation",
+    "profit_lock_enabled",
+    "take_profit_on_reversal",
 }
 _AI_SETTINGS_STR = {"auto_symbols", "auto_timeframe", "auto_confirm_timeframe"}
 
@@ -1965,12 +2008,35 @@ def saved_strategies(
 
     These are the configs the bot trades with when Settings
     ``use_saved_strategy`` is on. Real, persisted training results only — an
-    empty list means nothing has been trained-and-saved yet, never a stub.
+    empty list means nothing has been trained-and-saved yet, never a stub. Each
+    row also carries a ``validation`` block: whether the strategy's REAL saved
+    metrics clear the operator's gate (so the UI can show "validated — will
+    auto-trade" vs "not validated — analyzer decides"), computed from measured
+    numbers only, never fabricated.
     """
     engine = _engine_for(db, user)
-    return [
-        {"symbol": sym, **cfg} for sym, cfg in sorted(engine.strategy_configs.items())
-    ]
+    gate_on = bool(getattr(engine.settings, "require_strategy_validation", True))
+    uss_on = bool(getattr(engine.settings, "use_saved_strategy", False))
+    rows = []
+    for sym, cfg in sorted(engine.strategy_configs.items()):
+        ok, reason, detail = engine._validate_saved_strategy(cfg)
+        rows.append({
+            "symbol": sym,
+            **cfg,
+            "validation": {
+                "ok": ok,
+                "reason": reason,
+                "gate_enabled": gate_on,
+                "use_saved_strategy": uss_on,
+                # Whether this strategy's BUY will actually be trusted for live
+                # entries right now: the "use saved strategy" switch must be on, and
+                # either the gate is off or the strategy passed it. (A SELL/exit is
+                # never gated regardless.)
+                "will_auto_trade": uss_on and ((not gate_on) or ok),
+                **detail,
+            },
+        })
+    return rows
 
 
 @app.delete("/api/strategies/saved/{symbol:path}")

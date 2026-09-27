@@ -213,3 +213,194 @@ def run_backtest(
         trades=trades,
         equity_curve=equity_curve,
     )
+
+
+def _bar_seconds(candles: pd.DataFrame) -> float | None:
+    """Median spacing between candle timestamps, in seconds. None when the frame
+    has no usable timestamp column — we never guess a bar size."""
+    if "timestamp" not in candles or len(candles) < 2:
+        return None
+    try:
+        ts = candles["timestamp"].astype(float).tolist()
+    except (ValueError, TypeError):
+        return None
+    diffs = [b - a for a, b in zip(ts, ts[1:]) if b > a]
+    if not diffs:
+        return None
+    diffs.sort()
+    mid = diffs[len(diffs) // 2]  # ccxt timestamps are milliseconds
+    return round(mid / 1000.0, 3) if mid > 0 else None
+
+
+def _human_duration(seconds: float | None) -> str:
+    """'3h 20m', '2d 4h', '45s' — plain words for a non-trader. '' when unknown."""
+    if not seconds or seconds <= 0:
+        return ""
+    s = int(round(seconds))
+    days, rem = divmod(s, 86_400)
+    hours, rem = divmod(rem, 3_600)
+    mins, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    if hours:
+        return f"{hours}h {mins}m" if mins else f"{hours}h"
+    if mins:
+        return f"{mins}m {secs}s" if secs else f"{mins}m"
+    return f"{secs}s"
+
+
+def summarize_backtest(
+    result: BacktestResult,
+    candles: pd.DataFrame,
+    *,
+    timeframe: str | None = None,
+) -> dict:
+    """Real, explainable analytics computed ONLY from the backtest's own closed
+    trades and equity curve — nothing is fabricated. Every figure traces back to a
+    trade the strategy actually took or a price it actually would have paid.
+
+    Fields that need data which may not exist are honest about it: ``profit_factor``
+    is ``None`` when there were no losing trades (you cannot divide by zero losses),
+    and ``avg_hold_seconds`` is ``None`` when the candles carry no usable timestamps.
+    We never substitute a placeholder number for missing data.
+    """
+    trades = result.trades
+    pnls = [float(t.pnl) for t in trades]
+    win_pnls = [p for p in pnls if p > 0]
+    loss_pnls = [p for p in pnls if p < 0]
+    breakeven = sum(1 for p in pnls if p == 0)
+
+    gross_profit = sum(win_pnls)
+    gross_loss = -sum(loss_pnls)  # reported as a positive magnitude
+    # profit_factor: only meaningful with at least one loss. None (not 0, not inf)
+    # when nothing lost — the UI shows "-" rather than an invented ratio.
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
+
+    n = len(trades)
+    avg_win = (gross_profit / len(win_pnls)) if win_pnls else 0.0
+    avg_loss = (sum(loss_pnls) / len(loss_pnls)) if loss_pnls else 0.0  # negative
+    avg_trade_pnl = (sum(pnls) / n) if n else 0.0  # expectancy, in currency
+    largest_win = max(win_pnls) if win_pnls else 0.0
+    largest_loss = min(loss_pnls) if loss_pnls else 0.0  # negative
+
+    start_bal = result.starting_balance or 0.0
+    expectancy_pct = (avg_trade_pnl / start_bal * 100.0) if start_bal else 0.0
+    # Per-trade return relative to the cash actually put in on that trade.
+    per_trade_returns = [
+        (t.pnl / t.entry_cost * 100.0) for t in trades if t.entry_cost > 0
+    ]
+    avg_trade_return_pct = (
+        sum(per_trade_returns) / len(per_trade_returns) if per_trade_returns else 0.0
+    )
+
+    # Holding time: bars between entry and exit, converted to wall-clock using the
+    # frame's own bar spacing. Left as bar-count only when timestamps are missing.
+    held_bars = [
+        (t.exit_index - t.entry_index)
+        for t in trades
+        if t.exit_index is not None and t.entry_index is not None
+    ]
+    avg_bars_held = (sum(held_bars) / len(held_bars)) if held_bars else 0.0
+    bar_secs = _bar_seconds(candles)
+    avg_hold_seconds = round(avg_bars_held * bar_secs, 1) if bar_secs else None
+
+    # Buy & hold benchmark: what a hands-off holder would have made just owning the
+    # asset across the same window (first close -> last close). This is the honest
+    # bar to clear — a strategy that trades a lot but trails buy & hold is usually
+    # not worth the fees/risk.
+    closes = candles["close"].astype(float).tolist() if "close" in candles else []
+    buy_hold_pct: float | None = None
+    if len(closes) >= 2 and closes[0] > 0:
+        buy_hold_pct = (closes[-1] / closes[0] - 1) * 100.0
+    vs_bh = (
+        result.total_return_pct - buy_hold_pct if buy_hold_pct is not None else None
+    )
+
+    fees_pct_of_start = (
+        (result.total_fees / start_bal * 100.0) if start_bal else 0.0
+    )
+
+    # ---- plain-language explanation (no jargon, no invented figures) -----
+    bars = len(candles)
+    tf = timeframe or "bars"
+    lines: list[str] = []
+    if n == 0:
+        lines.append(
+            f"Over {bars} {tf} candles this strategy never met its own entry "
+            "conditions, so it placed no trades. There is nothing to judge yet — "
+            "try a longer history or a different timeframe before trusting it."
+        )
+    else:
+        verb = "made" if result.total_return_pct >= 0 else "lost"
+        lines.append(
+            f"Over {bars} {tf} candles the strategy took {n} "
+            f"trade{'s' if n != 1 else ''} and {verb} "
+            f"{abs(result.total_return_pct):.2f}% "
+            f"(${result.ending_balance - start_bal:,.2f} on a "
+            f"${start_bal:,.0f} stake)."
+        )
+        lines.append(
+            f"It won {len(win_pnls)} and lost {len(loss_pnls)}"
+            + (f" ({breakeven} scratch)" if breakeven else "")
+            + f" — a {result.win_rate_pct:.0f}% win rate. "
+            f"Average winner ${avg_win:,.2f}, average loser ${avg_loss:,.2f}."
+        )
+        if profit_factor is not None:
+            pf_words = (
+                "it made more than it lost"
+                if profit_factor > 1
+                else "it lost more than it made"
+            )
+            lines.append(
+                f"Profit factor {profit_factor:.2f} — for every $1 lost it earned "
+                f"${profit_factor:.2f}, so {pf_words}."
+            )
+        elif win_pnls:
+            lines.append("No losing trades in this window, so there is no loss to divide against — treat that as too small a sample, not a sure thing.")
+        avg_hold_txt = _human_duration(avg_hold_seconds)
+        if avg_hold_txt:
+            lines.append(f"A typical trade was held about {avg_hold_txt}.")
+        if buy_hold_pct is not None:
+            if vs_bh is not None and vs_bh >= 0:
+                lines.append(
+                    f"Simply holding the coin over the same window would have "
+                    f"returned {buy_hold_pct:.2f}%, so the strategy beat buy & hold "
+                    f"by {vs_bh:.2f} points."
+                )
+            else:
+                lines.append(
+                    f"Simply holding the coin would have returned "
+                    f"{buy_hold_pct:.2f}% — the strategy trailed buy & hold by "
+                    f"{abs(vs_bh):.2f} points, so the extra trading did not pay off "
+                    "here."
+                )
+        lines.append(
+            f"Fees cost ${result.total_fees:,.2f} ({fees_pct_of_start:.2f}% of the "
+            "stake); the worst peak-to-trough dip along the way was "
+            f"{result.max_drawdown_pct:.2f}%."
+        )
+
+    return {
+        "wins": len(win_pnls),
+        "losses": len(loss_pnls),
+        "breakeven": breakeven,
+        "gross_profit": round(gross_profit, 2),
+        "gross_loss": round(gross_loss, 2),
+        "profit_factor": round(profit_factor, 2) if profit_factor is not None else None,
+        "avg_win": round(avg_win, 2),
+        "avg_loss": round(avg_loss, 2),
+        "avg_trade_pnl": round(avg_trade_pnl, 2),
+        "expectancy_pct": round(expectancy_pct, 4),
+        "avg_trade_return_pct": round(avg_trade_return_pct, 4),
+        "largest_win": round(largest_win, 2),
+        "largest_loss": round(largest_loss, 2),
+        "avg_bars_held": round(avg_bars_held, 2),
+        "avg_hold_seconds": avg_hold_seconds,
+        "fees_pct_of_start": round(fees_pct_of_start, 4),
+        "buy_hold_return_pct": round(buy_hold_pct, 2) if buy_hold_pct is not None else None,
+        "vs_buy_hold_pct": round(vs_bh, 2) if vs_bh is not None else None,
+        "beat_buy_hold": (vs_bh is not None and vs_bh >= 0),
+        "profitable": result.total_return_pct > 0,
+        "bars": bars,
+        "explanation": " ".join(lines),
+    }

@@ -46,34 +46,45 @@ import {
 // latest bar), and a countdown shows the time left on the forming candle — the
 // same read-outs a TradingView chart gives you. Colours come from the active
 // theme's CSS variables so it re-themes with the rest of the app.
-// Widen the price series' auto-scale range so it also brackets `levels` — the
-// open position's entry / stop / target. Without this the vertical axis fits
-// only the visible candles, so on a tight timeframe (e.g. 5m, where price has
-// barely moved) a stop or target sitting a few % away falls OFF the top/bottom
-// of the chart and can't be scrolled to. Including the levels keeps them in
-// view on every timeframe. Style/scale only — it never invents a level; it just
-// stretches the window to whatever real numbers were handed in.
+// Gently widen the price series' auto-scale so it also brackets NEARBY `levels`
+// (the open position's entry / stop / target) — but never so far that it squashes
+// the candles. The candles always keep the vertical space first (TradingView-style):
+// a level only pins into the fit while it sits within half the candles' own range
+// of them, so a stop/target a few % away on a zoomed-in 1m chart is NOT forced in
+// (that flattened the candles into a thin strip). A far level stays a drawn line
+// you scroll the price axis up/down to reach — it is not "fixed" into view. Style/
+// scale only — it never invents a level; it just brackets real numbers handed in.
 function extendAutoscale(base: AutoscaleInfo | null, levels: number[]): AutoscaleInfo | null {
-  let lo = Infinity
-  let hi = -Infinity
+  if (!base) {
+    // No candle range yet (data still loading): briefly bracket the levels alone.
+    let lo = Infinity
+    let hi = -Infinity
+    for (const p of levels) {
+      if (Number.isFinite(p) && p > 0) {
+        lo = Math.min(lo, p)
+        hi = Math.max(hi, p)
+      }
+    }
+    return lo === Infinity ? base : { priceRange: { minValue: lo, maxValue: hi } }
+  }
+  const { minValue, maxValue } = base.priceRange
+  const span = maxValue - minValue
+  // How far beyond the candles' own range a level may sit and still be pinned in.
+  // Bounded to half the candle span so the fit can grow at most ~2x (candles keep
+  // ≳50% of the height); span 0 (flat/loading) allows any level through.
+  const pad = span > 0 ? span * 0.5 : Infinity
+  let lo = minValue
+  let hi = maxValue
+  let changed = false
   for (const p of levels) {
-    if (Number.isFinite(p) && p > 0) {
+    if (!Number.isFinite(p) || p <= 0) continue
+    if (p >= minValue - pad && p <= maxValue + pad) {
       lo = Math.min(lo, p)
       hi = Math.max(hi, p)
+      changed = true
     }
   }
-  if (lo === Infinity) return base // no levels to honour → leave the fit untouched
-  if (base) {
-    return {
-      priceRange: {
-        minValue: Math.min(base.priceRange.minValue, lo),
-        maxValue: Math.max(base.priceRange.maxValue, hi),
-      },
-      margins: base.margins,
-    }
-  }
-  // No candle range yet (data still loading): still bracket the levels alone.
-  return { priceRange: { minValue: lo, maxValue: hi } }
+  return changed ? { priceRange: { minValue: lo, maxValue: hi }, margins: base.margins } : base
 }
 
 type Palette = {

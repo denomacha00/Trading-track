@@ -10,6 +10,7 @@ from sqlalchemy import select
 from app.database import SessionLocal
 from app.engine import TradingEngine
 from app.models import PriceAlert, Trade, TradeStatus, _utcnow
+from app.state import load_monitor_interval
 from app.ws import Broadcaster
 
 logger = logging.getLogger(__name__)
@@ -262,7 +263,10 @@ async def monitor_loop(manager, broadcaster: Broadcaster, interval: float = 5.0)
     """Periodically tick every active user's engine and broadcast status.
 
     Runs for the lifetime of the app. Status events carry a ``user_id`` so the
-    WebSocket layer can route each snapshot to the right client.
+    WebSocket layer can route each snapshot to the right client. The tick cadence
+    is read live from the global monitor-interval setting each iteration (clamped
+    to a rate-limit-safe range), so changing it takes effect without a restart;
+    ``interval`` is only the fallback when nothing is stored yet.
     """
     while True:
         try:
@@ -277,4 +281,18 @@ async def monitor_loop(manager, broadcaster: Broadcaster, interval: float = 5.0)
             raise
         except Exception as exc:  # pragma: no cover - keep loop alive
             logger.exception("monitor_loop error: %s", exc)
+        # Read the (clamped) cadence live so the operator can retune responsiveness
+        # without a restart. A read failure just keeps the previous/fallback value.
+        try:
+            interval = await asyncio.to_thread(_current_interval, interval)
+        except Exception:  # pragma: no cover - defensive
+            pass
         await asyncio.sleep(interval)
+
+
+def _current_interval(fallback: float) -> float:
+    db = SessionLocal()
+    try:
+        return load_monitor_interval(db, fallback)
+    finally:
+        db.close()

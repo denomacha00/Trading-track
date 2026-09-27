@@ -104,6 +104,31 @@ class Settings(BaseSettings):
     # winners run. Never loosened.
     trailing_stop_pct: float = Field(default=0.0)
 
+    # ---- PROFIT-LOCK (breakeven+ and early profit-take) --------------
+    # Bank a real gain instead of giving it back. When enabled, once an open long
+    # is in profit by more than the round-trip fee buffer, its stop is ratcheted up
+    # to entry + profit_lock_floor_pct so the trade can no longer turn into a loss
+    # ("breakeven-plus"). This is a ONE-WAY ratchet layered on top of the ATR/fixed
+    # stop and the trailing stop — whichever protects the most is used, never less.
+    # It NEVER fabricates a number: the lock level is entry price × (1 + floor%).
+    profit_lock_enabled: bool = Field(default=False)
+    # Arm the lock once unrealized gain reaches this % of entry. Must be comfortably
+    # above a round trip's fees so locking secures a REAL net gain, not a fee loss.
+    profit_lock_trigger_pct: float = Field(default=1.0)
+    # The locked-in floor: stop is raised to entry × (1 + this %). Kept just above
+    # a round-trip taker fee (~0.2%) so a triggered lock is net-positive after fees.
+    profit_lock_floor_pct: float = Field(default=0.3)
+    # Early profit-take on a reversal: when in profit beyond the fee buffer AND the
+    # brain/saved strategy turns bearish (a "red flag"), close and bank the gain
+    # rather than waiting for the full take-profit. Off by default; the trailing
+    # stop and confident-sell exit still work without it.
+    take_profit_on_reversal: bool = Field(default=False)
+    # Anti-whipsaw: how many consecutive bearish reads confirm a "red flag" before
+    # the early exit fires. 1 = act on the first bearish tick (jumpy); 2 (default)
+    # waits for the reversal to persist so a single noisy tick can't bump you out of
+    # a still-good trade. Only matters when take_profit_on_reversal is on.
+    reversal_confirm_count: int = Field(default=2)
+
     # Account-level max-drawdown KILL-SWITCH (% below the peak total equity seen
     # while running). If equity falls this far from its peak, the engine HALTS:
     # autonomous trading stops and ALL new entries are blocked (open positions
@@ -146,12 +171,43 @@ class Settings(BaseSettings):
     # timeframe is not a buy. Empty = single-timeframe (disabled).
     auto_confirm_timeframe: str = Field(default="")
 
+    # Stand aside in a bad market, step back in when it recovers. When true
+    # (default) an autonomous/saved-strategy BUY is paused while price is in a
+    # bear regime (under a falling long-term trend); entries resume automatically
+    # once the regime turns neutral/bull. This is the visible "stop when bad,
+    # trade when good" behaviour. Protective volatility/shock stand-asides are a
+    # separate hard safety and always apply regardless of this flag.
+    auto_pause_in_bear: bool = Field(default=True)
+
     # Trade with a SAVED, trained strategy instead of the built-in analyzer. When
     # true, for any symbol that has a trained strategy saved to the account the
     # autonomous/observe path uses that strategy's signal as the verdict. Off by
     # default (paper-test a strategy before letting it drive real orders); the
     # capital-preservation gates and risk manager still apply.
     use_saved_strategy: bool = Field(default=False)
+
+    # ---- Saved-strategy VALIDATION GATE ------------------------------
+    # A saved strategy may only DRIVE autonomous BUYS once it has proven itself
+    # on a real backtest. This is the honest answer to "make the strategy correct
+    # and profitable": there is no magic 95%-accuracy number, but we CAN refuse to
+    # trade a strategy that hasn't demonstrated a positive, repeatable edge on
+    # out-of-sample data. When on (default) and use_saved_strategy is enabled, a
+    # strategy whose saved metrics fail the thresholds below is NOT trusted for new
+    # entries — the deterministic analyzer decides instead. A strategy SELL/exit is
+    # never gated (reducing risk is always allowed). Purely a safety gate over REAL
+    # measured metrics; it never invents a win-rate.
+    require_strategy_validation: bool = Field(default=True)
+    # Minimum OUT-OF-SAMPLE return (%) the saved strategy must have scored on its
+    # validation split. Default 0 => it must be net profitable out of sample.
+    strategy_min_return_pct: float = Field(default=0.0)
+    # Minimum win rate (%) on the backtest. 0 disables (win rate alone is a weak,
+    # easily-gamed metric, so it is OFF by default; return + trade count matter more).
+    strategy_min_win_rate_pct: float = Field(default=0.0)
+    # Minimum number of closed trades in the backtest, so a lucky 1-2 trade fluke
+    # can't pass as "validated".
+    strategy_min_trades: int = Field(default=5)
+    # Maximum backtest drawdown (%) allowed. 0 disables the drawdown ceiling.
+    strategy_max_drawdown_pct: float = Field(default=0.0)
 
     # AI trade review (permission gate). When true AND an AI key is configured
     # AND autonomous trading is on, the AI layer reviews each ENTRY the
@@ -160,6 +216,15 @@ class Settings(BaseSettings):
     # is unavailable it falls back to the deterministic decision (never
     # fabricates a veto/approval). Off by default; paper-test before enabling live.
     ai_trade_confirm: bool = Field(default=False)
+
+    # AI PRE-TRADE ANALYSIS (explanatory, opt-in). When true AND an AI key is
+    # configured, before each autonomous ENTRY the AI writes a short, grounded
+    # rationale for the setup (from the real factors + risk rules) so you can see
+    # WHY the bot is buying. It is explanatory only: the deterministic brain still
+    # decides and the risk gates still bind — the AI here never authors or forces a
+    # trade (vetoing is the separate ai_trade_confirm gate). Fails safe: if the AI
+    # is unavailable the entry proceeds on the deterministic decision with no note.
+    ai_pretrade_analysis: bool = Field(default=False)
 
     # Live "loud monitor" (opt-in, OFF by default). When true AND an AI key is
     # configured, the background monitor watches this user's OPEN positions and
@@ -170,6 +235,13 @@ class Settings(BaseSettings):
     # it stays silent. Off by default; the user turns it on when they want the
     # running commentary.
     ai_monitor_enabled: bool = Field(default=False)
+
+    # Background MONITOR cadence (seconds between ticks): how often the engine
+    # re-checks open positions (stops/targets/profit-lock), evaluates alerts, and
+    # runs autonomous analysis. Lower = more responsive but more exchange calls;
+    # a floor is enforced at read time so it can't be set low enough to hit rate
+    # limits. Clamped to [3, 60] by the loop. Default 5s.
+    monitor_interval_seconds: float = Field(default=5.0)
 
     # Assistant AUTOPILOT (opt-in, OFF by default). When true, the safe subset of
     # actions the assistant proposes in chat is APPLIED automatically the moment it

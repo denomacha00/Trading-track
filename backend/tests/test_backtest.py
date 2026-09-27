@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
-from app.backtest import run_backtest
+from app.backtest import run_backtest, summarize_backtest
 from app.strategies import MovingAverageCrossStrategy
 
 
@@ -149,3 +150,54 @@ def test_final_liquidation_pnl_includes_entry_fee():
     assert result.trades[-1].exit_index == len(prices) - 1
     reconciled = sum(t.pnl for t in result.trades)
     assert abs(reconciled - (result.ending_balance - result.starting_balance)) < 1e-6
+
+
+# ---- summarize_backtest: real, explainable analytics (nothing invented) ---
+
+
+def test_summary_reconciles_and_explains_a_real_run():
+    prices = [10, 9, 8, 7, 6, 5, 4, 3, 2, 1] + list(range(2, 40))
+    result = run_backtest(_candles(prices), MovingAverageCrossStrategy(3, 5),
+                          starting_balance=1000, fee_pct=0.1, slippage_pct=0.0)
+    summ = summarize_backtest(result, _candles(prices), timeframe="1h")
+    # Win/loss/breakeven partition the trades exactly (no double counting).
+    assert summ["wins"] + summ["losses"] + summ["breakeven"] == result.num_trades
+    # Gross figures reconcile with the sum of trade P&L.
+    assert summ["gross_profit"] - summ["gross_loss"] == pytest.approx(
+        sum(t.pnl for t in result.trades), abs=0.02
+    )
+    # The explanation is real prose that names the actual trade count.
+    assert str(result.num_trades) in summ["explanation"]
+    assert "buy & hold" in summ["explanation"].lower()
+
+
+def test_summary_profit_factor_null_without_losses():
+    # A run with no losing trade cannot have a profit factor — it must be None
+    # (shown as "-"), never a fabricated ratio or infinity.
+    prices = list(range(1, 40))  # monotonic rise -> the one trade wins
+    result = run_backtest(_candles(prices), MovingAverageCrossStrategy(3, 5),
+                          starting_balance=1000, fee_pct=0.0, slippage_pct=0.0)
+    summ = summarize_backtest(result, _candles(prices), timeframe="1h")
+    if summ["losses"] == 0:
+        assert summ["profit_factor"] is None
+
+
+def test_summary_no_trades_is_honest():
+    prices = [100.0] * 30
+    result = run_backtest(_candles(prices), MovingAverageCrossStrategy(3, 5),
+                          starting_balance=1000)
+    summ = summarize_backtest(result, _candles(prices), timeframe="1h")
+    assert summ["wins"] == 0 and summ["losses"] == 0
+    assert summ["profit_factor"] is None
+    assert "no trades" in summ["explanation"].lower()
+
+
+def test_summary_hold_seconds_none_without_timestamps():
+    # Candles whose timestamps don't advance -> we can't derive a bar size, so
+    # avg_hold_seconds is None (unknown), never a guessed duration.
+    prices = list(range(1, 40))
+    df = _candles(prices)
+    df["timestamp"] = [0] * len(prices)  # no usable spacing
+    result = run_backtest(df, MovingAverageCrossStrategy(3, 5), starting_balance=1000)
+    summ = summarize_backtest(result, df, timeframe="1h")
+    assert summ["avg_hold_seconds"] is None

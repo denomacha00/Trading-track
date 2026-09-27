@@ -25,6 +25,12 @@ from app.models import KeyValue
 SETTINGS_KEY = "settings_overrides"
 PAPER_BALANCE_KEY = "paper_balance"
 STRATEGY_KEY = "strategy_config"
+# The background monitor loop is a single server-wide task shared by all users,
+# so its tick cadence is a GLOBAL value (not per-user): stored unscoped and read
+# live by monitor_loop each iteration. Clamped to a safe range at read time.
+MONITOR_INTERVAL_KEY = "monitor_interval_seconds"
+MONITOR_INTERVAL_MIN = 3.0
+MONITOR_INTERVAL_MAX = 60.0
 
 
 def _scoped(base: str, user_id: Optional[int]) -> str:
@@ -94,6 +100,28 @@ def save_strategy_configs(
     db: Session, configs: dict[str, Any], user_id: Optional[int] = None
 ) -> None:
     kv_set(db, _scoped(STRATEGY_KEY, user_id), configs)
+
+
+def clamp_monitor_interval(seconds: float) -> float:
+    """Clamp a requested monitor cadence into the safe [MIN, MAX] range."""
+    try:
+        s = float(seconds)
+    except (ValueError, TypeError):
+        return MONITOR_INTERVAL_MIN
+    return max(MONITOR_INTERVAL_MIN, min(MONITOR_INTERVAL_MAX, s))
+
+
+def load_monitor_interval(db: Session, default: float = 5.0) -> float:
+    """Global monitor tick cadence (seconds), clamped to the safe range."""
+    val = kv_get(db, MONITOR_INTERVAL_KEY, None)
+    return clamp_monitor_interval(val if val is not None else default)
+
+
+def save_monitor_interval(db: Session, seconds: float) -> float:
+    """Persist the global monitor cadence (clamped). Returns the stored value."""
+    clamped = clamp_monitor_interval(seconds)
+    kv_set(db, MONITOR_INTERVAL_KEY, clamped)
+    return clamped
 
 
 def purge_user_state(db: Session, user_id: int) -> int:

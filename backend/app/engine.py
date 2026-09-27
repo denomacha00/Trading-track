@@ -58,6 +58,15 @@ class TradingEngine:
         # Last autonomous verdict per symbol, so a signal row is logged only when
         # the brain's decision CHANGES (not an identical row every ~5s tick).
         self._last_auto_verdict: dict[str, str] = {}
+        # Last market-regime snapshot per symbol (bull/bear/neutral + whether new
+        # longs are paused and why), for the visible "stand aside in a bad market,
+        # step back in when it's good" status. Updated on each monitor analysis.
+        self._last_regime: dict[str, dict[str, Any]] = {}
+        # Per-open-trade count of CONSECUTIVE bearish reads while in profit, so the
+        # early "red-flag" exit fires only after the reversal persists (anti-whipsaw)
+        # rather than on a single noisy tick. Keyed by trade id; reset when the flag
+        # clears or the trade closes. In-memory: a restart re-arms it harmlessly.
+        self._reversal_flags: dict[int, int] = {}
         # ---- risk-safeguard state (in-memory; reset on restart) ----
         # Peak TOTAL equity (free cash + open-position value) seen so far, for the
         # max-drawdown kill-switch. Seeded on the first drawdown check.
@@ -265,6 +274,57 @@ class TradingEngine:
         """True when price is under a falling long-term EMA — no new longs."""
         return any(f.name == "regime" and f.signal == "sell" for f in analysis.factors)
 
+    def _validate_saved_strategy(self, cfg: dict) -> tuple[bool, str, dict]:
+        """Judge whether a saved strategy has earned the right to drive new BUYS.
+
+        Uses ONLY the real metrics recorded when the strategy was trained/backtested
+        — out-of-sample validation return, win rate, trade count, drawdown — against
+        the operator's thresholds. Returns ``(ok, reason, detail)``. It never invents
+        a number: if the metrics are missing (or lack an out-of-sample split) the
+        gate fails CLOSED with a clear reason, because an unproven strategy has not
+        earned real money's trust. This is the honest stand-in for "make it 95%
+        correct": we can't promise accuracy, but we can refuse to auto-trade a
+        strategy that hasn't demonstrated a positive, out-of-sample edge.
+        """
+        metrics = (cfg or {}).get("metrics")
+        if not isinstance(metrics, dict) or not metrics:
+            return False, "no backtest metrics yet — retrain to validate", {}
+        s = self.settings
+        oos = metrics.get("validation_return_pct")
+        in_sample_only = oos is None
+        return_pct = float(
+            oos if oos is not None else (metrics.get("total_return_pct", 0.0) or 0.0)
+        )
+        win_rate = float(metrics.get("win_rate_pct", 0.0) or 0.0)
+        num_trades = int(metrics.get("num_trades", 0) or 0)
+        drawdown = float(metrics.get("max_drawdown_pct", 0.0) or 0.0)
+        detail = {
+            "return_pct": round(return_pct, 2),
+            "return_basis": "in-sample only" if in_sample_only else "out-of-sample",
+            "win_rate_pct": round(win_rate, 2),
+            "num_trades": num_trades,
+            "max_drawdown_pct": round(drawdown, 2),
+            "overfit_gap_pct": metrics.get("overfit_gap_pct"),
+        }
+        fails: list[str] = []
+        min_return = getattr(s, "strategy_min_return_pct", 0.0) or 0.0
+        if return_pct <= min_return:
+            basis = "in-sample " if in_sample_only else "out-of-sample "
+            fails.append(f"{basis}return {return_pct:+.1f}% ≤ required {min_return:.1f}%")
+        min_trades = getattr(s, "strategy_min_trades", 0) or 0
+        if num_trades < min_trades:
+            fails.append(f"only {num_trades} trades (need ≥ {min_trades})")
+        min_wr = getattr(s, "strategy_min_win_rate_pct", 0.0) or 0.0
+        if min_wr > 0 and win_rate < min_wr:
+            fails.append(f"win rate {win_rate:.0f}% < required {min_wr:.0f}%")
+        max_dd = getattr(s, "strategy_max_drawdown_pct", 0.0) or 0.0
+        if max_dd > 0 and drawdown > max_dd:
+            fails.append(f"drawdown {drawdown:.0f}% > allowed {max_dd:.0f}%")
+        if in_sample_only:
+            fails.append("no out-of-sample validation (retrain to produce one)")
+        ok = not fails
+        return ok, ("validated" if ok else "; ".join(fails)), detail
+
     def _apply_saved_strategy(self, symbol: str, df, analysis):
         """Let the user's SAVED strategy own the verdict when they've opted in.
 
@@ -289,13 +349,26 @@ class TradingEngine:
         reason = getattr(sig, "reason", "") or ""
         label = f"Saved {cfg['strategy']} strategy"
         if action == "buy":
-            if self._protective_hold(analysis) or self._bear_regime(analysis):
+            pause_bear = getattr(self.settings, "auto_pause_in_bear", True)
+            if self._protective_hold(analysis) or (pause_bear and self._bear_regime(analysis)):
                 analysis.verdict = "hold"
                 analysis.summary = (
                     f"{label} signalled BUY, but standing aside to protect "
                     f"capital: {analysis.summary}"
                 )
                 return analysis
+            # Validation gate: a saved strategy only earns the right to drive a
+            # NEW long once its real backtest metrics clear the operator's bar.
+            # Unvalidated -> defer to the deterministic analyzer verdict rather
+            # than trade on an unproven edge. A SELL/exit is never gated.
+            if getattr(self.settings, "require_strategy_validation", True):
+                ok_val, why, _detail = self._validate_saved_strategy(cfg)
+                if not ok_val:
+                    analysis.summary = (
+                        f"{label} signalled BUY but is not validated ({why}); "
+                        f"deferring to analyzer: {analysis.summary}"
+                    )
+                    return analysis
             analysis.verdict = "buy"
             analysis.confidence = 1.0
         elif action == "sell":
@@ -1420,6 +1493,7 @@ class TradingEngine:
                     f"checks resumed."
                 )
             self._maybe_trail_stop(db, trade, price)
+            self._maybe_lock_profit(db, trade, price)
             hit: str | None = None
             if trade.side == "buy":
                 if trade.stop_loss and price <= trade.stop_loss:
@@ -1431,7 +1505,13 @@ class TradingEngine:
                     hit = "stop-loss"
                 elif trade.take_profit and price <= trade.take_profit:
                     hit = "take-profit"
+            if hit is None and self._should_take_profit_on_reversal(db, trade, price):
+                hit = "reversal"
             if hit:
+                reason = (
+                    "banked profit on confirmed reversal"
+                    if hit == "reversal" else f"{hit} triggered"
+                )
                 with self._lock:
                     # Re-read under the lock: a manual close (on a different DB
                     # session) may have closed this trade between our SELECT and
@@ -1439,7 +1519,8 @@ class TradingEngine:
                     db.refresh(trade)
                     if trade.status != TradeStatus.open.value:
                         continue
-                    ok, _msg, _t = self._close_trade(db, trade, f"{hit} triggered")
+                    ok, _msg, _t = self._close_trade(db, trade, reason)
+                self._reversal_flags.pop(trade.id, None)
                 if ok:
                     closed.append((trade, hit))
         return closed
@@ -1473,7 +1554,115 @@ class TradingEngine:
                 {"id": trade.id, "symbol": trade.symbol, "stop_loss": candidate},
             )
 
-    # ---- autonomous analysis-driven trading --------------------------
+    def _round_trip_fee_pct(self) -> float:
+        """Approximate round-trip cost (%) of a trade: taker fee on entry + exit.
+
+        Used only as an internal SAFETY FLOOR so profit-lock never "banks" a gain
+        thinner than the fees that would erase it. When no paper fee is configured
+        we fall back to ~0.1%/leg (typical Binance spot taker) — a conservative
+        estimate for the floor, never a figure shown to the user as if measured.
+        """
+        try:
+            fee = float(getattr(self.settings, "paper_taker_fee_pct", 0.0) or 0.0)
+        except (ValueError, TypeError):
+            fee = 0.0
+        if fee <= 0:
+            fee = 0.1
+        return fee * 2.0
+
+    def _maybe_lock_profit(self, db: Session, trade: Trade, price: float) -> None:
+        """Bank a winning long early by ratcheting the stop into profit.
+
+        The autopilot profit-taking asked for: once an open long is up by at least
+        ``profit_lock_trigger_pct`` (and by more than round-trip fees, so the exit
+        is genuinely net-positive), raise the stop to a small profit floor above
+        entry. A later "red-flag" pullback then closes the trade in the green
+        instead of giving the gain back. Raise-only, never above the live price;
+        on LIVE the exchange-side stop is moved too (cancel + replace). Longs only.
+
+        This does NOT withdraw to a bank: a closed live trade realizes to USDT in
+        the Binance spot wallet (real, spendable) — as far as an API key without
+        withdrawal permission can, or should, go.
+        """
+        if not getattr(self.settings, "profit_lock_enabled", False) or trade.side != "buy":
+            return
+        entry = float(trade.entry_price or 0)
+        if entry <= 0 or price <= 0:
+            return
+        gain_pct = (price - entry) / entry * 100.0
+        trigger = max(
+            float(getattr(self.settings, "profit_lock_trigger_pct", 1.0) or 0.0),
+            self._round_trip_fee_pct(),
+        )
+        if gain_pct < trigger:
+            return
+        # Lock a floor that is net-positive after fees, and never at/above price.
+        floor_pct = max(
+            float(getattr(self.settings, "profit_lock_floor_pct", 0.3) or 0.0),
+            self._round_trip_fee_pct(),
+        )
+        candidate = entry * (1 + floor_pct / 100.0)
+        if candidate >= price:
+            return
+        if trade.stop_loss is not None and candidate <= float(trade.stop_loss):
+            return  # existing stop is already at least this protective
+        trade.stop_loss = candidate
+        if self.settings.is_live:
+            if trade.stop_order_id:
+                self.connector.cancel_order(trade.stop_order_id, trade.symbol)
+                trade.stop_order_id = None
+            new_stop = self.connector.create_stop_loss_order(
+                trade.symbol, "sell", trade.amount, candidate
+            )
+            if new_stop:
+                trade.stop_order_id = str(new_stop.get("id"))
+        db.commit()
+        self._emit(
+            "profit_locked",
+            {"id": trade.id, "symbol": trade.symbol, "stop_loss": candidate,
+             "locked_pct": round(floor_pct, 3)},
+        )
+        self._notify(
+            f"🔒 {trade.symbol}: up {gain_pct:.2f}% — stop raised to lock in "
+            f"~{floor_pct:.2f}% ({candidate:g}). A pullback now banks the gain."
+        )
+
+    def _should_take_profit_on_reversal(self, db: Session, trade: Trade, price: float) -> bool:
+        """True when a NET-POSITIVE long should be banked because the read flipped
+        bearish and STAYED bearish long enough to confirm (anti-whipsaw).
+
+        The active half of the profit-take, built for a hands-off operator: even
+        before the locked stop is hit, if the position is genuinely in profit
+        (after round-trip fees) and a fresh analysis turns bearish for
+        ``reversal_confirm_count`` reads in a row (the confirmed "red flag"), close
+        now to keep the gain. It only ever sells a WINNER — a dip into a loss is
+        left to the stop, never realized early — and a single noisy bearish tick is
+        ignored. Opt-in via ``take_profit_on_reversal``; longs only. On exit the
+        proceeds (stake + net gain) land back as USDT, ready to re-enter on the next
+        good signal (a winning exit has no re-entry cooldown).
+        """
+        if not getattr(self.settings, "take_profit_on_reversal", False) or trade.side != "buy":
+            return False
+        notional = float(trade.entry_price or 0) * float(trade.amount or 0)
+        if notional <= 0:
+            return False
+        net = self.unrealized_pnl(trade, price) - notional * self._round_trip_fee_pct() / 100.0
+        if net <= 0:
+            self._reversal_flags.pop(trade.id, None)  # not a net winner -> reset streak
+            return False
+        try:
+            analysis = self.analyze_symbol(
+                trade.symbol, self.settings.auto_timeframe or "1h", apply_strategy=True
+            )
+        except Exception:
+            return False  # can't read -> don't force an exit
+        if getattr(analysis, "verdict", "hold") != "sell":
+            self._reversal_flags.pop(trade.id, None)  # red flag cleared -> reset streak
+            return False
+        need = max(1, int(getattr(self.settings, "reversal_confirm_count", 2) or 1))
+        seen = self._reversal_flags.get(trade.id, 0) + 1
+        self._reversal_flags[trade.id] = seen
+        return seen >= need
 
     def analyze_symbol(
         self, symbol: str, timeframe: str = "1h", limit: int = 200,
@@ -1513,6 +1702,7 @@ class TradingEngine:
             analysis = self.analyze_symbol(symbol, timeframe, apply_strategy=True)
         except Exception as exc:
             return False, f"analysis failed for {symbol}: {exc}"
+        self._record_regime(symbol, analysis)
         ok, msg = self._decide_and_act(db, symbol, timeframe, analysis)
         # Persist the brain's OWN verdict (deduped on change) so the Signals tab
         # shows an honest timeline of autonomous decisions, not just TradingView
@@ -1576,12 +1766,27 @@ class TradingEngine:
                 proceed, reason = self.ai.confirm_trade(analysis)
                 if not proceed:
                     return False, f"{symbol}: {reason}"
+            # Explanatory AI pre-trade rationale (opt-in, fails safe). Never decides
+            # or blocks — it just says WHY in plain language for a hands-off user.
+            note = f"auto: {analysis.summary}"
+            if getattr(self.settings, "ai_pretrade_analysis", False) and self.ai.available:
+                try:
+                    rationale = self.ai.pretrade_analysis(analysis)
+                except Exception:
+                    rationale = ""
+                if rationale:
+                    note = f"auto: {rationale}"
+                    self._emit("pretrade_analysis", {
+                        "symbol": symbol.upper(),
+                        "text": rationale,
+                        "confidence": round(analysis.confidence, 3),
+                    })
             # Use an ATR-floored stop so a fixed % stop can't sit inside noise;
             # execute_signal sizes the position against this real stop distance.
             ok, msg, _ = self.execute_signal(
                 db, action="buy", symbol=symbol, amount=None,
                 stop_loss=self._atr_floored_stop(analysis), take_profit=None,
-                source="auto", note=f"auto: {analysis.summary}",
+                source="auto", note=note,
             )
             return ok, msg
         # sell verdict: close a long if we hold one, else stand aside.
@@ -1661,6 +1866,7 @@ class TradingEngine:
             analysis = self.analyze_symbol(symbol, timeframe, apply_strategy=True)
         except Exception as exc:
             return False, f"analysis failed for {symbol}: {exc}"
+        self._record_regime(symbol, analysis)
         try:
             self._log_auto_verdict(
                 db, symbol.upper(), analysis, False,
@@ -1669,6 +1875,35 @@ class TradingEngine:
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("verdict logging failed for %s: %s", symbol, exc)
         return True, f"{symbol}: {analysis.verdict} ({analysis.confidence:.0%}) observed"
+
+    def _record_regime(self, symbol: str, analysis) -> None:
+        """Snapshot the market regime for a symbol so status() can SHOW the bot
+        standing aside in a bad market and re-engaging in a good one — the visible
+        pause/resume the user asked for. Pure observation of the analyzer's own
+        regime factor and protective holds; nothing here is fabricated.
+        """
+        regime, detail = "neutral", ""
+        for f in getattr(analysis, "factors", []):
+            if f.name == "regime":
+                regime = {"sell": "bear", "buy": "bull"}.get(f.signal, "neutral")
+                detail = getattr(f, "detail", "") or ""
+                break
+        protective = self._protective_hold(analysis)
+        pause_bear = getattr(self.settings, "auto_pause_in_bear", True)
+        # A new long is stood aside here iff the analyzer is protecting capital, or
+        # we're in a bear regime AND the operator opted to pause in bears.
+        paused = protective or (regime == "bear" and pause_bear)
+        try:
+            self._last_regime[symbol.upper()] = {
+                "regime": regime,
+                "detail": detail,
+                "protective_hold": protective,
+                "entries_paused": paused,
+                "verdict": getattr(analysis, "verdict", "hold"),
+                "at": _utcnow().isoformat(),
+            }
+        except Exception:  # pragma: no cover - never let bookkeeping break trading
+            pass
 
     # ---- status ------------------------------------------------------
 
@@ -1707,6 +1942,19 @@ class TradingEngine:
             )
         )
         balance = self._equity(db)
+        # Circuit-breaker / pause visibility (honest runtime state, not settings).
+        max_streak = int(getattr(self.settings, "max_consecutive_losses", 0) or 0)
+        try:
+            streak = self._consecutive_losses(db)
+        except Exception:
+            streak = 0
+        entries_paused, pause_reason = False, None
+        if self._killswitch_tripped:
+            entries_paused, pause_reason = True, "drawdown kill-switch tripped"
+        elif max_streak > 0 and streak >= max_streak:
+            entries_paused, pause_reason = True, f"{streak} consecutive losses (circuit breaker)"
+        elif not self.running:
+            entries_paused, pause_reason = True, "bot stopped — new entries halted"
         return {
             "running": self.running,
             "trading_mode": self.settings.trading_mode,
@@ -1724,4 +1972,13 @@ class TradingEngine:
             "killswitch": self._killswitch_tripped,
             "max_drawdown_pct": getattr(self.settings, "max_drawdown_pct", 0.0),
             "peak_equity": round(self._peak_equity, 2),
+            # Autopilot / pause-resume visibility.
+            "auto_trade_enabled": bool(getattr(self.settings, "auto_trade_enabled", False)),
+            "consecutive_losses": streak,
+            "max_consecutive_losses": max_streak,
+            "entries_paused": entries_paused,
+            "entries_pause_reason": pause_reason,
+            # Per-symbol regime snapshots (bull/bear/neutral + whether new longs are
+            # stood aside there). Empty until the monitor has analysed each symbol.
+            "regimes": dict(self._last_regime),
         }

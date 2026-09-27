@@ -606,6 +606,28 @@ function Dashboard({
         speak(d.text)
         if (d.kind === 'alert') refreshAlerts()
       }
+      if (m.event === 'profit_locked') {
+        // The bot ratcheted an open winner's stop up INTO profit. It's fee-aware:
+        // it never locks a gain thinner than the round-trip fee, so the secured
+        // level is genuinely net-positive. Refresh trades so the raised stop shows.
+        refreshTrades()
+        showToast(
+          'ok',
+          `Profit locked on ${m.data.symbol}: stop raised to ${fmt(m.data.stop_loss)} ` +
+            `(≈+${fmt(m.data.locked_pct)}% secured above entry)`,
+        )
+      }
+      if (m.event === 'pretrade_analysis') {
+        // A grounded, plain-language rationale the AI wrote BEFORE an autonomous
+        // entry. It explains the deterministic analyzer's own decision — it never
+        // authors a number and can't force or veto a trade on its own.
+        const d = m.data
+        setTurns((t) =>
+          [...t, { role: 'ai', text: d.text, live: true, ts: Date.now() } as ChatMsg].slice(-200),
+        )
+        showToast('ok', `Pre-trade check — ${d.symbol}`)
+        speak(d.text)
+      }
     },
   })
 
@@ -2470,6 +2492,31 @@ function BotPulse({
         </span>
         {status?.testnet && <span className="badge">testnet</span>}
         <span className={`badge ${auto ? 'on' : 'off'}`}>auto {auto ? 'on' : 'off'}</span>
+        {status?.killswitch && (
+          <span
+            className="badge off"
+            title="Auto-entries are halted: the max-drawdown safety limit was hit. Exits still run."
+          >
+            ⛔ drawdown halt
+          </span>
+        )}
+        {status?.entries_paused && !status?.killswitch && (
+          <span
+            className="badge off"
+            title={status?.entries_pause_reason ?? 'New entries are paused; exits still run.'}
+          >
+            ⏸ entries paused
+          </span>
+        )}
+        {(status?.consecutive_losses ?? 0) > 0 && (
+          <span
+            className="bp-meta"
+            title="Consecutive losing trades. Auto-entries halt when this reaches the max below."
+          >
+            losses in a row: {status?.consecutive_losses}
+            {status?.max_consecutive_losses ? ` / ${status.max_consecutive_losses}` : ''}
+          </span>
+        )}
         <span className="bp-sep" />
         <span className="bp-meta">Open positions: {status?.open_positions ?? 0}</span>
         <span className="bp-sep" />
@@ -2496,6 +2543,21 @@ function BotPulse({
         )}
       </div>
       <div className="bp-explain">{explain}</div>
+      {status?.regimes && Object.keys(status.regimes).length > 0 && (
+        <div className="bp-regime" style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+          <span className="bp-k">Market regime</span>
+          {Object.entries(status.regimes).map(([sym, r]) => (
+            <span
+              key={sym}
+              className={`badge ${r.regime === 'bull' ? 'on' : r.regime === 'bear' ? 'off' : ''}`}
+              title={`${r.detail}${r.entries_paused ? ' — new entries paused' : ''} (as of ${ago(+new Date(r.at))})`}
+            >
+              {sym}: {r.regime}
+              {r.entries_paused ? ' ⏸' : ''}
+            </span>
+          ))}
+        </div>
+      )}
     </section>
   )
 }
@@ -3943,6 +4005,83 @@ function BacktestPanel({
             trailing {fmt(result.trailing_stop_pct ?? 0)}% — so these numbers reflect how the
             bot would actually trade, not buy-and-hold.
           </p>
+          {(result.explanation || result.analytics?.explanation) && (
+            <div
+              className="card"
+              style={{
+                marginTop: 12,
+                padding: 12,
+                background: 'var(--panel-2, rgba(255,255,255,0.03))',
+                borderRadius: 8,
+                lineHeight: 1.5,
+              }}
+            >
+              <div className="label" style={{ marginBottom: 4, opacity: 0.7 }}>
+                What this means
+              </div>
+              {result.explanation || result.analytics?.explanation}
+            </div>
+          )}
+          {result.analytics && result.num_trades > 0 && (
+            <div className="stats cols-3" style={{ marginTop: 12 }}>
+              <div className="stat">
+                <div className="label">Profit factor</div>
+                {/* null when there were no losing trades — shown as "-", never a
+                    fabricated ratio or infinity. */}
+                <div className="value">
+                  {result.analytics.profit_factor == null
+                    ? '-'
+                    : fmt(result.analytics.profit_factor)}
+                </div>
+              </div>
+              <div className="stat">
+                <div className="label">Avg win / loss</div>
+                <div className="value">
+                  <span className="pos">{fmt(result.analytics.avg_win)}</span>
+                  {' / '}
+                  <span className="neg">{fmt(result.analytics.avg_loss)}</span>
+                </div>
+              </div>
+              <div className="stat">
+                <div className="label">Expectancy / trade</div>
+                <div
+                  className={`value ${result.analytics.avg_trade_pnl >= 0 ? 'pos' : 'neg'}`}
+                >
+                  {fmt(result.analytics.avg_trade_pnl)}
+                </div>
+              </div>
+              <div className="stat">
+                <div className="label">Largest win / loss</div>
+                <div className="value">
+                  <span className="pos">{fmt(result.analytics.largest_win)}</span>
+                  {' / '}
+                  <span className="neg">{fmt(result.analytics.largest_loss)}</span>
+                </div>
+              </div>
+              <div className="stat">
+                <div className="label">Avg hold</div>
+                <div className="value">{fmtHold(result.analytics.avg_hold_seconds)}</div>
+              </div>
+              <div className="stat">
+                <div className="label">vs Buy &amp; hold</div>
+                {/* Did the trading beat simply owning the coin over the same window? */}
+                <div
+                  className={`value ${result.analytics.beat_buy_hold ? 'pos' : 'neg'}`}
+                  title={
+                    result.analytics.buy_hold_return_pct == null
+                      ? undefined
+                      : `Buy & hold returned ${fmt(result.analytics.buy_hold_return_pct)}%`
+                  }
+                >
+                  {result.analytics.vs_buy_hold_pct == null
+                    ? '-'
+                    : `${result.analytics.vs_buy_hold_pct >= 0 ? '+' : ''}${fmt(
+                        result.analytics.vs_buy_hold_pct,
+                      )} pts`}
+                </div>
+              </div>
+            </div>
+          )}
           {result.equity_curve.length > 1 && (
             <div style={{ marginTop: 12 }}>
               <EquitySparkline values={result.equity_curve} />
@@ -4205,6 +4344,7 @@ function SavedStrategiesCard({
                   <th className="mono">Win %</th>
                   <th className="mono">Max DD %</th>
                   <th>Trained</th>
+                  <th>Auto-trade</th>
                   <th></th>
                 </tr>
               </thead>
@@ -4233,6 +4373,30 @@ function SavedStrategiesCard({
                     </td>
                     <td className="mono" style={{ whiteSpace: 'nowrap' }}>
                       {s.trained_at ? new Date(s.trained_at).toLocaleDateString() : '—'}
+                    </td>
+                    <td>
+                      {/* Real validation verdict from the backend — never a
+                          fabricated "pass". Green only when this strategy will
+                          actually drive an autonomous BUY; otherwise the honest
+                          reason (gate not passed, or the master toggle is off). */}
+                      {!s.validation ? (
+                        <span className="hint">—</span>
+                      ) : s.validation.will_auto_trade ? (
+                        <span className="badge on" title={s.validation.reason}>
+                          ✓ auto-trades
+                        </span>
+                      ) : !s.validation.use_saved_strategy ? (
+                        <span
+                          className="badge"
+                          title="Turn on 'Trade with my saved strategies' in Settings to let this drive trades."
+                        >
+                          saved-strategy off
+                        </span>
+                      ) : (
+                        <span className="badge off" title={s.validation.reason}>
+                          ⚠ won't auto-trade
+                        </span>
+                      )}
                     </td>
                     <td>
                       <button
@@ -4385,6 +4549,19 @@ function SettingsPanel({
         ai_trade_confirm: form.ai_trade_confirm,
         ai_monitor_enabled: form.ai_monitor_enabled,
         ai_autopilot_enabled: form.ai_autopilot_enabled,
+        ai_pretrade_analysis: form.ai_pretrade_analysis,
+        auto_pause_in_bear: form.auto_pause_in_bear,
+        require_strategy_validation: form.require_strategy_validation,
+        strategy_min_return_pct: form.strategy_min_return_pct,
+        strategy_min_win_rate_pct: form.strategy_min_win_rate_pct,
+        strategy_min_trades: form.strategy_min_trades,
+        strategy_max_drawdown_pct: form.strategy_max_drawdown_pct,
+        profit_lock_enabled: form.profit_lock_enabled,
+        profit_lock_trigger_pct: form.profit_lock_trigger_pct,
+        profit_lock_floor_pct: form.profit_lock_floor_pct,
+        take_profit_on_reversal: form.take_profit_on_reversal,
+        reversal_confirm_count: form.reversal_confirm_count,
+        monitor_interval_seconds: form.monitor_interval_seconds,
       })
       onSaved(saved)
     } catch (e) {
@@ -4624,6 +4801,24 @@ function SettingsPanel({
       <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <input
           type="checkbox"
+          checked={form.ai_pretrade_analysis}
+          onChange={(e) => setForm({ ...form, ai_pretrade_analysis: e.target.checked })}
+          disabled={!form.ai_enabled}
+        />
+        AI pre-trade explanation (plain-language rationale before each entry)
+      </label>
+      <p className="hint">
+        When on, and only while autonomous trading is on, the AI writes a short,
+        grounded note <b>explaining why</b> the analyzer is about to enter — in
+        words a first-time trader can follow. It explains the deterministic
+        decision; it <b>never invents a number, sizes a trade, or overrides a risk
+        gate</b>, and if the AI is unavailable the trade still proceeds on the
+        analyzer's own decision. You'll see it in the assistant feed.{' '}
+        {form.ai_enabled ? '' : 'Add an AI key (Credentials) to enable this.'}
+      </p>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
           checked={form.use_saved_strategy}
           onChange={(e) => setForm({ ...form, use_saved_strategy: e.target.checked })}
         />
@@ -4636,6 +4831,63 @@ function SettingsPanel({
         regime or a volatility shock, while its <b>SELL/exit is always honoured</b>.
         Symbols with no saved strategy fall back to the analyzer brain.
       </p>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={form.require_strategy_validation}
+          onChange={(e) =>
+            setForm({ ...form, require_strategy_validation: e.target.checked })
+          }
+        />
+        Only auto-trade a strategy that PASSED a real backtest (recommended)
+      </label>
+      <p className="hint">
+        The honest version of "make it 95% accurate": we never fabricate an
+        accuracy number. Instead, a saved strategy only earns the right to open a{' '}
+        <b>new</b> long once its <b>real out-of-sample</b> backtest clears the
+        thresholds below. Unproven ⇒ the bot defers to its built-in analyzer
+        instead of trading an untested edge. A <b>SELL/exit is never gated</b>.
+      </p>
+      {form.require_strategy_validation && (
+        <div className="row">
+          <div className="field">
+            <label>Min out-of-sample return %</label>
+            <NumField
+              className="input"
+              value={form.strategy_min_return_pct}
+              onChange={setNum('strategy_min_return_pct')}
+              inputMode="decimal"
+            />
+          </div>
+          <div className="field">
+            <label>Min win rate %</label>
+            <NumField
+              className="input"
+              value={form.strategy_min_win_rate_pct}
+              onChange={setNum('strategy_min_win_rate_pct')}
+              inputMode="decimal"
+            />
+          </div>
+          <div className="field">
+            <label>Min trades (sample size)</label>
+            <NumField
+              className="input"
+              value={form.strategy_min_trades}
+              onChange={setNum('strategy_min_trades')}
+              inputMode="numeric"
+            />
+          </div>
+          <div className="field">
+            <label>Max drawdown % allowed</label>
+            <NumField
+              className="input"
+              value={form.strategy_max_drawdown_pct}
+              onChange={setNum('strategy_max_drawdown_pct')}
+              inputMode="decimal"
+            />
+          </div>
+        </div>
+      )}
       <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <input
           type="checkbox"
@@ -4675,6 +4927,107 @@ function SettingsPanel({
         your explicit confirmation. Every outcome shown is the real result of the
         action, never a claim.{' '}
         {form.ai_enabled ? '' : 'Add an AI key (Credentials) to enable this.'}
+      </p>
+
+      <div className="panel-head" style={{ paddingLeft: 0, borderBottom: 'none' }}>
+        Capital preservation &amp; profit-taking (hands-off safety)
+      </div>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={form.auto_pause_in_bear}
+          onChange={(e) => setForm({ ...form, auto_pause_in_bear: e.target.checked })}
+        />
+        Stand aside in a bear market (pause NEW entries, resume in a bull)
+      </label>
+      <p className="hint">
+        The safe default. When price is in a confirmed downtrend the bot stops
+        opening <b>new</b> longs and waits for the market to turn back up —
+        protecting your capital instead of buying a falling knife. It never blocks
+        an <b>exit</b>. You'll see the current regime and whether entries are paused
+        on the dashboard.
+      </p>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={form.profit_lock_enabled}
+          onChange={(e) => setForm({ ...form, profit_lock_enabled: e.target.checked })}
+        />
+        Lock in profit as a winner runs (ratchet the stop up into the green)
+      </label>
+      <p className="hint">
+        Once an open long is up by the <b>trigger %</b>, the bot raises its stop to
+        sit <b>floor %</b> above your entry, so a winner can't hand all its gains
+        back. You don't need to do any fee math: the bot <b>automatically</b> keeps
+        the locked level above round-trip fees, so it can never secure a level that
+        would actually be a loss. Keep trigger larger than floor.
+      </p>
+      {form.profit_lock_enabled && (
+        <div className="row">
+          <div className="field">
+            <label>Arm after up % (trigger)</label>
+            <NumField
+              className="input"
+              value={form.profit_lock_trigger_pct}
+              onChange={setNum('profit_lock_trigger_pct')}
+              inputMode="decimal"
+            />
+          </div>
+          <div className="field">
+            <label>Lock floor above entry %</label>
+            <NumField
+              className="input"
+              value={form.profit_lock_floor_pct}
+              onChange={setNum('profit_lock_floor_pct')}
+              inputMode="decimal"
+            />
+          </div>
+        </div>
+      )}
+      {/* REVERSAL_AND_CADENCE_MARKER */}
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={form.take_profit_on_reversal}
+          onChange={(e) =>
+            setForm({ ...form, take_profit_on_reversal: e.target.checked })
+          }
+        />
+        Bank a winner early if the trend flips against it (reversal exit)
+      </label>
+      <p className="hint">
+        <b>OFF (default) = "let it finish":</b> a trade runs to its stop or target,
+        never sold early. <b>ON:</b> if a position is a <b>real net winner</b> (after
+        fees) and the read turns bearish <b>and stays bearish</b> for the number of
+        checks below, the bot banks the gain rather than watching it evaporate. The
+        confirmation count is anti-whipsaw — one red blip won't trigger it, and it{' '}
+        <b>never</b> sells a position that isn't actually in profit.
+      </p>
+      {form.take_profit_on_reversal && (
+        <div className="field" style={{ maxWidth: 280 }}>
+          <label>Bearish checks required to exit (anti-whipsaw)</label>
+          <NumField
+            className="input"
+            value={form.reversal_confirm_count}
+            onChange={setNum('reversal_confirm_count')}
+            inputMode="numeric"
+          />
+        </div>
+      )}
+      <div className="field" style={{ maxWidth: 280 }}>
+        <label>Monitor check interval (seconds)</label>
+        <NumField
+          className="input"
+          value={form.monitor_interval_seconds}
+          onChange={setNum('monitor_interval_seconds')}
+          inputMode="numeric"
+        />
+      </div>
+      <p className="hint">
+        How often the background monitor re-checks prices, your positions, and the
+        autopilot rules above. The server keeps this between <b>3 and 60 seconds</b>{' '}
+        to stay well within exchange rate limits — lower is more responsive, higher
+        is gentler. This is a single shared cadence for the whole bot.
       </p>
       <p className="hint">
         Trailing stop ratchets an open long's stop-loss upward as price rises to
