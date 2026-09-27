@@ -20,11 +20,13 @@ import {
   type Time,
 } from 'lightweight-charts'
 import type { Candle } from './types'
+import type { IctAnalysis, IctZone } from './types'
 import type { Theme } from './theme'
 import { sma, ema, bollinger, vwap, rsi, macd, type IndicatorPrefs, type LinePoint } from './indicators'
 import { volumeProfile, type VolumeProfile } from './volumeProfile'
 import { priceDecimals, fmtPrice, priceMinMove } from './priceFormat'
 import type { ChartMarker } from './chartMarkers'
+import { DEFAULT_ICT_OVERLAYS, ICT_COLORS, type IctOverlayPrefs } from './ictOverlays'
 import {
   loadDrawings,
   saveDrawings,
@@ -215,6 +217,8 @@ export function PriceChart({
   indicators,
   markers,
   clearSignal,
+  ict,
+  ictOverlays,
 }: {
   candles: Candle[]
   theme: Theme
@@ -251,6 +255,12 @@ export function PriceChart({
   // drawings" command). A change in value is the trigger; the initial value is a
   // no-op so mounting never clears the user's saved drawings.
   clearSignal?: number
+  // The REAL, computed ICT / smart-money read for this symbol/timeframe (from
+  // /api/analyze), or null when ICT is off / thin data / the read errored. The
+  // chart draws only what's actually here — never a fabricated level.
+  ict?: IctAnalysis | null
+  // Which ICT overlays to draw. Undefined = the module defaults.
+  ictOverlays?: IctOverlayPrefs
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -317,6 +327,10 @@ export function PriceChart({
   // profile repaints in step with pans/zooms and theme flips.
   const vpRef = useRef<VolumeProfile | null>(null)
   const vpOnRef = useRef<boolean>(false)
+  // The ICT read + which overlays to draw, mirrored into refs so the primitive's
+  // canvas renderer reads the latest synchronously (like the drawings/VP refs).
+  const ictRef = useRef<IctAnalysis | null>(null)
+  const ictPrefsRef = useRef<IctOverlayPrefs>(DEFAULT_ICT_OVERLAYS)
   // Persistence bookkeeping: which symbol|timeframe is currently loaded, and a
   // one-shot flag so the load itself doesn't immediately re-save.
   const loadedKeyRef = useRef<string>('')
@@ -488,6 +502,211 @@ export function PriceChart({
       }
       ctx.restore()
     }
+    // Paint the computed ICT / smart-money read (see app/ict.py). Every layer is
+    // gated by a toggle and drawn ONLY from real computed levels — nothing here is
+    // invented. Zones extend to the right edge (they stay relevant until price
+    // mitigates them); mitigated zones are drawn faint and unlabelled so the live
+    // structure stands out. Drawn under the user's own drawings.
+    const renderIct = (ctx: CanvasRenderingContext2D, width: number) => {
+      const a = ictRef.current
+      const prefs = ictPrefsRef.current
+      const s = seriesRef.current
+      const c = chartRef.current
+      const pal = paletteRef.current
+      if (!a || !s || !c || !pal) return
+      const ts = c.timeScale()
+      const yOf = (price: number) => s.priceToCoordinate(price)
+      const xOf = (time: number | null) => (time == null ? null : ts.timeToCoordinate(time as Time))
+      const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v))
+      // Outlined text reads on any candle/background and in both themes.
+      const label = (x: number, y: number, text: string, color: string, align: CanvasTextAlign = 'left') => {
+        ctx.save()
+        ctx.font = '10px system-ui, -apple-system, sans-serif'
+        ctx.textAlign = align
+        ctx.textBaseline = 'middle'
+        ctx.lineJoin = 'round'
+        ctx.lineWidth = 3
+        ctx.strokeStyle = pal.bg
+        ctx.strokeText(text, x, y)
+        ctx.fillStyle = color
+        ctx.fillText(text, x, y)
+        ctx.restore()
+      }
+      const hline = (price: number, color: string, dash: number[], w: number, tag?: string) => {
+        const y = yOf(price)
+        if (y == null) return
+        ctx.save()
+        ctx.strokeStyle = color
+        ctx.lineWidth = w
+        ctx.setLineDash(dash)
+        strokeSeg(ctx, 0, y, width, y)
+        ctx.setLineDash([])
+        ctx.restore()
+        if (tag) label(width - 4, y, tag, color, 'right')
+      }
+      const zoneTag = (z: IctZone): string => {
+        switch (z.subtype) {
+          case 'order-block': return 'OB'
+          case 'fvg': return z.void ? 'FVG•void' : z.inverted ? 'iFVG' : 'FVG'
+          case 'breaker': return 'BRK'
+          case 'rejection': return 'REJ'
+          case 'bpr': return 'BPR'
+          case 'volume-imbalance': return 'VI'
+          default: return ''
+        }
+      }
+      const drawZone = (z: IctZone) => {
+        const yTop = yOf(z.top)
+        const yBot = yOf(z.bottom)
+        if (yTop == null || yBot == null) return
+        const xc = xOf(z.time)
+        const x0 = xc == null ? 0 : clamp(xc, 0, width)
+        const top = Math.min(yTop, yBot)
+        const h = Math.max(1, Math.abs(yBot - yTop))
+        const col = z.kind === 'bullish' ? ICT_COLORS.bull : ICT_COLORS.bear
+        ctx.save()
+        ctx.fillStyle = col
+        ctx.globalAlpha = z.mitigated ? 0.05 : 0.13
+        ctx.fillRect(x0, top, Math.max(0, width - x0), h)
+        ctx.globalAlpha = 1
+        if (!z.mitigated) {
+          ctx.strokeStyle = col
+          ctx.lineWidth = 1
+          ctx.setLineDash(z.inverted ? [3, 3] : [])
+          ctx.strokeRect(x0 + 0.5, top + 0.5, Math.max(0, width - x0 - 1), Math.max(1, h - 1))
+          ctx.setLineDash([])
+          if (h >= 12) label(x0 + 4, top + 7, zoneTag(z), col)
+        }
+        ctx.restore()
+      }
+
+      ctx.save()
+      // Dealing range: shade premium (red) above equilibrium and discount (green)
+      // below, mark the 50% equilibrium, the range extremes, and the OTE bands.
+      const dr = a.dealing_range
+      if (prefs.dealingRange && dr) {
+        const yHi = yOf(dr.high)
+        const yLo = yOf(dr.low)
+        const yEq = yOf(dr.equilibrium)
+        if (yHi != null && yLo != null && yEq != null) {
+          ctx.save()
+          ctx.globalAlpha = 0.05
+          ctx.fillStyle = ICT_COLORS.bear
+          ctx.fillRect(0, Math.min(yHi, yEq), width, Math.abs(yEq - yHi))
+          ctx.fillStyle = ICT_COLORS.bull
+          ctx.fillRect(0, Math.min(yEq, yLo), width, Math.abs(yLo - yEq))
+          ctx.globalAlpha = 1
+          ctx.restore()
+          // OTE (0.62–0.79) — the classic optimal-trade-entry retracement band.
+          const oteBand = (band: [number, number], col: string) => {
+            const y1 = yOf(band[0])
+            const y2 = yOf(band[1])
+            if (y1 == null || y2 == null) return
+            ctx.save()
+            ctx.globalAlpha = 0.14
+            ctx.fillStyle = col
+            ctx.fillRect(0, Math.min(y1, y2), width, Math.max(1, Math.abs(y2 - y1)))
+            ctx.globalAlpha = 1
+            ctx.restore()
+          }
+          oteBand(dr.ote_discount, ICT_COLORS.bull)
+          oteBand(dr.ote_premium, ICT_COLORS.bear)
+          hline(dr.equilibrium, ICT_COLORS.equilibrium, [2, 3], 1, 'EQ 50%')
+          hline(dr.high, ICT_COLORS.equilibrium, [1, 4], 1, 'range H')
+          hline(dr.low, ICT_COLORS.equilibrium, [1, 4], 1, 'range L')
+        }
+      }
+
+      // Prior day/week highs & lows — major draws on liquidity.
+      if (prefs.keyLevels && a.key_levels) {
+        const kl = a.key_levels
+        if (kl.pdh != null) hline(kl.pdh, ICT_COLORS.keyLevel, [6, 3], 1, 'PDH')
+        if (kl.pdl != null) hline(kl.pdl, ICT_COLORS.keyLevel, [6, 3], 1, 'PDL')
+        if (kl.pwh != null) hline(kl.pwh, ICT_COLORS.keyLevel, [2, 2], 1, 'PWH')
+        if (kl.pwl != null) hline(kl.pwl, ICT_COLORS.keyLevel, [2, 2], 1, 'PWL')
+      }
+      // Resting liquidity pools (unswept), with EQH/EQL called out. The nearest
+      // unswept pool above/below is the "draw on liquidity" — flag it stronger.
+      if (prefs.liquidity) {
+        const drawAbove = a.draw_on_liquidity?.above ?? null
+        const drawBelow = a.draw_on_liquidity?.below ?? null
+        for (const pool of a.liquidity) {
+          if (pool.swept) continue
+          const isDraw =
+            (drawAbove != null && pool.index === drawAbove.index && pool.price === drawAbove.price) ||
+            (drawBelow != null && pool.index === drawBelow.index && pool.price === drawBelow.price)
+          const tag = pool.equal
+            ? pool.kind === 'buy-side' ? 'EQH' : 'EQL'
+            : isDraw ? (pool.kind === 'buy-side' ? 'draw↑' : 'draw↓') : undefined
+          hline(pool.price, ICT_COLORS.liquidity, isDraw ? [] : [2, 3], isDraw ? 1.5 : 1, tag)
+        }
+      }
+
+      // Zones (drawn least → most significant so the key ones sit on top).
+      if (prefs.volumeImbalance) for (const z of a.volume_imbalances) drawZone(z)
+      if (prefs.bpr) for (const z of a.bpr) drawZone(z)
+      if (prefs.rejection) for (const z of a.rejection_blocks) drawZone(z)
+      if (prefs.breakers) for (const z of a.breakers) drawZone(z)
+      if (prefs.fvg) for (const z of a.fvgs) drawZone(z)
+      if (prefs.orderBlocks) for (const z of a.order_blocks) drawZone(z)
+      // Liquidity sweeps (stop hunts): a wick past the level that closed back in.
+      if (prefs.sweeps) {
+        for (const sw of a.sweeps) {
+          const x = xOf(sw.time)
+          const yLvl = yOf(sw.level)
+          const yExt = yOf(sw.extreme)
+          if (x == null || yLvl == null || yExt == null) continue
+          ctx.save()
+          ctx.strokeStyle = ICT_COLORS.sweep
+          ctx.lineWidth = 1.5
+          strokeSeg(ctx, x, yLvl, x, yExt)
+          ctx.fillStyle = ICT_COLORS.sweep
+          ctx.beginPath()
+          ctx.arc(x, yExt, 2.5, 0, Math.PI * 2)
+          ctx.fill()
+          ctx.restore()
+          label(x + 4, yExt, sw.side === 'buy-side' ? 'BSL✕' : 'SSL✕', ICT_COLORS.sweep)
+        }
+      }
+
+      // Structure: BOS (continuation) / CHoCH (reversal); CHoCH + displacement = MSS.
+      if (prefs.structure) {
+        for (const ev of a.events) {
+          const y = yOf(ev.level)
+          if (y == null) continue
+          const xc = xOf(ev.time)
+          const x1 = xc == null ? width : clamp(xc, 0, width)
+          const col = ev.direction === 'bull' ? ICT_COLORS.bull : ICT_COLORS.bear
+          ctx.save()
+          ctx.strokeStyle = col
+          ctx.lineWidth = 1
+          ctx.setLineDash([4, 2])
+          strokeSeg(ctx, Math.max(0, x1 - 52), y, Math.min(width, x1 + 6), y)
+          ctx.setLineDash([])
+          ctx.restore()
+          const name = ev.kind === 'CHoCH' && ev.displacement ? 'MSS' : ev.kind
+          label(Math.min(width - 2, x1 + 8), y, name, col)
+        }
+      }
+
+      // Confirmed swing pivots (fractals) — the skeleton structure is built from.
+      if (prefs.swings) {
+        for (const swg of a.swings) {
+          const x = xOf(swg.time)
+          const y = yOf(swg.price)
+          if (x == null || y == null) continue
+          ctx.save()
+          ctx.fillStyle = pal.text
+          ctx.globalAlpha = 0.7
+          ctx.beginPath()
+          ctx.arc(x, y, 2, 0, Math.PI * 2)
+          ctx.fill()
+          ctx.restore()
+        }
+      }
+
+      ctx.restore()
+    }
     // Paint every saved drawing (plus the in-progress preview) onto the price
     // pane each frame, projecting data anchors to pixels through the live scales
     // so lines stay pinned to their bar/price as the chart pans and zooms.
@@ -561,6 +780,7 @@ export function PriceChart({
       draw: (target) => {
         target.useMediaCoordinateSpace(({ context, mediaSize }) => {
           renderVolumeProfile(context, mediaSize.width)
+          renderIct(context, mediaSize.width)
           renderDrawings(context, mediaSize.width)
         })
       },
@@ -1015,6 +1235,16 @@ export function PriceChart({
     drawViewRef.current?.requestUpdate()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [candles, indKey])
+
+  // Feed the computed ICT read + the per-overlay toggles to the canvas layer and
+  // repaint. We only stash refs (the pane renderer reads them each frame) so a
+  // new analysis or a toggle flip redraws without rebuilding the chart. null ict
+  // or all-off prefs simply draws nothing — honest empty, never a fake level.
+  useEffect(() => {
+    ictRef.current = ict ?? null
+    ictPrefsRef.current = ictOverlays ?? DEFAULT_ICT_OVERLAYS
+    drawViewRef.current?.requestUpdate()
+  }, [ict, ictOverlays])
 
   // price and time-synced to it (pan/zoom price and the panes follow). Every
   // value is real math on the same candles — RSI(14) with 70/30 guides, MACD

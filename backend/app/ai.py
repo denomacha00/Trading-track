@@ -236,10 +236,17 @@ _ACTION_GUIDE = (
     "when the operator asks you to show a symbol, switch timeframe, add/remove an "
     "indicator, or wipe the hand-drawn lines. Indicator keys (true=show, false=hide): "
     "ema9, ema21, sma50, sma200, bb, vwap, rsi, macd, volume, volumeProfile. "
-    "Timeframes: 1m,5m,15m,1h,4h,1d. To UNDO your last chart change when they ask, "
+    "Timeframes: 1m,5m,15m,1h,4h,1d. You can ALSO toggle the ICT / smart-money "
+    'overlays with an optional "ict" object (true=show, false=hide), e.g. '
+    '{"type":"chart","ict":{"orderBlocks":true,"fvg":true,"dealingRange":true},'
+    '"reason":"..."}. ICT keys: swings, structure (BOS/CHoCH/MSS), sweeps, '
+    "orderBlocks, fvg, breakers, rejection, bpr, volumeImbalance, liquidity, "
+    "dealingRange (premium/discount + OTE), keyLevels (PDH/PDL/PWH/PWL). These only "
+    "SHOW levels the bot already computed on closed bars — you never invent one, and "
+    "it moves no money. To UNDO your last chart change when they ask, "
     'send {"type":"chart","undo":true} — that steps the view back one change. One '
     "caution to state honestly: clearing drawings deletes them, so undo restores the "
-    "view (symbol/timeframe/indicators) but cannot bring wiped drawings back.\n"
+    "view (symbol/timeframe/indicators/ICT) but cannot bring wiped drawings back.\n"
     "The tag is hidden from the user, so keep your sentence before it self-contained."
 )
 

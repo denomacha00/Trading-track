@@ -1,8 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent as ReactKeyboardEvent, type SetStateAction } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type Dispatch, type KeyboardEvent as ReactKeyboardEvent, type SetStateAction } from 'react'
 import { api, setToken, getToken, setAuthFailureHandler } from './api'
 import { PriceChart, TF_SECONDS } from './PriceChart'
 import { TradingViewChart } from './TradingViewChart'
 import { DEFAULT_INDICATORS, type IndicatorPrefs } from './indicators'
+import {
+  ICT_OVERLAY_GROUPS,
+  allIctOverlays,
+  anyIctOverlayOn,
+  ictOverlayCount,
+  loadIctOverlays,
+  mergeIctOverlays,
+  saveIctOverlays,
+  type IctOverlayPrefs,
+} from './ictOverlays'
 import { tradesToMarkers } from './chartMarkers'
 import { loadTurns, saveTurns } from './chatHistory'
 import { useBinanceStream } from './useBinanceStream'
@@ -11,7 +21,7 @@ import { Admin } from './Admin'
 import { useSocket } from './useSocket'
 import { useTheme, type Theme } from './theme'
 import { ThemeToggle } from './ThemeToggle'
-import type { AiHealth, Alert, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
+import type { AiHealth, Alert, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, IctAnalysis, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -258,6 +268,14 @@ function Dashboard({
     }
     return DEFAULT_INDICATORS
   })
+  // Which ICT / smart-money overlays are switched on (persisted like the layout).
+  // The chart draws only the layers turned on here, and only from levels the
+  // backend actually computed — a toggle reveals a real layer, never fakes one.
+  const [ictOverlays, setIctOverlays] = useState<IctOverlayPrefs>(() => loadIctOverlays())
+  // The latest computed ICT read for the charted symbol/timeframe (from the
+  // analyze endpoint), or null when ICT is off, thin, or the fetch failed. Fed to
+  // the chart for drawing and to the ICT menu's live count. Never fabricated.
+  const [ictRead, setIctRead] = useState<IctAnalysis | null>(null)
   // Trade arrows (buy/sell markers on the exact bars where your OWN trades opened
   // and closed) are OFF by default — they can crowd the chart — and shown on
   // demand via the "Trades" toggle. Remembered like the other chart prefs.
@@ -270,7 +288,7 @@ function Dashboard({
   const [chartClearSignal, setChartClearSignal] = useState(0)
   // View-history for the assistant's chart commands, so "undo" steps the chart
   // back one change. Each entry is the view as it was BEFORE a change we applied.
-  const chartUndoRef = useRef<{ symbol: string; timeframe: string; indicators: IndicatorPrefs }[]>([])
+  const chartUndoRef = useRef<{ symbol: string; timeframe: string; indicators: IndicatorPrefs; ictOverlays: IctOverlayPrefs }[]>([])
   // "Watch the bot think": when ON, each autonomous verdict briefly drives the
   // chart to the symbol it just decided on and lights up the indicators for the
   // REAL factors behind that call — so you can SEE why it acted — then it
@@ -305,8 +323,39 @@ function Dashboard({
     localStorage.setItem('tt.indicators', JSON.stringify(indicators))
   }, [indicators])
   useEffect(() => {
+    saveIctOverlays(ictOverlays)
+  }, [ictOverlays])
+  useEffect(() => {
     localStorage.setItem('tt.showTradeMarkers', showTradeMarkers ? '1' : '0')
   }, [showTradeMarkers])
+  // Keep the chart's ICT read fresh: whenever ICT is enabled in settings, at least
+  // one overlay is on, and we're on our own real-data chart, pull the computed read
+  // for the charted symbol/timeframe and re-poll every 30s (the analyzer works on
+  // CLOSED bars, so there's nothing to gain from faster polling). Off, thin, or a
+  // failed fetch all resolve to null — the chart then draws no ICT rather than
+  // anything stale or invented. Aborts in flight on symbol/timeframe/toggle change.
+  useEffect(() => {
+    const wantIct = !!settings?.ict_enabled && anyIctOverlayOn(ictOverlays) && chartView === 'bot'
+    if (!wantIct) {
+      setIctRead(null)
+      return
+    }
+    let alive = true
+    const pull = async () => {
+      try {
+        const res = await api.analyze(symbol, timeframe)
+        if (alive) setIctRead(res.ict ?? null)
+      } catch {
+        if (alive) setIctRead(null)
+      }
+    }
+    pull()
+    const id = setInterval(pull, 30000)
+    return () => {
+      alive = false
+      clearInterval(id)
+    }
+  }, [settings?.ict_enabled, ictOverlays, chartView, symbol, timeframe])
   // Apply a VIEW-ONLY chart command from the assistant (switch symbol/timeframe,
   // toggle indicators, clear drawings — or step back one change on `undo`). It only
   // ever changes what the operator is LOOKING AT; it moves no money and calls no
@@ -318,6 +367,7 @@ function Dashboard({
     symbol?: string
     timeframe?: string
     indicators?: Partial<IndicatorPrefs>
+    ict?: Partial<IctOverlayPrefs>
     clear_drawings?: boolean
     undo?: boolean
   }): string => {
@@ -327,6 +377,7 @@ function Dashboard({
       setSymbol(prev.symbol)
       setTimeframe(prev.timeframe)
       setIndicators(prev.indicators)
+      setIctOverlays(prev.ictOverlays)
       if (chartView !== 'bot') setChartView('bot')
       const on = Object.entries(prev.indicators).filter(([, v]) => v).map(([k]) => k).join(', ')
       return `Reverted the chart to ${prev.symbol} · ${prev.timeframe}${on ? ` · ${on}` : ''}.`
@@ -335,12 +386,13 @@ function Dashboard({
     const viewChanges =
       (!!c.symbol && c.symbol !== symbol) ||
       (!!c.timeframe && c.timeframe !== timeframe) ||
-      (!!c.indicators && Object.keys(c.indicators).length > 0)
+      (!!c.indicators && Object.keys(c.indicators).length > 0) ||
+      (!!c.ict && Object.keys(c.ict).length > 0)
     // Snapshot the CURRENT view before a view change so `undo` can restore it.
     // Clearing drawings is destructive and NOT snapshotted — undo can't un-delete
     // drawings (and the assistant is told to say so).
     if (viewChanges) {
-      chartUndoRef.current.push({ symbol, timeframe, indicators })
+      chartUndoRef.current.push({ symbol, timeframe, indicators, ictOverlays })
       if (chartUndoRef.current.length > 25) chartUndoRef.current.shift()
     }
     if (c.symbol && c.symbol !== symbol) {
@@ -358,6 +410,14 @@ function Dashboard({
       const hidden = Object.entries(inds).filter(([, v]) => v === false).map(([k]) => k)
       if (shown.length) parts.push(`show ${shown.join(', ')}`)
       if (hidden.length) parts.push(`hide ${hidden.join(', ')}`)
+    }
+    if (c.ict && Object.keys(c.ict).length > 0) {
+      const patch = c.ict
+      setIctOverlays((cur) => mergeIctOverlays(cur, patch))
+      const shown = Object.entries(patch).filter(([, v]) => v === true).map(([k]) => k)
+      const hidden = Object.entries(patch).filter(([, v]) => v === false).map(([k]) => k)
+      if (shown.length) parts.push(`ICT show ${shown.join(', ')}`)
+      if (hidden.length) parts.push(`ICT hide ${hidden.join(', ')}`)
     }
     if (c.clear_drawings) {
       setChartClearSignal((n) => n + 1)
@@ -1247,6 +1307,9 @@ function Dashboard({
                 {chartView === 'bot' && (
                   <IndicatorsMenu value={indicators} onChange={setIndicators} />
                 )}
+                {chartView === 'bot' && settings?.ict_enabled && (
+                  <IctMenu value={ictOverlays} onChange={setIctOverlays} />
+                )}
                 {chartView === 'bot' && (
                   <div className="chart-view-toggle" role="group" aria-label="Trade arrows">
                     <button
@@ -1382,6 +1445,8 @@ function Dashboard({
                   timeframe={timeframe}
                   priceLines={chartPriceLines}
                   indicators={indicators}
+                  ict={ictRead}
+                  ictOverlays={ictOverlays}
                   markers={showTradeMarkers ? chartMarkers : []}
                   clearSignal={chartClearSignal}
                 />
@@ -2092,6 +2157,78 @@ function IndicatorsMenu({
               Clear all
             </button>
           )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function IctMenu({
+  value,
+  onChange,
+}: {
+  value: IctOverlayPrefs
+  onChange: (v: IctOverlayPrefs) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDoc)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+  const count = ictOverlayCount(value)
+  return (
+    <div className="ind-menu" ref={ref}>
+      <button
+        type="button"
+        className="ind-btn"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="true"
+        aria-expanded={open}
+        title="Show real ICT / smart-money reads on the chart (structure, liquidity, order blocks, FVGs, premium/discount). Drawn only from levels the bot actually computes."
+      >
+        ICT{count ? ` (${count})` : ''}
+        <span className="ind-caret">▾</span>
+      </button>
+      {open && (
+        <div className="ind-panel" style={{ maxHeight: '60vh', overflowY: 'auto', minWidth: 260 }}>
+          <div className="row" style={{ gap: 6, padding: '2px 4px 6px' }}>
+            <button type="button" className="ind-clear" style={{ flex: 1 }} onClick={() => onChange(allIctOverlays(true))}>
+              All on
+            </button>
+            <button type="button" className="ind-clear" style={{ flex: 1 }} onClick={() => onChange(allIctOverlays(false))}>
+              All off
+            </button>
+          </div>
+          {ICT_OVERLAY_GROUPS.map((g) => (
+            <div key={g.title}>
+              <div className="ind-group">{g.title}</div>
+              {g.items.map((d) => (
+                <label key={d.key} className="ind-row" style={{ alignItems: 'flex-start' }} title={d.desc}>
+                  <input
+                    type="checkbox"
+                    checked={value[d.key]}
+                    onChange={(e) => onChange({ ...value, [d.key]: e.target.checked })}
+                  />
+                  <span style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                    <span className="ind-label">{d.label}</span>
+                    <span style={{ fontSize: 11, opacity: 0.6, lineHeight: 1.25 }}>{d.desc}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          ))}
         </div>
       )}
     </div>
@@ -3235,6 +3372,7 @@ function AssistantPanel({
     symbol?: string
     timeframe?: string
     indicators?: Partial<IndicatorPrefs>
+    ict?: Partial<IctOverlayPrefs>
     clear_drawings?: boolean
     undo?: boolean
   }) => string
@@ -3373,6 +3511,12 @@ function AssistantPanel({
         if (shown.length) lines.push(`Show: ${shown.join(', ')}`)
         if (hidden.length) lines.push(`Hide: ${hidden.join(', ')}`)
       }
+      if (a.ict && Object.keys(a.ict).length) {
+        const shown = Object.entries(a.ict).filter(([, v]) => v === true).map(([k]) => k)
+        const hidden = Object.entries(a.ict).filter(([, v]) => v === false).map(([k]) => k)
+        if (shown.length) lines.push(`ICT show: ${shown.join(', ')}`)
+        if (hidden.length) lines.push(`ICT hide: ${hidden.join(', ')}`)
+      }
       if (a.clear_drawings) lines.push('Clear all drawings (can’t be undone).')
       lines.push('View only — shows things, moves no money.')
       return { title: 'Update the chart', lines, danger: false }
@@ -3437,6 +3581,7 @@ function AssistantPanel({
           symbol: action.symbol,
           timeframe: action.timeframe,
           indicators: action.indicators,
+          ict: action.ict,
           clear_drawings: action.clear_drawings,
           undo: action.undo,
         })
@@ -3775,6 +3920,126 @@ function NewsPanel({ onError }: { onError: (msg: string) => void }) {
   )
 }
 
+// A compact, honest read-out of the computed ICT analysis (mirrors what the chart
+// draws). Every number is the analyzer's real output; empty sections are simply
+// omitted rather than shown as zero. Beginner-facing labels explain each concept.
+function IctReadCard({ ict }: { ict: IctAnalysis }) {
+  const f = (n: number | null | undefined): string => {
+    if (n == null || !Number.isFinite(n)) return '—'
+    const abs = Math.abs(n)
+    const dp = abs >= 1000 ? 2 : abs >= 1 ? 4 : 6
+    return n.toLocaleString(undefined, { maximumFractionDigits: dp })
+  }
+  const biasClass = ict.bias === 'bullish' ? 'pos' : ict.bias === 'bearish' ? 'neg' : ''
+  const dr = ict.dealing_range
+  const kl = ict.key_levels
+  const dol = ict.draw_on_liquidity
+  // Live (unmitigated / unswept) counts — what still matters on the chart now.
+  const zoneCount = (zs: { mitigated: boolean }[]) => zs.filter((z) => !z.mitigated).length
+  const chips: { label: string; n: number; title: string }[] = [
+    { label: 'Order blocks', n: zoneCount(ict.order_blocks), title: 'Supply/demand origins of an impulsive move.' },
+    { label: 'FVGs', n: zoneCount(ict.fvgs), title: 'Three-candle imbalances price often returns to fill.' },
+    { label: 'Breakers', n: zoneCount(ict.breakers), title: 'Order blocks price violated, so their role flipped.' },
+    { label: 'Rejection', n: zoneCount(ict.rejection_blocks), title: 'Long-wick swing candles — the wick did the rejecting.' },
+    { label: 'BPR', n: zoneCount(ict.bpr), title: 'Overlap of a bullish and bearish FVG — a strong band.' },
+    { label: 'Vol. imbalance', n: zoneCount(ict.volume_imbalances), title: 'Body gaps between candles whose wicks still overlap.' },
+  ].filter((c) => c.n > 0)
+  const recentEvents = ict.events.slice(-3).reverse()
+  const recentSweeps = ict.sweeps.slice(-3).reverse()
+  const box: CSSProperties = {
+    marginTop: 10,
+    border: '1px solid rgba(127,127,127,0.25)',
+    borderRadius: 8,
+    padding: 12,
+  }
+  const row: CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 6 }
+  return (
+    <div style={box}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
+        <strong>ICT read</strong>
+        <span className={`verdict ${biasClass}`} style={{ fontWeight: 700 }}>
+          {ict.bias.toUpperCase()}
+        </span>
+        <span className="hint">trend {ict.trend}</span>
+      </div>
+      {ict.summary && <p style={{ marginTop: 6 }}>{ict.summary}</p>}
+      {dr && (
+        <div style={row}>
+          <span className="hint" title="Where price sits in the current dealing range. Discount = cheaper half (look for longs); premium = dearer half (look for shorts).">
+            Range: <strong className={dr.zone === 'discount' ? 'pos' : dr.zone === 'premium' ? 'neg' : ''}>{dr.zone}</strong>
+            {' '}({Math.round(dr.position_pct * 100)}% · EQ {f(dr.equilibrium)})
+            {dr.in_ote ? ' · in OTE' : ''}
+          </span>
+        </div>
+      )}
+      {recentEvents.length > 0 && (
+        <div style={row}>
+          {recentEvents.map((ev, i) => {
+            const name = ev.kind === 'CHoCH' && ev.displacement ? 'MSS' : ev.kind
+            return (
+              <span
+                key={`ev${i}`}
+                className={`think-chip ${ev.direction === 'bull' ? 'buy' : 'sell'}`}
+                title={
+                  ev.kind === 'BOS'
+                    ? 'Break of structure — trend continuation.'
+                    : ev.displacement
+                    ? 'Market-structure shift — a change of character with a strong (displacement) move.'
+                    : 'Change of character — a possible trend reversal.'
+                }
+              >
+                {name} {ev.direction === 'bull' ? '▲' : '▼'} {f(ev.level)}
+              </span>
+            )
+          })}
+        </div>
+      )}
+      {recentSweeps.length > 0 && (
+        <div style={row}>
+          {recentSweeps.map((sw, i) => (
+            <span
+              key={`sw${i}`}
+              className="think-chip"
+              title="Liquidity sweep (stop hunt): price ran stops past a level, then closed back inside."
+            >
+              {sw.side === 'buy-side' ? 'BSL✕' : 'SSL✕'} {f(sw.level)}
+            </span>
+          ))}
+        </div>
+      )}
+      {chips.length > 0 && (
+        <div style={row}>
+          {chips.map((c) => (
+            <span key={c.label} className="think-chip" title={c.title}>
+              {c.label}: {c.n}
+            </span>
+          ))}
+        </div>
+      )}
+      {(dol?.above || dol?.below) && (
+        <div style={row}>
+          <span className="hint" title="The nearest unswept pool of resting orders price tends to be drawn toward.">
+            Draw on liquidity:
+            {dol?.above ? ` ↑ ${f(dol.above.price)}` : ''}
+            {dol?.below ? ` ↓ ${f(dol.below.price)}` : ''}
+          </span>
+        </div>
+      )}
+      {kl && (kl.pdh != null || kl.pdl != null || kl.pwh != null || kl.pwl != null) && (
+        <div style={row}>
+          <span className="hint" title="Prior day/week highs & lows — major liquidity draws.">
+            Key levels:
+            {kl.pdh != null ? ` PDH ${f(kl.pdh)}` : ''}
+            {kl.pdl != null ? ` · PDL ${f(kl.pdl)}` : ''}
+            {kl.pwh != null ? ` · PWH ${f(kl.pwh)}` : ''}
+            {kl.pwl != null ? ` · PWL ${f(kl.pwl)}` : ''}
+          </span>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function AnalyzePanel({
   symbol,
   timeframe,
@@ -3905,6 +4170,15 @@ function AnalyzePanel({
               ))}
             </tbody>
           </table>
+          {analysis.ict ? (
+            <IctReadCard ict={analysis.ict} />
+          ) : analysis.ict_enabled === false ? (
+            <p className="hint" style={{ marginTop: 10 }}>
+              ICT / smart-money read is off — turn it on in Settings to see market
+              structure, liquidity, order blocks, FVGs and premium/discount here and
+              on the chart.
+            </p>
+          ) : null}
         </div>
       )}
 
@@ -4626,6 +4900,7 @@ function SettingsPanel({
         ai_monitor_enabled: form.ai_monitor_enabled,
         ai_autopilot_enabled: form.ai_autopilot_enabled,
         ai_pretrade_analysis: form.ai_pretrade_analysis,
+        ict_enabled: form.ict_enabled,
         auto_pause_in_bear: form.auto_pause_in_bear,
         require_strategy_validation: form.require_strategy_validation,
         strategy_min_return_pct: form.strategy_min_return_pct,
@@ -4906,6 +5181,24 @@ function SettingsPanel({
         gate</b>, and if the AI is unavailable the trade still proceeds on the
         analyzer's own decision. You'll see it in the assistant feed.{' '}
         {form.ai_enabled ? '' : 'Add an AI key (Credentials) to enable this.'}
+      </p>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={form.ict_enabled}
+          onChange={(e) => setForm({ ...form, ict_enabled: e.target.checked })}
+        />
+        ICT / smart-money read (structure, liquidity, order blocks, FVGs, premium/discount)
+      </label>
+      <p className="hint">
+        When on, the bot computes a full ICT read on the same <b>closed</b> candles —
+        market structure (BOS / CHoCH / MSS), liquidity sweeps, order blocks,
+        fair-value gaps, breaker &amp; rejection blocks, and the premium/discount
+        dealing range with its OTE band. You can draw these on the chart (the{' '}
+        <b>ICT</b> menu above it), read them in <b>Analyze</b>, and the assistant can
+        apply them for you. It's a deterministic analytical <b>lens</b> — real math,
+        no repainting, never a fabricated level — <b>not</b> an auto-trader, and it
+        works whether or not an AI key is set.
       </p>
       <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <input

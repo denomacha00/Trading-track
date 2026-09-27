@@ -1841,6 +1841,15 @@ _AI_CHART_INDICATORS = {
     "rsi", "macd", "volume", "volumeProfile",
 }
 _AI_CHART_TIMEFRAMES = {"1m", "5m", "15m", "1h", "4h", "1d"}
+# The ICT / smart-money overlay keys the assistant may toggle on the chart. These
+# mirror the frontend's IctOverlayPrefs (see ictOverlays.ts) exactly; anything else
+# is dropped. Toggling an overlay only VIEWS a level the analyzer already computed —
+# it never fabricates one, moves money, or touches account state, so it's as
+# autopilot-safe as an indicator toggle.
+_AI_CHART_ICT = {
+    "swings", "structure", "sweeps", "orderBlocks", "fvg", "breakers",
+    "rejection", "bpr", "volumeImbalance", "liquidity", "dealingRange", "keyLevels",
+}
 
 
 def _coerce_bool(v) -> bool | None:
@@ -2032,6 +2041,18 @@ def _normalize_proposed_action(raw: dict | None, engine) -> dict | None:
                             inds[key] = b
                 if inds:
                     out["indicators"] = inds
+                    changed = True
+            ict_in = raw.get("ict")
+            if isinstance(ict_in, dict):
+                ict_patch: dict = {}
+                for k, v in ict_in.items():
+                    key = str(k).strip()
+                    if key in _AI_CHART_ICT:
+                        b = _coerce_bool(v)
+                        if b is not None:
+                            ict_patch[key] = b
+                if ict_patch:
+                    out["ict"] = ict_patch
                     changed = True
             if _coerce_bool(raw.get("clear_drawings")):
                 out["clear_drawings"] = True

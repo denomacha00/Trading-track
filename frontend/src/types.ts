@@ -1,6 +1,7 @@
 // Shared types mirroring the backend schemas.
 
 import type { IndicatorPrefs } from './indicators'
+import type { IctOverlayPrefs } from './ictOverlays'
 
 // Per-symbol market-regime snapshot the bot publishes so the UI can SHOW it
 // standing aside in a bad market and re-engaging in a good one (the visible
@@ -150,6 +151,10 @@ export type ProposedAction =
       symbol?: string
       timeframe?: string
       indicators?: Partial<IndicatorPrefs>
+      // Which ICT / smart-money overlays to show (true) or hide (false). Same
+      // view-only nature as `indicators`: it only changes what's drawn, never
+      // money or account state. Only the keys that change are sent.
+      ict?: Partial<IctOverlayPrefs>
       clear_drawings?: boolean
       undo?: boolean
       reason?: string | null
@@ -204,6 +209,11 @@ export interface Settings {
   ai_enabled: boolean
   ai_model?: string
   ai_style?: string
+  // ICT / smart-money read. When on, every Analyze also computes a REAL ICT read
+  // (market structure, liquidity, order blocks, FVGs, premium/discount) on the
+  // same closed bars, and the chart can draw it. It is an analytical LENS only —
+  // it never sizes, places, or vetoes a trade. On by default.
+  ict_enabled: boolean
   // ---- Autopilot safety / pause-resume (safe defaults for non-traders) ----
   // Stand aside for NEW longs while price is in a bear regime; resume in a bull.
   // On by default — capital preservation is the safe stance.
@@ -513,6 +523,109 @@ export interface MarketAnalysis {
   narration?: string
   assessment?: string
   ai_enabled?: boolean
+  // A REAL, computed ICT / smart-money read on the same closed bars (present when
+  // ICT is enabled and there were enough bars). `null` when the engine declined
+  // (thin data) or the read errored; `ict_enabled` tells the UI which state it's
+  // in. Never fabricated — every level here is computed from real candles.
+  ict?: IctAnalysis | null
+  ict_enabled?: boolean
+}
+
+// ---- ICT / smart-money read (mirrors backend app/ict.py `as_dict()`) --------
+// Everything here is COMPUTED from real closed candles — no fabricated levels.
+// `time` is unix SECONDS (for the chart) or null when the frame carried no
+// timestamps. Prices are absolute.
+
+export interface IctSwing {
+  index: number
+  time: number | null
+  price: number
+  kind: 'high' | 'low'
+}
+
+export interface IctStructureEvent {
+  index: number // bar whose CLOSE broke the level
+  time: number | null
+  kind: 'BOS' | 'CHoCH' // CHoCH + displacement => an MSS
+  direction: 'bull' | 'bear'
+  level: number // the swing price that was broken
+  from_index: number
+  displacement: boolean
+}
+
+export interface IctSweep {
+  index: number
+  time: number | null
+  side: 'buy-side' | 'sell-side' // which liquidity pool was swept
+  level: number // the swept swing level
+  extreme: number // the wick extreme that ran the stops
+  reaction: 'bull' | 'bear' // implied follow-through
+}
+
+export interface IctZone {
+  kind: 'bullish' | 'bearish'
+  top: number
+  bottom: number
+  index: number // origin bar (left edge)
+  time: number | null
+  mitigated: boolean // price has since traded back into it
+  subtype: 'order-block' | 'breaker' | 'rejection' | 'fvg' | 'bpr' | 'volume-imbalance'
+  inverted: boolean // (FVG) a close ran fully through it, so its role flipped
+  void: boolean // (FVG) oversized gap = liquidity void / inefficiency
+  ce: number // consequent encroachment = the zone's 50% (a key ICT level)
+}
+
+export interface IctLiquidityPool {
+  kind: 'buy-side' | 'sell-side'
+  price: number
+  index: number
+  time: number | null
+  equal: boolean // part of an EQH/EQL cluster (a stronger pool)
+  swept: boolean // price has since run through it
+}
+
+export interface IctDealingRange {
+  high: number
+  low: number
+  equilibrium: number // the 50% line
+  position_pct: number // 0 at the low, 1 at the high
+  zone: 'premium' | 'discount' | 'equilibrium'
+  ote_discount: [number, number] // long "optimal trade entry" band (price)
+  ote_premium: [number, number] // short OTE band (price)
+  in_ote: boolean // price is inside the side-appropriate OTE band
+}
+
+export interface IctKeyLevels {
+  pdh?: number // previous day high
+  pdl?: number // previous day low
+  pwh?: number // previous week high
+  pwl?: number // previous week low
+}
+
+export interface IctDrawOnLiquidity {
+  above: IctLiquidityPool | null // nearest UNSWEPT buy-side pool above price
+  below: IctLiquidityPool | null // nearest UNSWEPT sell-side pool below price
+}
+
+export interface IctAnalysis {
+  symbol: string
+  price: number
+  trend: 'bull' | 'bear' | 'none'
+  bias: 'bullish' | 'bearish' | 'neutral'
+  summary: string
+  swings: IctSwing[]
+  events: IctStructureEvent[]
+  sweeps: IctSweep[]
+  order_blocks: IctZone[]
+  fvgs: IctZone[]
+  breakers: IctZone[]
+  rejection_blocks: IctZone[]
+  bpr: IctZone[]
+  volume_imbalances: IctZone[]
+  liquidity: IctLiquidityPool[]
+  draw_on_liquidity: IctDrawOnLiquidity | null
+  key_levels: IctKeyLevels | null
+  dealing_range: IctDealingRange | null
 }
 
 // A user-defined price alert: "notify me when SYMBOL crosses PRICE". The

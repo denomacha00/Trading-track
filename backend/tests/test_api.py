@@ -754,6 +754,44 @@ def test_normalize_chart_rejects_empty_and_bad_fields():
     assert _normalize_proposed_action({"type": "chart", "timeframe": "1h"}, None)["timeframe"] == "1h"
 
 
+def test_normalize_chart_ict_overlays():
+    # The chart action can ALSO toggle the ICT / smart-money overlays. Same rules as
+    # indicators: only allowlisted keys survive, values are coerced to real bools,
+    # and an ICT-only patch is enough on its own to render a card. Toggling an
+    # overlay only VIEWS a computed level — it never fabricates one or moves money.
+    from app.main import _normalize_proposed_action
+
+    a = _normalize_proposed_action(
+        {
+            "type": "chart",
+            "ict": {
+                "orderBlocks": "true",  # coerced to bool
+                "fvg": True,
+                "dealingRange": False,  # explicit hide survives
+                "swings": 1,  # truthy number -> True
+                "bogus": True,  # unknown key -> dropped
+            },
+            "reason": "mark the smart-money zones",
+        },
+        None,
+    )
+    assert a == {
+        "type": "chart",
+        "ict": {"orderBlocks": True, "fvg": True, "dealingRange": False, "swings": True},
+        "reason": "mark the smart-money zones",
+        "auto": False,
+    }
+    # An ICT object with only unknown keys leaves nothing actionable -> refused.
+    assert _normalize_proposed_action({"type": "chart", "ict": {"nope": True}}, None) is None
+    # ICT overlays combine with indicators/symbol in one view-only proposal.
+    combo = _normalize_proposed_action(
+        {"type": "chart", "indicators": {"rsi": True}, "ict": {"liquidity": True}},
+        None,
+    )
+    assert combo["indicators"] == {"rsi": True}
+    assert combo["ict"] == {"liquidity": True}
+
+
 class _AutopilotEngine:
     """Minimal engine stub exposing just the settings the normalizer reads."""
 
