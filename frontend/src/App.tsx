@@ -2184,8 +2184,8 @@ function OrderBook({
     askCum[askCum.length - 1] ?? 0,
     bidCum[bidCum.length - 1] ?? 0,
   )
-  const bestAsk = active?.asks[0]?.price
-  const bestBid = active?.bids[0]?.price
+  const bestAsk = active?.asks?.[0]?.price
+  const bestBid = active?.bids?.[0]?.price
   const spread = bestAsk != null && bestBid != null ? bestAsk - bestBid : null
   const spreadPct = spread != null && bestAsk ? (spread / bestAsk) * 100 : null
   const viaFallback = Boolean(active?.source && exchange && active.source !== exchange)
@@ -3187,11 +3187,14 @@ function AssistantPanel({
   }
 
   // Mark a turn's action with a new lifecycle state (so its card can't be re-run
-  // and shows the outcome). Turns are only appended, so the index stays stable.
-  const setActionState = (idx: number, s: 'pending' | 'running' | 'done' | 'dismissed') =>
-    setTurns((t) => t.map((m, i) => (i === idx ? { ...m, actionState: s } : m)))
+  // and shows the outcome). Keyed by the turn's STABLE id, not its array index:
+  // a live monitor call-out on the shared transcript can slice leading turns off
+  // (see the Dashboard socket handler's `.slice(-200)`) between an action
+  // starting and its await resolving, which would shift every index.
+  const setActionState = (id: number, s: 'pending' | 'running' | 'done' | 'dismissed') =>
+    setTurns((t) => t.map((m) => (m.id === id ? { ...m, actionState: s } : m)))
   const pushResult = (text: string) => setTurns((t) => [...t, { role: 'ai', text, ts: Date.now() }])
-  const dismissAction = (idx: number) => setActionState(idx, 'dismissed')
+  const dismissAction = (id: number) => setActionState(id, 'dismissed')
 
   // Turn a proposed action into a human-readable card: a title, plain-English
   // detail lines, and whether it's a real-money danger (a live order).
@@ -3240,8 +3243,8 @@ function AssistantPanel({
   // authenticated endpoints the manual controls use — the AI has no private path
   // to money or settings. Report the REAL result (or the real error); leave the
   // card re-confirmable if the server rejected it.
-  const runAction = async (idx: number, action: ProposedAction) => {
-    setActionState(idx, 'running')
+  const runAction = async (id: number, action: ProposedAction) => {
+    setActionState(id, 'running')
     try {
       if (action.type === 'order') {
         const res = await api.order({
@@ -3253,7 +3256,7 @@ function AssistantPanel({
           ...(action.take_profit != null ? { take_profit: action.take_profit } : {}),
         })
         const tr = res.trade
-        setActionState(idx, res.accepted ? 'done' : 'pending')
+        setActionState(id, res.accepted ? 'done' : 'pending')
         pushResult(
           (res.accepted ? '✅ ' : '⚠️ ') +
             res.message +
@@ -3262,11 +3265,11 @@ function AssistantPanel({
         if (!res.accepted) onError(res.message)
       } else if (action.type === 'settings') {
         const s = await api.updateSettings(action.changes)
-        setActionState(idx, 'done')
+        setActionState(id, 'done')
         pushResult('✅ Settings updated: ' + Object.keys(action.changes).map((k) => `${k}=${(s as any)[k]}`).join(', '))
       } else if (action.type === 'bot') {
         const res = await api.setBot(action.state)
-        setActionState(idx, 'done')
+        setActionState(id, 'done')
         pushResult(`✅ Bot ${res.running ? 'started' : 'stopped'}.`)
       } else if (action.type === 'alert') {
         const al = await api.createAlert({
@@ -3275,11 +3278,11 @@ function AssistantPanel({
           price: action.price,
           ...(action.note ? { note: action.note } : {}),
         })
-        setActionState(idx, 'done')
+        setActionState(id, 'done')
         pushResult(`✅ Alert armed: ${al.symbol} ${al.condition} ${al.price}${al.note ? ` (${al.note})` : ''}. You'll be notified on a real cross.`)
       } else if (action.type === 'train') {
         const rep = await api.train(action.symbol, action.strategy, action.timeframe, true)
-        setActionState(idx, 'done')
+        setActionState(id, 'done')
         pushResult(
           rep.best
             ? `✅ Trained ${rep.strategy} on ${rep.symbol} ${rep.timeframe}: return ${rep.best.total_return_pct.toFixed(2)}%, win ${rep.best.win_rate_pct.toFixed(1)}%, ${rep.best.num_trades} trades — ${rep.saved ? 'saved to your account.' : 'not saved (did not beat the baseline).'}${rep.warning ? ` Note: ${rep.warning}` : ''}`
@@ -3296,13 +3299,13 @@ function AssistantPanel({
           clear_drawings: action.clear_drawings,
           undo: action.undo,
         })
-        setActionState(idx, 'done')
+        setActionState(id, 'done')
         pushResult('✅ ' + summary)
       }
     } catch (e) {
       const msg = (e as Error).message
       onError(msg)
-      setActionState(idx, 'pending')
+      setActionState(id, 'pending')
       pushResult(`⚠️ Couldn't complete that action: ${msg}`)
     }
   }
@@ -3315,7 +3318,7 @@ function AssistantPanel({
   // (not index) and guarded by autoStartedRef so it fires exactly once; a live
   // order or paper<->live switch is never `auto`, so it still waits for a tap.
   useEffect(() => {
-    const idx = turns.findIndex(
+    const m = turns.find(
       (m) =>
         m.id != null &&
         m.action &&
@@ -3323,10 +3326,9 @@ function AssistantPanel({
         m.actionState === 'running' &&
         !autoStartedRef.current.has(m.id),
     )
-    if (idx === -1) return
-    const m = turns[idx]
-    autoStartedRef.current.add(m.id as number)
-    void runAction(idx, m.action as ProposedAction)
+    if (!m || m.id == null) return
+    autoStartedRef.current.add(m.id)
+    void runAction(m.id, m.action as ProposedAction)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [turns])
 
@@ -3438,7 +3440,7 @@ function AssistantPanel({
                             <button
                               type="button"
                               className="btn primary sm"
-                              onClick={() => runAction(i, t.action!)}
+                              onClick={() => runAction(t.id!, t.action!)}
                               disabled={running || busy}
                             >
                               {running ? 'Working…' : 'Confirm'}
@@ -3446,7 +3448,7 @@ function AssistantPanel({
                             <button
                               type="button"
                               className="btn ghost sm"
-                              onClick={() => dismissAction(i)}
+                              onClick={() => dismissAction(t.id!)}
                               disabled={running}
                             >
                               Cancel
@@ -3921,7 +3923,7 @@ function BacktestPanel({
             </div>
             <div className="stat">
               <div className="label">Fees paid</div>
-              <div className="value">{fmt(result.total_fees ?? 0)}</div>
+              <div className="value">{fmt(result.total_fees)}</div>
             </div>
           </div>
           <p className="hint" style={{ marginTop: 8 }}>

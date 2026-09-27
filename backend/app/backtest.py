@@ -181,7 +181,10 @@ def run_backtest(
         if current_trade is not None:
             current_trade.exit_index = n - 1
             current_trade.exit_price = last_price
-            current_trade.pnl = proceeds - (current_trade.entry_price * position_qty)
+            # Cost basis is entry_cost (spend incl. entry fee), same as the
+            # sell-signal and stop/TP exits above — NOT entry_price * qty, which
+            # would drop the entry fee and overstate this trade's profit.
+            current_trade.pnl = proceeds - current_trade.entry_cost
             trades.append(current_trade)
         balance = proceeds
         position_qty = 0.0

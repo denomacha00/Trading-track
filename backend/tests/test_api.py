@@ -190,7 +190,12 @@ def test_ai_ask_without_key_falls_back(client):
     try:
         user = db.scalars(select(User).where(User.email == ADMIN_EMAIL)).first()
         engine = get_manager().get(db, user)
+        # Clear BOTH providers. `available` is True if EITHER the primary or the
+        # optional fallback key is set, so disabling AI for this test means
+        # clearing both — otherwise a real AI_FALLBACK_API_KEY in the environment
+        # keeps the assistant live and this "no key" path is never exercised.
         engine.ai._settings.ai_api_key = ""
+        engine.ai._settings.ai_fallback_api_key = ""
     finally:
         db.close()
     r = client.post("/api/ai/ask", json={"question": "what is the trend?"})

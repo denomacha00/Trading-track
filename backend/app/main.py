@@ -1185,7 +1185,15 @@ def ai_ask(
     engine = _engine_for(db, user)
     symbol = payload.get("symbol")
     timeframe = payload.get("timeframe", "1h")
-    analysis = _analysis_for(engine, symbol, timeframe) if symbol else None
+    # A bad or momentarily unreachable symbol shouldn't 502 the whole ask (same
+    # as /api/ai/chat): degrade gracefully to no-analysis context so the
+    # assistant can still answer the question.
+    analysis = None
+    if symbol:
+        try:
+            analysis = _analysis_for(engine, str(symbol), str(timeframe))
+        except Exception:
+            analysis = None
     answer = engine.ai.ask(question, analysis)
     return {"answer": answer, "ai_enabled": engine.ai.available}
 

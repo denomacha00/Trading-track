@@ -130,3 +130,22 @@ def test_exits_disabled_by_default_match_signal_only():
                           stop_loss_pct=0.0, take_profit_pct=0.0, trailing_stop_pct=0.0)
     assert base.ending_balance == zeroed.ending_balance
     assert base.num_trades == zeroed.num_trades
+
+
+def test_final_liquidation_pnl_includes_entry_fee():
+    # A position held through the last bar (uptrend, no sell signal) is liquidated
+    # at the final close. Its P&L must use entry_cost (spend INCLUDING the entry
+    # fee) as the cost basis, exactly like the sell-signal and stop/TP exits — not
+    # entry_price*qty, which drops the entry fee and overstates the trade. With a
+    # non-zero fee, per-trade P&L must reconcile to the cent with the balance
+    # change; the old buggy basis broke this by exactly the entry fee and could
+    # flip a real losing trade into a counted "winner", inflating win_rate_pct.
+    prices = [10, 9, 8, 7, 6, 5, 4, 3, 2, 1] + list(range(2, 40))
+    result = run_backtest(_candles(prices), MovingAverageCrossStrategy(3, 5),
+                          starting_balance=1000, fee_pct=0.1, slippage_pct=0.0)
+    assert result.num_trades >= 1
+    assert result.total_fees > 0.0
+    # The last trade is the end-of-run liquidation (still open at the final bar).
+    assert result.trades[-1].exit_index == len(prices) - 1
+    reconciled = sum(t.pnl for t in result.trades)
+    assert abs(reconciled - (result.ending_balance - result.starting_balance)) < 1e-6

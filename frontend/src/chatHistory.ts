@@ -20,6 +20,10 @@ export type StoredTurn = ChatTurn & {
   ts?: number
   action?: unknown
   actionState?: unknown
+  // Stable per-session action id (App._actionTurnSeq). STRIPPED on load: the
+  // session counter resets on reload, so keeping it would let a fresh action's
+  // id collide with a restored turn's — and action-card state is keyed by id.
+  id?: unknown
   nav?: unknown
   live?: boolean
 }
@@ -70,10 +74,13 @@ export function loadTurns<T extends StoredTurn>(userId: number): T[] {
     if (!env || env.userId !== userId || !Array.isArray(env.turns)) return []
     const clean: T[] = []
     for (const t of prune(env.turns as StoredTurn[], Date.now())) {
-      // Drop the actionable card + any stale lifecycle state; keep the text.
-      const { action, actionState, ...rest } = t
+      // Drop the actionable card + any stale lifecycle state; keep the text. The
+      // id goes too: it's a per-session action key that must not survive to
+      // collide with a fresh action's id after the session counter resets.
+      const { action, actionState, id, ...rest } = t
       void action
       void actionState
+      void id
       clean.push(rest as unknown as T)
     }
     return clean
