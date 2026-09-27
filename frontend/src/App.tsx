@@ -2518,7 +2518,7 @@ function BotPulse({
           </span>
         )}
         <span className="bp-sep" />
-        <span className="bp-meta">Open positions: {status?.open_positions ?? 0}</span>
+        <span className="bp-meta">Open positions: {status ? status.open_positions : '–'}</span>
         <span className="bp-sep" />
         <span className="bp-meta" title="Time since the last status update from the backend">
           {connected ? 'updated ' : 'stale — reconnecting, last '}
@@ -2598,7 +2598,7 @@ function StatsRow({ status }: { status: BotStatus | null }) {
       <div className="stat">
         <div className="label">Open / Max</div>
         <div className="value">
-          {status?.open_positions ?? 0} / {status?.max_open_positions ?? 0}
+          {status ? `${status.open_positions} / ${status.max_open_positions}` : '– / –'}
         </div>
       </div>
     </section>
@@ -4004,9 +4004,10 @@ function BacktestPanel({
           </div>
           <p className="hint" style={{ marginTop: 8 }}>
             Applied the bot's live exit rules — stop-loss{' '}
-            {fmt(result.stop_loss_pct ?? 0)}%, take-profit {fmt(result.take_profit_pct ?? 0)}%,
-            trailing {fmt(result.trailing_stop_pct ?? 0)}% — so these numbers reflect how the
-            bot would actually trade, not buy-and-hold.
+            {result.stop_loss_pct ? `${fmt(result.stop_loss_pct)}%` : 'off'}, take-profit{' '}
+            {result.take_profit_pct ? `${fmt(result.take_profit_pct)}%` : 'off'}, trailing{' '}
+            {result.trailing_stop_pct ? `${fmt(result.trailing_stop_pct)}%` : 'off'} — so these
+            numbers reflect how the bot would actually trade, not buy-and-hold.
           </p>
           {(result.explanation || result.analytics?.explanation) && (
             <div
@@ -4069,7 +4070,13 @@ function BacktestPanel({
                 <div className="label">vs Buy &amp; hold</div>
                 {/* Did the trading beat simply owning the coin over the same window? */}
                 <div
-                  className={`value ${result.analytics.beat_buy_hold ? 'pos' : 'neg'}`}
+                  className={`value ${
+                    result.analytics.vs_buy_hold_pct == null
+                      ? ''
+                      : result.analytics.beat_buy_hold
+                      ? 'pos'
+                      : 'neg'
+                  }`}
                   title={
                     result.analytics.buy_hold_return_pct == null
                       ? undefined
@@ -5258,7 +5265,20 @@ function CredentialsCard({
           />
           Use Binance testnet (recommended until you have verified everything)
         </label>
-        {saved && <p className="hint" style={{ color: 'var(--green)' }}>{saved}</p>}
+        {saved && (
+          <p
+            className="hint"
+            style={{
+              color: saved.startsWith('✅')
+                ? 'var(--green)'
+                : saved.startsWith('⚠️')
+                ? 'var(--warn, #d98a00)'
+                : undefined,
+            }}
+          >
+            {saved}
+          </p>
+        )}
         <button className="btn primary" onClick={save} disabled={disabled || busy}>
           {busy ? 'Saving…' : 'Save API keys'}
         </button>
