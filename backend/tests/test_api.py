@@ -537,16 +537,27 @@ def test_normalize_order_rejects_bad_side_and_symbol():
     assert _normalize_proposed_action({"type": "order", "side": "buy", "symbol": "BTC"}, None) is None
 
 
-def test_normalize_order_keeps_explicit_prices():
+def test_normalize_order_ignores_ai_authored_money_math():
     from app.main import _normalize_proposed_action
 
+    # SAFETY (M9): even if the model emits an amount / stop / TP / limit price,
+    # the normaliser drops them all. The risk manager owns sizing and the stop,
+    # so a hallucinated size can't bypass the per-position concentration cap and
+    # a bogus stop can't set the trade's real risk. The AI proposes only the
+    # direction and symbol; an operator wanting exact numbers uses the order form.
     a = _normalize_proposed_action(
-        {"type": "order", "side": "buy", "symbol": "BTC/USDT", "amount": 0.01, "stop_loss": 60000},
+        {
+            "type": "order", "side": "buy", "symbol": "BTC/USDT",
+            "amount": 999.0, "stop_loss": 1.0, "take_profit": 5.0,
+            "limit_price": 60000,
+        },
         None,
     )
-    assert a["amount"] == 0.01
-    assert a["stop_loss"] == 60000.0
-    assert "take_profit" not in a  # omitted stays omitted (engine applies defaults)
+    assert a["amount"] is None       # risk manager sizes it (+ concentration cap)
+    assert "stop_loss" not in a      # deterministic _auto_stop applies instead
+    assert "take_profit" not in a    # deterministic _auto_take applies instead
+    assert "limit_price" not in a    # entry price is not taken from the model
+    assert a["side"] == "buy" and a["symbol"] == "BTC/USDT"
 
 
 def test_normalize_settings_allowlist_drops_trading_mode():

@@ -1675,17 +1675,19 @@ def _normalize_proposed_action(raw: dict | None, engine) -> dict | None:
                 "symbol": symbol,
                 "reason": reason,
             }
-            for k in ("amount", "limit_price", "stop_loss", "take_profit"):
-                v = raw.get(k)
-                if v is None:
-                    continue
-                try:
-                    fv = float(v)
-                except (TypeError, ValueError):
-                    continue
-                if fv > 0:
-                    out[k] = fv
-            out.setdefault("amount", None)  # null => risk manager sizes it safely
+            # SAFETY (M9): the assistant proposes INTENT only — never the money
+            # math. Position SIZE, the protective STOP/TAKE-PROFIT and the entry
+            # price are ALWAYS owned by the risk manager and deterministic
+            # settings, NEVER read from the model's output. A hallucinated amount
+            # would otherwise be treated as a deliberate "explicit" size and
+            # BYPASS the per-position concentration cap (risk.check only clamps
+            # auto-sized orders), and a bogus stop would set the trade's real
+            # risk. So we take only {side, symbol}: amount=None makes risk.check
+            # size it AND apply the concentration cap, and execute_signal /
+            # _fill_pending apply the deterministic _auto_stop / _auto_take. An
+            # operator who wants a specific size, stop or limit uses the manual
+            # order form, whose numbers are genuinely operator-authored.
+            out["amount"] = None  # risk manager sizes it + concentration cap
             # A live order is real money: never autopilot it. A paper order is
             # safe to auto-apply when the operator enabled autopilot.
             out["auto"] = autopilot and not live
