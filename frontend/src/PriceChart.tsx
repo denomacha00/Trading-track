@@ -23,6 +23,7 @@ import type { Candle } from './types'
 import type { Theme } from './theme'
 import { sma, ema, bollinger, vwap, rsi, macd, type IndicatorPrefs, type LinePoint } from './indicators'
 import { volumeProfile, type VolumeProfile } from './volumeProfile'
+import { priceDecimals, fmtPrice, priceMinMove } from './priceFormat'
 import type { ChartMarker } from './chartMarkers'
 import {
   loadDrawings,
@@ -182,11 +183,6 @@ export const TF_SECONDS: Record<string, number> = {
   '1w': 604800,
 }
 
-function fmtPrice(v: number): string {
-  const dp = Math.abs(v) < 10 ? 4 : 2
-  return v.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })
-}
-
 // Compact volume (1.23K / 4.56M / 7.89B) so a busy bar doesn't overflow.
 function fmtVol(v: number | undefined): string {
   if (v == null || !Number.isFinite(v)) return '—'
@@ -263,6 +259,10 @@ export function PriceChart({
   // The newest bar, kept current so live ticks extend it rather than reset it.
   const lastBarRef = useRef<CandlestickData | null>(null)
   const lastVolRef = useRef<number | undefined>(undefined)
+  // The price-axis decimal precision currently applied to the candle series,
+  // derived from the asset's magnitude (see priceDecimals) so a sub-cent coin
+  // reads its real value on the axis/crosshair instead of collapsing to "0.00".
+  const priceDpRef = useRef<number>(2)
   // True while the pointer is over the chart, so live updates don't fight the
   // crosshair read-out for the bar the user is inspecting.
   const hoveringRef = useRef(false)
@@ -375,12 +375,15 @@ export function PriceChart({
     const chgPct = bar.open ? (chg / bar.open) * 100 : 0
     const col = chg >= 0 ? p.up : p.down
     const sign = chg >= 0 ? '+' : ''
+    // One precision for the whole row (from the close) so O/H/L/C/chg line up and
+    // a sub-cent asset shows its real figures instead of "0.00".
+    const dp = priceDecimals(bar.close)
     el.innerHTML =
-      `<span class="cl-k">O</span><span class="cl-v">${fmtPrice(bar.open)}</span>` +
-      `<span class="cl-k">H</span><span class="cl-v">${fmtPrice(bar.high)}</span>` +
-      `<span class="cl-k">L</span><span class="cl-v">${fmtPrice(bar.low)}</span>` +
-      `<span class="cl-k">C</span><span class="cl-v">${fmtPrice(bar.close)}</span>` +
-      `<span class="cl-chg" style="color:${col}">${sign}${fmtPrice(chg)} (${sign}${chgPct.toFixed(2)}%)</span>` +
+      `<span class="cl-k">O</span><span class="cl-v">${fmtPrice(bar.open, dp)}</span>` +
+      `<span class="cl-k">H</span><span class="cl-v">${fmtPrice(bar.high, dp)}</span>` +
+      `<span class="cl-k">L</span><span class="cl-v">${fmtPrice(bar.low, dp)}</span>` +
+      `<span class="cl-k">C</span><span class="cl-v">${fmtPrice(bar.close, dp)}</span>` +
+      `<span class="cl-chg" style="color:${col}">${sign}${fmtPrice(chg, dp)} (${sign}${chgPct.toFixed(2)}%)</span>` +
       `<span class="cl-k">Vol</span><span class="cl-v" style="color:${col}">${fmtVol(vol)}</span>`
   }
 
@@ -763,6 +766,20 @@ export function PriceChart({
       close: c.close,
     }))
     seriesRef.current.setData(data)
+    // Match the price-axis / crosshair precision to this asset's magnitude so a
+    // sub-cent coin shows its real price instead of "0.00" (lightweight-charts
+    // defaults to 2 dp). Derived from the latest real close; only re-applied when
+    // it actually changes so periodic reloads don't churn the series options.
+    const repClose = data[data.length - 1]?.close
+    if (repClose != null && Number.isFinite(repClose) && repClose > 0) {
+      const dp = priceDecimals(repClose)
+      if (dp !== priceDpRef.current) {
+        priceDpRef.current = dp
+        seriesRef.current.applyOptions({
+          priceFormat: { type: 'price', precision: dp, minMove: priceMinMove(dp) },
+        })
+      }
+    }
     if (volumeRef.current) {
       const vol: HistogramData[] = candles.map((c) => ({
         time: c.time as Time,
