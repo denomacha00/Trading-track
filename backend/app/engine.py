@@ -611,6 +611,30 @@ class TradingEngine:
             )
         return False, ""
 
+    def _daily_loss_hit(self, db: Session) -> bool:
+        """True if today's realized + open PnL has breached the daily-loss limit.
+
+        Mirrors the daily-loss branch of :meth:`RiskManager.check` so that a
+        RESTING-order fill is held to the SAME breaker as a fresh entry — filling
+        a limit/DCA leg IS opening a new position, and must not sneak past the
+        loss limit just because the order was placed earlier. Scoped to the
+        current book (paper vs live) via ``day_realized_pnl``. Never fabricates a
+        breach: if the account can't be valued right now it returns False and lets
+        the deterministic gates elsewhere surface the degraded state.
+        """
+        limit_pct = getattr(self.settings, "daily_loss_limit_pct", 0.0) or 0.0
+        if limit_pct <= 0:
+            return False
+        try:
+            day_pnl = self.risk.day_realized_pnl(db) + self._open_unrealized(db)
+            basis = self._total_equity(db)
+        except Exception:
+            return False
+        if basis <= 0:
+            return False
+        loss_limit = -abs(basis * (limit_pct / 100.0))
+        return day_pnl <= loss_limit
+
     def reset_killswitch(self, db: Session | None = None) -> None:
         """Clear the kill-switch and reseed the equity peak (human re-arm).
 
@@ -1408,6 +1432,21 @@ class TradingEngine:
                         if trade.status == TradeStatus.pending.value:
                             self._cancel_pending(db, trade, f"exchange {status}")
                     continue
+                # Capital-preservation halt: a tripped max-drawdown kill-switch
+                # means NO new risk. Cancel a still-resting live order ON THE
+                # EXCHANGE so it can't fill into the very drawdown that halted us.
+                # An order the exchange has ALREADY filled is booked below instead
+                # — we can't un-fill reality, and pretending we did would desync
+                # our book from the real position.
+                if self._killswitch_tripped and status not in {"closed", "filled"}:
+                    with self._lock:
+                        db.refresh(trade)
+                        if trade.status == TradeStatus.pending.value:
+                            self._cancel_pending(
+                                db, trade,
+                                "canceled: max-drawdown kill-switch active",
+                            )
+                    continue
                 # Only promote a resting order once the exchange reports it FULLY
                 # filled. A partial fill ("open" with a nonzero filled amount) must
                 # keep resting — booking it as a complete position would track base
@@ -1436,11 +1475,66 @@ class TradingEngine:
                 db.refresh(trade)
                 if trade.status != TradeStatus.pending.value:
                     continue
+                if not self.settings.is_live:
+                    # A PAPER fill is OUR simulated action, so it must respect the
+                    # same capital-preservation gates as a fresh entry:
+                    #  • kill-switch tripped (catastrophe, needs human re-arm) →
+                    #    cancel the resting order and give back its reservation;
+                    #  • daily-loss breaker (auto-resets at UTC midnight) → don't
+                    #    fill today, but LEAVE it resting to be re-evaluated later.
+                    # (A LIVE order the exchange already filled is booked as-is:
+                    #  the fill really happened, so recording it keeps our book
+                    #  honest; the kill-switch still blocks the NEXT new entry.)
+                    if self._killswitch_tripped:
+                        self._cancel_pending(
+                            db, trade,
+                            "canceled: max-drawdown kill-switch active",
+                        )
+                        continue
+                    if self._daily_loss_hit(db):
+                        continue
                 if filled_amt is not None:
                     trade.amount = filled_amt
                 self._fill_pending(db, trade, fill_price)
             filled.append(trade)
         return filled
+
+    def _exchange_stop_filled_price(self, trade: Trade) -> Optional[float]:
+        """Average fill price if this trade's exchange-side stop has ALREADY fired.
+
+        A live stop-loss is placed as a real resting order on the venue. If price
+        gaps through it the exchange fills it and the base asset is gone — but our
+        in-process monitor still sees the trade as open and tries to market-close
+        it, which the exchange rejects with -2010 (insufficient balance) on every
+        tick, wedging the trade open forever. Detecting the already-filled stop
+        lets us book the close at the REAL fill price instead of looping.
+
+        Returns the fill price when the stop order reports closed/filled with a
+        positive filled quantity, else None (unknown / still resting / no stop).
+        Never fabricates: on any fetch failure we return None and let the normal
+        market-close path run and surface any real error.
+        """
+        if not (self.settings.is_live and trade.stop_order_id):
+            return None
+        try:
+            order = self.connector.fetch_order(trade.stop_order_id, trade.symbol)
+        except Exception:
+            return None
+        if not order:
+            return None
+        status = (order.get("status") or "").lower()
+        filled = float(order.get("filled") or 0)
+        if status in {"closed", "filled"} and filled > 0:
+            # Prefer the venue's average fill; fall back to the stop trigger we
+            # set (a real level we chose, never an invented number) only if the
+            # venue reports no price.
+            return float(
+                order.get("average")
+                or order.get("price")
+                or trade.stop_loss
+                or trade.entry_price
+            )
+        return None
 
     def _close_trade(
         self, db: Session, trade: Trade, reason: str
@@ -1455,9 +1549,19 @@ class TradingEngine:
             ro = self._live_readonly_block()
             if ro:
                 return False, ro, None
-            # Cancel any resting exchange-side stop before we market-close, so it
-            # can't fire later against a position we no longer hold.
+            # If the protective exchange-side stop has ALREADY fired, the base
+            # asset is gone: a fresh market close would hit -2010 forever and
+            # wedge the trade open. Book the close at the stop's REAL fill price.
             if trade.stop_order_id:
+                stop_fill = self._exchange_stop_filled_price(trade)
+                if stop_fill is not None:
+                    trade.stop_order_id = None
+                    return self._book_close(
+                        db, trade, stop_fill,
+                        f"{reason} | exchange stop already filled",
+                    )
+                # Not filled yet — cancel it before we market-close, so it can't
+                # fire later against a position we no longer hold.
                 self.connector.cancel_order(trade.stop_order_id, trade.symbol)
                 trade.stop_order_id = None
             close_side = "sell" if trade.side == "buy" else "buy"
@@ -1475,6 +1579,19 @@ class TradingEngine:
                     close_order.get("average") or close_order.get("price") or price
                 )
 
+        return self._book_close(db, trade, price, reason)
+
+    def _book_close(
+        self, db: Session, trade: Trade, price: float, reason: str
+    ) -> tuple[bool, str, Optional[Trade]]:
+        """Book a closed trade: realize PnL, refund the paper wallet, close the
+        DB row, record a losing exit for the re-entry cooldown, emit + notify.
+
+        Caller holds the lock and has ALREADY done any live exchange work (the
+        market-close, or determined the fill price of an exchange-side stop that
+        fired). Shared by the normal market-close path and the already-filled-stop
+        path so every close books identically and honestly.
+        """
         pnl = self._realized_pnl(trade, price)
         if not self.settings.is_live:
             # Return notional + pnl to the paper wallet.

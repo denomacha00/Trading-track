@@ -189,11 +189,13 @@ def _tick_all(manager) -> tuple[list[dict], list[dict]]:
                                     "observe user=%s %s failed: %s",
                                     user.id, symbol, exc,
                                 )
-                # ALWAYS: fill resting orders, run SL/TP on open positions, and
-                # update the drawdown kill-switch — even when the bot is stopped.
+                # ALWAYS, even when the bot is stopped. Update the drawdown
+                # kill-switch FIRST so a fresh trip is seen by check_pending_orders
+                # in the SAME pass — it then cancels resting entries instead of
+                # letting them fill into the very drawdown that just halted us.
+                engine._update_drawdown(db)
                 engine.check_pending_orders(db)
                 engine.check_open_positions(db)
-                engine._update_drawdown(db)
                 statuses.append({"user_id": user.id, "status": engine.status(db)})
 
                 # Assistant call-outs. A tiny per-user price cache keeps us to one
