@@ -103,15 +103,23 @@ class RiskManager:
         rather than letting losses compound until a stop fires.
 
         ``equity_for_limits`` (optional) is the TOTAL account equity (free cash +
-        open-position value) used ONLY as the basis for the daily-loss limit.
-        Position *sizing* still uses ``equity`` (free cash available to deploy).
-        Separating them matters: as capital gets deployed the free cash shrinks,
-        so basing the loss limit on free cash would tighten the breaker the more
-        you trade and trip it far too early. Falls back to ``equity`` when not
-        supplied, preserving the old behaviour for callers that don't pass it.
+        open-position value) used as the basis for the portfolio-level limits —
+        the daily-loss breaker, the per-position concentration cap and the total-
+        exposure cap. Position *sizing* still uses ``equity`` (free cash available
+        to deploy). Separating them matters: as capital gets deployed the free
+        cash shrinks, so basing these limits on free cash would tighten them the
+        more you trade — the loss breaker would trip too early and the caps would
+        mean different things at different deployment levels. Falls back to
+        ``equity`` when not supplied, preserving the old behaviour for callers
+        that don't pass it.
         """
         if price <= 0:
             return RiskDecision(False, "Invalid price")
+
+        # Basis for every PORTFOLIO-level limit (daily-loss breaker, concentration
+        # cap, total-exposure cap): TOTAL account equity, not the shrinking
+        # free-cash figure used for sizing. See the docstring for why.
+        basis = equity_for_limits if equity_for_limits is not None else equity
 
         if is_opening:
             open_trades = self.open_positions(db)
@@ -123,11 +131,10 @@ class RiskManager:
 
             # Daily loss limit (loss is negative pnl). Include open drawdown so
             # the breaker reflects TOTAL current risk, not just closed trades.
-            # The limit is a % of total account equity (see equity_for_limits),
-            # not the shrinking free-cash figure used for sizing.
+            # The limit is a % of total account equity (see basis), not the
+            # shrinking free-cash figure used for sizing.
             day_pnl = self.day_realized_pnl(db) + day_unrealized
-            limit_basis = equity_for_limits if equity_for_limits is not None else equity
-            loss_limit = -abs(limit_basis * (self.settings.daily_loss_limit_pct / 100.0))
+            loss_limit = -abs(basis * (self.settings.daily_loss_limit_pct / 100.0))
             if day_pnl <= loss_limit:
                 return RiskDecision(
                     False,
@@ -148,6 +155,24 @@ class RiskManager:
             return RiskDecision(False, "Computed position size is zero")
 
         notional = amount * price
+
+        # Per-position CONCENTRATION cap (the primary blow-up guard). No single
+        # position may exceed max_position_pct% of TOTAL equity. We clamp the
+        # AUTO-sizer only: when the caller passed no explicit amount, the bot
+        # chose the size, so shrinking it to the cap is honest (caps only ever
+        # reduce risk). An EXPLICIT amount is the operator's / webhook's / saved-
+        # strategy's deliberate choice — we don't silently resize it here (that
+        # would trade a different size than asked); it's still bounded by free
+        # cash and the exposure cap below.
+        max_pos_pct = getattr(self.settings, "max_position_pct", 0.0)
+        if is_opening and not requested_amount and max_pos_pct > 0 and basis > 0:
+            pos_cap = basis * (max_pos_pct / 100.0)
+            if notional > pos_cap:
+                amount = pos_cap / price
+                notional = amount * price
+                if amount <= 0:
+                    return RiskDecision(False, "Computed position size is zero")
+
         if is_opening and notional > equity:
             return RiskDecision(
                 False,
@@ -155,14 +180,16 @@ class RiskManager:
             )
 
         # Portfolio-level exposure cap: total open notional + this order must stay
-        # under max_total_exposure_pct% of equity. Prevents many small positions
-        # from quietly stacking into an oversized, correlated book.
+        # under max_total_exposure_pct% of TOTAL equity. Prevents many small
+        # positions from quietly stacking into an oversized, correlated book.
+        # Measured against total equity (not free cash) so the ceiling is stable
+        # as capital gets deployed.
         max_exposure_pct = getattr(self.settings, "max_total_exposure_pct", 0.0)
         if is_opening and max_exposure_pct > 0:
             open_notional = sum(
                 t.amount * t.entry_price for t in self.open_positions(db)
             )
-            cap = equity * (max_exposure_pct / 100.0)
+            cap = basis * (max_exposure_pct / 100.0)
             if open_notional + notional > cap:
                 return RiskDecision(
                     False,

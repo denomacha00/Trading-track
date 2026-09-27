@@ -95,9 +95,25 @@ class Settings(BaseSettings):
     daily_loss_limit_pct: float = Field(default=5.0)
     default_stop_loss_pct: float = Field(default=2.0)
     default_take_profit_pct: float = Field(default=4.0)
-    # Cap on TOTAL open notional across ALL positions, as a % of equity. This is
-    # portfolio-level exposure control on top of per-trade sizing: it stops many
-    # "small" positions from adding up to an oversized book. 0 disables.
+    # CONCENTRATION CAP — the single most important beginner guardrail against
+    # blowing up on one bad coin. No single position's notional may exceed this
+    # % of TOTAL account equity. It clamps the AUTO-sizer (an explicit operator/
+    # webhook amount is the caller's own deliberate choice and isn't shrunk here,
+    # only bounded by free cash + the exposure cap). Why it matters: at the
+    # default 1% risk / 2% stop the risk formula alone would put ~50% of equity in
+    # ONE trade, and a very tight stop drives that toward 100% — so without this
+    # cap "risk 1%" quietly becomes "half the account on one ticker". 25% means a
+    # beginner is diversified across at least ~4 positions by construction. Caps
+    # only ever REDUCE size. 0 disables (power users who size manually).
+    max_position_pct: float = Field(default=25.0)
+    # Cap on TOTAL open notional across ALL positions, as a % of TOTAL equity.
+    # Portfolio-level leverage control layered on top of per-trade sizing and the
+    # concentration cap: it stops many "small" positions from stacking into an
+    # oversized, correlated book. On spot the free-cash-per-order check already
+    # bounds you at ~100% invested, so this mainly bites with margin; it's opt-in
+    # (0 disables) and the concentration cap above is the primary beginner
+    # protection. Measured against total equity so the cap means the same thing
+    # however much cash is already deployed.
     max_total_exposure_pct: float = Field(default=0.0)
     # Trailing stop (percent). 0 disables. When > 0, an open long's stop-loss is
     # ratcheted up as price makes new highs, locking in gains while letting

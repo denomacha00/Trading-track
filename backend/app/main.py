@@ -846,6 +846,7 @@ def _settings_out(engine, user: User, db: Session | None = None) -> SettingsOut:
         default_take_profit_pct=s.default_take_profit_pct,
         trailing_stop_pct=s.trailing_stop_pct,
         max_total_exposure_pct=s.max_total_exposure_pct,
+        max_position_pct=getattr(s, "max_position_pct", 0.0),
         paper_taker_fee_pct=getattr(s, "paper_taker_fee_pct", 0.0),
         min_signal_confidence=s.min_signal_confidence,
         auto_trade_enabled=s.auto_trade_enabled,
@@ -1558,6 +1559,7 @@ _AI_SETTINGS_FLOAT = {
     "default_take_profit_pct",
     "trailing_stop_pct",
     "max_total_exposure_pct",
+    "max_position_pct",
     "min_signal_confidence",
     "paper_taker_fee_pct",
     # Profit-lock + saved-strategy gate + monitor cadence (all risk-management
@@ -1596,8 +1598,8 @@ _AI_SETTINGS_STR = {"auto_symbols", "auto_timeframe", "auto_confirm_timeframe"}
 _AI_RISK_SETTINGS = {
     # position sizing & loss limits
     "risk_per_trade_pct", "daily_loss_limit_pct", "default_stop_loss_pct",
-    "trailing_stop_pct", "max_total_exposure_pct", "min_signal_confidence",
-    "max_open_positions",
+    "trailing_stop_pct", "max_total_exposure_pct", "max_position_pct",
+    "min_signal_confidence", "max_open_positions",
     # profit-lock protection
     "profit_lock_enabled", "profit_lock_trigger_pct", "profit_lock_floor_pct",
     # strategy-validation gate (unproven edges driving real money)

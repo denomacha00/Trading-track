@@ -113,8 +113,9 @@ def test_valid_trade_allowed(db):
 
 def test_total_exposure_cap_blocks(db):
     # Cap total open notional at 50% of equity. One open position of 3000 exists;
-    # a new 3000 order would push total to 6000 > 5000 cap.
-    rm = RiskManager(_settings(max_total_exposure_pct=50.0))
+    # a new 3000 order would push total to 6000 > 5000 cap. (Concentration cap
+    # off so this isolates the exposure cap; the explicit 3000 amount is honoured.)
+    rm = RiskManager(_settings(max_total_exposure_pct=50.0, max_position_pct=0.0))
     db.add(Trade(symbol="BTC/USDT", side="buy", amount=30, entry_price=100,
                  status=TradeStatus.open.value))
     db.commit()
@@ -124,7 +125,7 @@ def test_total_exposure_cap_blocks(db):
 
 
 def test_total_exposure_cap_allows_within_limit(db):
-    rm = RiskManager(_settings(max_total_exposure_pct=50.0))
+    rm = RiskManager(_settings(max_total_exposure_pct=50.0, max_position_pct=0.0))
     db.add(Trade(symbol="BTC/USDT", side="buy", amount=10, entry_price=100,
                  status=TradeStatus.open.value))
     db.commit()
@@ -134,12 +135,84 @@ def test_total_exposure_cap_allows_within_limit(db):
 
 
 def test_total_exposure_cap_disabled_by_default(db):
-    rm = RiskManager(_settings())  # max_total_exposure_pct defaults to 0 (off)
+    # Exposure cap defaults to 0 (off). Concentration cap off too so this test
+    # isolates "no exposure cap" (see the concentration-cap tests below).
+    rm = RiskManager(_settings(max_position_pct=0.0))
     db.add(Trade(symbol="BTC/USDT", side="buy", amount=90, entry_price=100,
                  status=TradeStatus.open.value))
     db.commit()
     decision = rm.check(db, equity=10_000, price=100, requested_amount=5, is_opening=True)
     assert decision.allowed  # no exposure cap enforced
+
+
+def test_exposure_cap_uses_total_equity_not_free_cash(db):
+    # M5: the exposure cap is measured against TOTAL equity, not the shrinking
+    # free-cash figure. Free cash is only 3000 but total equity is 10000; with a
+    # 50% cap the ceiling is 5000 (of total), not 1500 (of free cash). An existing
+    # 2000 position + a new 1000 order = 3000 <= 5000 -> allowed. Were the basis
+    # free cash, 3000 > 1500 would (wrongly) block a perfectly safe trade.
+    rm = RiskManager(_settings(max_total_exposure_pct=50.0, max_position_pct=0.0))
+    db.add(Trade(symbol="BTC/USDT", side="buy", amount=20, entry_price=100,
+                 status=TradeStatus.open.value))
+    db.commit()
+    decision = rm.check(
+        db, equity=3_000, price=100, requested_amount=10,
+        is_opening=True, equity_for_limits=10_000,
+    )
+    assert decision.allowed
+
+
+# ---- per-position concentration cap (M6) ------------------------------------
+
+
+def test_concentration_cap_clamps_auto_size(db):
+    # Defaults would auto-size 50% of equity into ONE trade (risk 1% / stop 2% ->
+    # 5000 notional). The 25% concentration cap must shrink it to 2500 (qty 25).
+    rm = RiskManager(_settings(max_position_pct=25.0))
+    decision = rm.check(
+        db, equity=10_000, price=100, requested_amount=None,
+        is_opening=True, equity_for_limits=10_000,
+    )
+    assert decision.allowed
+    assert decision.amount == pytest.approx(25.0)  # 2500 notional / 100 price
+
+
+def test_concentration_cap_uses_total_equity_basis(db):
+    # The cap is a % of TOTAL equity, not free cash. Free cash 4000 auto-sizes to
+    # 2000 notional (risk 1% of 4000 = 40, / 2% stop); the 25% cap on TOTAL equity
+    # (10000) is 2500, so 2000 is under it and NOT clamped (amount 20). Were the
+    # basis free cash (4000 -> cap 1000), it would wrongly clamp to qty 10.
+    rm = RiskManager(_settings(max_position_pct=25.0))
+    decision = rm.check(
+        db, equity=4_000, price=100, requested_amount=None,
+        is_opening=True, equity_for_limits=10_000,
+    )
+    assert decision.allowed
+    assert decision.amount == pytest.approx(20.0)
+
+
+def test_concentration_cap_does_not_resize_explicit_amount(db):
+    # An EXPLICIT amount is the caller's deliberate choice: 40 @ 100 = 4000 (40%
+    # of equity) exceeds the 25% concentration cap but is honoured, not silently
+    # shrunk (still bounded by free cash + the exposure cap).
+    rm = RiskManager(_settings(max_position_pct=25.0))
+    decision = rm.check(
+        db, equity=10_000, price=100, requested_amount=40,
+        is_opening=True, equity_for_limits=10_000,
+    )
+    assert decision.allowed
+    assert decision.amount == pytest.approx(40.0)
+
+
+def test_concentration_cap_disabled_allows_full_auto_size(db):
+    # With the cap off (0), the auto-sizer's full 50%-of-equity position stands.
+    rm = RiskManager(_settings(max_position_pct=0.0))
+    decision = rm.check(
+        db, equity=10_000, price=100, requested_amount=None,
+        is_opening=True, equity_for_limits=10_000,
+    )
+    assert decision.allowed
+    assert decision.amount == pytest.approx(50.0)  # 5000 notional / 100 price
 
 
 def test_daily_loss_limit_includes_open_drawdown(db):

@@ -162,6 +162,9 @@ export interface Settings {
   default_take_profit_pct: number
   trailing_stop_pct: number
   max_total_exposure_pct: number
+  // Concentration cap: no single position may exceed this % of TOTAL equity.
+  // Clamps the auto-sizer (the main beginner blow-up guard); 0 = off.
+  max_position_pct: number
   // Paper-only modeled taker fee charged on BOTH legs of a simulated round trip
   // so paper P&L reflects the real cost of trading. 0 = fee-free (default).
   // LIVE P&L is never adjusted by this — real fills already include real fees.

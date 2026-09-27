@@ -222,6 +222,7 @@ class SettingsOut(BaseModel):
     default_take_profit_pct: float
     trailing_stop_pct: float
     max_total_exposure_pct: float
+    max_position_pct: float = 0.0
     paper_taker_fee_pct: float = 0.0
     min_signal_confidence: float
     auto_trade_enabled: bool
@@ -276,6 +277,7 @@ class SettingsUpdate(BaseModel):
     ai_autopilot_enabled: Optional[bool] = None
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=100)
     max_total_exposure_pct: Optional[float] = Field(default=None, ge=0, le=1000)
+    max_position_pct: Optional[float] = Field(default=None, ge=0, le=100)
     paper_taker_fee_pct: Optional[float] = Field(default=None, ge=0, le=5)
     # Visible pause/resume + saved-strategy validation gate.
     auto_pause_in_bear: Optional[bool] = None

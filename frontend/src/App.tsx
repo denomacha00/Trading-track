@@ -4539,6 +4539,7 @@ function SettingsPanel({
         default_take_profit_pct: form.default_take_profit_pct,
         trailing_stop_pct: form.trailing_stop_pct,
         max_total_exposure_pct: form.max_total_exposure_pct,
+        max_position_pct: form.max_position_pct,
         paper_taker_fee_pct: form.paper_taker_fee_pct,
         min_signal_confidence: form.min_signal_confidence,
         auto_trade_enabled: form.auto_trade_enabled,
@@ -4694,6 +4695,21 @@ function SettingsPanel({
             onChange={setNum('daily_loss_limit_pct')}
             inputMode="decimal"
           />
+        </div>
+        <div className="field">
+          <label>Max per-position % (0 = off)</label>
+          <NumField
+            className="input"
+            value={form.max_position_pct}
+            onChange={setNum('max_position_pct')}
+            inputMode="decimal"
+          />
+          <p className="hint tiny" style={{ marginTop: 4 }}>
+            Most the bot will ever put in ONE coin, as % of your total account.
+            Keeps a single bad trade from sinking you — 25% means at least ~4
+            positions. Only limits the bot's own auto-sizing; your own manual
+            order size is never shrunk.
+          </p>
         </div>
         <div className="field">
           <label>Max total exposure % (0 = off)</label>
