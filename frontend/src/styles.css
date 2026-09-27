@@ -2278,7 +2278,6 @@ pre.code {
 .tl-badge.trade { color: var(--accent); border-color: var(--accent); }
 .tl-badge.signal { color: var(--green); border-color: var(--green); }
 .tl-badge.alert { color: #d9a441; border-color: #d9a441; }
-/* __HIST_CSS_2__ */
 .tl-tag {
   flex: 0 0 auto;
   font-size: 11px;
@@ -2294,4 +2293,112 @@ pre.code {
   .hist-head { flex-direction: column; }
   .tl-item { flex-direction: column; gap: 2px; }
   .tl-time { width: auto; }
+}
+
+/* ── Always-available AI chat: floating launcher + docked panel ──────────
+   The Assistant tab still holds the full chat (unchanged, in its place); this
+   adds a one-tap launcher on every OTHER tab that opens the SAME transcript in
+   a panel docked to the corner, so the AI guide is always within reach. */
+.chat-fab {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  font-size: 24px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  z-index: 160;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.chat-fab:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.42); }
+.chat-fab.open { background: var(--panel-2); color: var(--text); border-color: var(--border); }
+.chat-fab-ico { pointer-events: none; }
+/* "New reply while closed" dot — driven by real transcript growth, not decoration. */
+.chat-fab-dot {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--red);
+  border: 2px solid var(--panel);
+}
+/* __CHAT_CSS_MORE__ */
+.chat-dock {
+  position: fixed;
+  right: 20px;
+  bottom: 88px;
+  width: 380px;
+  max-width: calc(100vw - 40px);
+  height: min(560px, calc(100vh - 130px));
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  z-index: 150;
+}
+.chat-dock-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.chat-dock-title { font-weight: 700; font-size: 14px; }
+.chat-dock-close {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.chat-dock-close:hover { color: var(--text); background: var(--panel-2); }
+.chat-dock-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 12px;
+  overflow: hidden;
+  display: flex;
+}
+/* __CHAT_CSS_MORE2__ */
+/* Make the reused AssistantPanel fill the dock: the transcript grows and
+   scrolls while the input row stays pinned at the bottom (this overrides the
+   tab layout's fixed 380px chat-list height so it fits any dock height). */
+.chat-dock .assistant,
+.chat-dock .chat-col { flex: 1 1 auto; min-height: 0; width: 100%; }
+.chat-dock .chat-list { flex: 1 1 auto; height: auto; min-height: 0; }
+
+/* On phones the dock becomes a full-screen sheet so the chat fits well and is
+   comfortable to type into; the launcher hides while it's open (the sheet has
+   its own close button in the header). */
+@media (max-width: 640px) {
+  .chat-dock {
+    right: 0;
+    left: 0;
+    bottom: 0;
+    top: 0;
+    width: auto;
+    max-width: none;
+    height: auto;
+    border-radius: 0;
+    border-width: 0;
+  }
+  .chat-fab.open { display: none; }
 }

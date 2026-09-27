@@ -530,6 +530,14 @@ function Dashboard({
   const liveBinance = !!access && !access.testnet && (access.exchange ?? 'binance') === 'binance'
   const stream = useBinanceStream(symbol, timeframe, liveBinance)
   const [menuOpen, setMenuOpen] = useState(false)
+  // "Chat should always be there": a floating launcher sits on every tab and
+  // opens the SAME assistant transcript in a docked panel, so the AI guide is
+  // one tap away without leaving the current view. On the Assistant tab the tab
+  // itself IS the chat, so the launcher and dock stand down to avoid a duplicate
+  // mount of the panel. `chatSeenLen` drives a small "new reply" dot when a
+  // proactive message lands while the dock is closed.
+  const [chatOpen, setChatOpen] = useState(false)
+  const [chatSeenLen, setChatSeenLen] = useState(0)
   // Ref to the tabbed content column. On phones the two-column layout collapses
   // into a single stack (stats + chart on top, the tabbed panel below), so
   // picking a view from the hamburger drawer used to switch the tab correctly
@@ -571,6 +579,11 @@ function Dashboard({
   useEffect(() => {
     saveTurns(me.id, turns)
   }, [turns, me.id])
+  // Whenever the chat is actually on screen (dock open, or the Assistant tab),
+  // mark the whole transcript as seen so the launcher's "new reply" dot clears.
+  useEffect(() => {
+    if (chatOpen || tab === 'assistant') setChatSeenLen(turns.length)
+  }, [chatOpen, tab, turns.length])
   // Read-aloud (Web Speech) is OFF by default; the user turns it on in the
   // assistant. Lifted so a pushed alert can be spoken from any tab when it's on.
   const [readAloud, setReadAloud] = useState(false)
@@ -1758,6 +1771,60 @@ function Dashboard({
           </section>
         </div>
       </div>
+
+      {/* Always-available AI chat. A floating launcher on every tab (except the
+          Assistant tab, which already shows the full chat) opens the SAME
+          transcript in a docked panel — the AI guide is one tap away anywhere. */}
+      {tab !== 'assistant' && (
+        <>
+          {chatOpen && (
+            <div className="chat-dock" role="dialog" aria-label="AI assistant">
+              <div className="chat-dock-head">
+                <span className="chat-dock-title">🤖 AI Assistant</span>
+                <button
+                  type="button"
+                  className="chat-dock-close"
+                  aria-label="Close chat"
+                  onClick={() => setChatOpen(false)}
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="chat-dock-body">
+                <AssistantPanel
+                  symbol={symbol}
+                  timeframe={timeframe}
+                  tradingMode={status?.trading_mode}
+                  turns={turns}
+                  setTurns={setTurns}
+                  readAloud={readAloud}
+                  onReadAloudChange={setReadAloud}
+                  ttsSupported={ttsSupported}
+                  speak={speak}
+                  onNavigate={(d) => {
+                    navigate(d)
+                    setChatOpen(false)
+                  }}
+                  onChartControl={applyChartControl}
+                  onError={(m) => showToast('error', m)}
+                />
+              </div>
+            </div>
+          )}
+          <button
+            type="button"
+            className={`chat-fab ${chatOpen ? 'open' : ''}`}
+            aria-label={chatOpen ? 'Close AI assistant' : 'Open AI assistant'}
+            aria-expanded={chatOpen}
+            onClick={() => setChatOpen((v) => !v)}
+          >
+            <span className="chat-fab-ico">{chatOpen ? '✕' : '🤖'}</span>
+            {!chatOpen && turns.length > chatSeenLen && (
+              <span className="chat-fab-dot" aria-hidden="true" />
+            )}
+          </button>
+        </>
+      )}
 
       {toast && <div className={`toast ${toast.kind}`}>{toast.text}</div>}
     </div>
