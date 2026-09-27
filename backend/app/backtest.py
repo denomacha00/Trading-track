@@ -36,11 +36,19 @@ class BacktestResult:
     ending_balance: float
     total_return_pct: float
     num_trades: int
-    win_rate_pct: float
+    # None when zero trades were taken (there is no rate to report), NOT 0.0 —
+    # a fabricated 0% would read as "traded and lost every time". A genuine 0%
+    # (traded, all losers) is still reported as 0.0.
+    win_rate_pct: float | None
     max_drawdown_pct: float
     total_fees: float = 0.0
     trades: list[BacktestTrade] = field(default_factory=list)
     equity_curve: list[float] = field(default_factory=list)
+    # True when the candles lacked separate open/high/low columns, so those were
+    # substituted with the close. Intrabar stop-loss / take-profit / trailing
+    # fills are then approximated on the close instead of the real bar range —
+    # surfaced so the result is never silently less realistic than it looks.
+    ohlc_synthetic: bool = False
 
 
 def run_backtest(
@@ -91,6 +99,10 @@ def run_backtest(
     n = len(candles)
     min_bars = strategy.min_bars()
     closes = candles["close"].astype(float).tolist()
+    # If the frame carries no separate open/high/low we fall back to the close,
+    # but we record that so the result can say the intrabar exits were
+    # approximated rather than pretend the bar range was real.
+    ohlc_synthetic = not ("open" in candles and "high" in candles and "low" in candles)
     opens = candles["open"].astype(float).tolist() if "open" in candles else closes
     highs = candles["high"].astype(float).tolist() if "high" in candles else closes
     lows = candles["low"].astype(float).tolist() if "low" in candles else closes
@@ -190,9 +202,17 @@ def run_backtest(
         position_qty = 0.0
 
     ending_balance = balance
+    # The final equity point must equal the realised ending balance: an open
+    # position is liquidated above at a price net of exit fee + slippage, but the
+    # in-loop mark-to-market wrote the raw last close with no exit cost. Overwrite
+    # so equity_curve[-1] == ending_balance and the drawdown scan sees the true
+    # final equity. No-op when nothing was open at the last bar.
+    if equity_curve:
+        equity_curve[-1] = ending_balance
     total_return = (ending_balance / starting_balance - 1) * 100 if starting_balance else 0.0
     wins = sum(1 for t in trades if t.pnl > 0)
-    win_rate = (wins / len(trades) * 100) if trades else 0.0
+    # None (not 0.0) when no trade was taken — see BacktestResult.win_rate_pct.
+    win_rate = (wins / len(trades) * 100) if trades else None
 
     peak = float("-inf")
     max_dd = 0.0
@@ -212,6 +232,7 @@ def run_backtest(
         total_fees=round(total_fees, 2),
         trades=trades,
         equity_curve=equity_curve,
+        ohlc_synthetic=ohlc_synthetic,
     )
 
 
@@ -379,6 +400,13 @@ def summarize_backtest(
             "stake); the worst peak-to-trough dip along the way was "
             f"{result.max_drawdown_pct:.2f}%."
         )
+        if result.ohlc_synthetic:
+            lines.append(
+                "Note: this history had no separate open/high/low prices, so any "
+                "stop-loss or take-profit was checked against the closing price "
+                "only. Real intrabar highs and lows could have triggered those "
+                "exits differently — treat the exit timing as approximate."
+            )
 
     return {
         "wins": len(win_pnls),
@@ -401,6 +429,7 @@ def summarize_backtest(
         "vs_buy_hold_pct": round(vs_bh, 2) if vs_bh is not None else None,
         "beat_buy_hold": (vs_bh is not None and vs_bh >= 0),
         "profitable": result.total_return_pct > 0,
+        "ohlc_synthetic": result.ohlc_synthetic,
         "bars": bars,
         "explanation": " ".join(lines),
     }

@@ -419,6 +419,9 @@ export interface BacktestAnalytics {
   vs_buy_hold_pct: number | null
   beat_buy_hold: boolean
   profitable: boolean
+  // True when the history lacked separate open/high/low, so intrabar stop/target
+  // fills were approximated on the close (exit timing is then only approximate).
+  ohlc_synthetic?: boolean
   bars: number
   explanation: string
 }
@@ -431,7 +434,8 @@ export interface BacktestResult {
   ending_balance: number
   total_return_pct: number
   num_trades: number
-  win_rate_pct: number
+  // null when the run took zero trades (no rate to report) — the UI shows "-".
+  win_rate_pct: number | null
   max_drawdown_pct: number
   total_fees?: number
   // Exit rules the backtest applied (defaulted from live settings) so results
@@ -443,6 +447,9 @@ export interface BacktestResult {
   // rather than the raw picker selection — so the UI can label it honestly.
   used_saved?: boolean
   equity_curve: number[]
+  // True when the history lacked separate open/high/low columns (intrabar exits
+  // approximated on the close). Optional so an older backend still parses.
+  ohlc_synthetic?: boolean
   // Deeper real analytics + a plain-language read of what happened. Optional so
   // an older backend without them still parses.
   analytics?: BacktestAnalytics

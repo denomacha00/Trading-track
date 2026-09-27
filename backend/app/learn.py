@@ -36,7 +36,10 @@ PARAM_GRIDS: dict[str, dict[str, list[Any]]] = {
 class TrainingCandidate:
     params: dict[str, Any]
     total_return_pct: float
-    win_rate_pct: float
+    # None only for a zero-trade candidate (no rate to report). Such candidates
+    # are filtered out of `best`/`leaderboard`, so anything surfaced to the API
+    # always carries a real win rate.
+    win_rate_pct: float | None
     max_drawdown_pct: float
     num_trades: int
     score: float
@@ -189,7 +192,11 @@ def train(
         candidate = TrainingCandidate(
             params=params,
             total_return_pct=round(result.total_return_pct, 2),
-            win_rate_pct=round(result.win_rate_pct, 2),
+            win_rate_pct=(
+                round(result.win_rate_pct, 2)
+                if result.win_rate_pct is not None
+                else None
+            ),
             max_drawdown_pct=round(result.max_drawdown_pct, 2),
             num_trades=result.num_trades,
             score=round(
@@ -215,7 +222,9 @@ def train(
             )
             candidate.validation_return_pct = round(v.total_return_pct, 2)
             candidate.validation_num_trades = v.num_trades
-            candidate.validation_win_rate_pct = round(v.win_rate_pct, 2)
+            candidate.validation_win_rate_pct = (
+                round(v.win_rate_pct, 2) if v.win_rate_pct is not None else None
+            )
             candidate.validation_max_drawdown_pct = round(v.max_drawdown_pct, 2)
             # Like-for-like: project the in-sample per-bar pace over the OOS
             # window instead of subtracting totals from unequal-length windows.

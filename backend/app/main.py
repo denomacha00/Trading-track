@@ -1478,13 +1478,16 @@ def backtest(
         "ending_balance": round(result.ending_balance, 2),
         "total_return_pct": round(result.total_return_pct, 2),
         "num_trades": result.num_trades,
-        "win_rate_pct": round(result.win_rate_pct, 2),
+        "win_rate_pct": (
+            round(result.win_rate_pct, 2) if result.win_rate_pct is not None else None
+        ),
         "max_drawdown_pct": round(result.max_drawdown_pct, 2),
         "total_fees": result.total_fees,
         "stop_loss_pct": sl,
         "take_profit_pct": tp,
         "trailing_stop_pct": trail,
         "equity_curve": [round(e, 2) for e in result.equity_curve],
+        "ohlc_synthetic": result.ohlc_synthetic,
         "analytics": analytics,
         "explanation": analytics["explanation"],
     }

@@ -201,3 +201,66 @@ def test_summary_hold_seconds_none_without_timestamps():
     result = run_backtest(df, MovingAverageCrossStrategy(3, 5), starting_balance=1000)
     summ = summarize_backtest(result, df, timeframe="1h")
     assert summ["avg_hold_seconds"] is None
+
+
+# ---- L11: honest zero-trade rate, equity/balance identity, synthetic OHLC ---
+
+
+def test_win_rate_is_none_when_no_trades():
+    # A flat market never triggers the strategy. With zero trades there is no
+    # win rate to report, so it must be None (rendered "-"), NOT a fabricated
+    # 0.0 that would read as "traded and lost every time".
+    prices = [100.0] * 30
+    result = run_backtest(_candles(prices), MovingAverageCrossStrategy(3, 5),
+                          starting_balance=1000)
+    assert result.num_trades == 0
+    assert result.win_rate_pct is None
+
+
+def test_win_rate_is_zero_when_traded_and_all_lost():
+    # A genuine 0% win rate (it traded, every trade lost) is still 0.0, not None —
+    # None means "no trades", 0.0 means "traded, none won". They must not collapse.
+    # Rise to trigger a long, then a hard crash so the only trade loses.
+    prices = [10, 10, 10, 10, 10, 11, 12, 13, 14, 15, 16, 8, 6, 4, 2]
+    result = run_backtest(_candles(prices), MovingAverageCrossStrategy(3, 5),
+                          starting_balance=1000, fee_pct=0.1, slippage_pct=0.1)
+    assert result.num_trades >= 1
+    assert all(t.pnl <= 0 for t in result.trades)
+    assert result.win_rate_pct == 0.0
+
+
+def test_equity_curve_last_point_equals_ending_balance():
+    # An open-at-the-end position is liquidated net of exit fee + slippage. The
+    # final equity point must equal that realised ending balance, not the raw
+    # mark-to-market close (which ignores the exit cost). With a non-zero fee the
+    # two would differ unless the curve's last point is reconciled to the balance.
+    prices = [10, 9, 8, 7, 6, 5, 4, 3, 2, 1] + list(range(2, 40))
+    result = run_backtest(_candles(prices), MovingAverageCrossStrategy(3, 5),
+                          starting_balance=1000, fee_pct=0.1, slippage_pct=0.1)
+    assert result.num_trades >= 1
+    # The last trade is the end-of-run liquidation (position was still open).
+    assert result.trades[-1].exit_index == len(prices) - 1
+    assert result.equity_curve[-1] == pytest.approx(result.ending_balance, abs=1e-9)
+
+
+def test_ohlc_synthetic_flag_reflects_missing_columns():
+    # Full OHLC candles: the flag is False (real bar range used for intrabar exits).
+    prices = list(range(1, 40))
+    full = run_backtest(_candles(prices), MovingAverageCrossStrategy(3, 5),
+                        starting_balance=1000)
+    assert full.ohlc_synthetic is False
+
+    # Close-only history: open/high/low were substituted with the close, so the
+    # flag is True and the summary says the exit timing is approximate.
+    close_only = pd.DataFrame(
+        {"timestamp": range(len(prices)), "close": [float(p) for p in prices],
+         "volume": [1.0] * len(prices)}
+    )
+    synth = run_backtest(close_only, MovingAverageCrossStrategy(3, 5),
+                         starting_balance=1000)
+    assert synth.ohlc_synthetic is True
+    summ = summarize_backtest(synth, close_only, timeframe="1h")
+    assert summ["ohlc_synthetic"] is True
+    if synth.num_trades > 0:
+        assert "closing price only" in summ["explanation"].lower()
+
