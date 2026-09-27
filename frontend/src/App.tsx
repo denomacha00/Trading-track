@@ -2564,10 +2564,13 @@ function BotPulse({
 
 function StatsRow({ status }: { status: BotStatus | null }) {
   const cls = (n: number) => (n > 0 ? 'pos' : n < 0 ? 'neg' : '')
+  const stale = !!status?.prices_stale
   return (
     <section className="stats">
       <div className="stat">
-        <div className="label">Equity</div>
+        <div className="label">
+          Equity{stale && <span className="stale-tag" title="Price feed can't value an open position right now — equity and unrealized PnL are unavailable, not zero. Your cash balance is still correct."> · feed stale</span>}
+        </div>
         <div className="value">${fmt(status?.equity)}</div>
       </div>
       <div className="stat">

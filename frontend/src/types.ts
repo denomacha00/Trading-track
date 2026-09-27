@@ -22,11 +22,15 @@ export interface BotStatus {
   exchange_connected: boolean
   open_positions: number
   balance: number
-  equity: number
+  // NULL when the price feed can't value an open position right now (the UI shows
+  // "-" rather than a fabricated break-even). Free cash (`balance`) stays honest.
+  equity: number | null
   realized_pnl: number
-  unrealized_pnl: number
+  unrealized_pnl: number | null
   day_pnl: number
   max_open_positions: number
+  // True when ≥1 open position can't be priced, so equity/unrealized read stale.
+  prices_stale?: boolean
   // Risk-safeguard + autopilot visibility. All optional so older payloads
   // (and tests that assert only the core keys) keep parsing.
   killswitch?: boolean

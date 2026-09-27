@@ -266,6 +266,13 @@ select {
   letter-spacing: 0.5px;
 }
 
+.stale-tag {
+  color: var(--warn, #d98a00);
+  text-transform: none;
+  letter-spacing: 0;
+  cursor: help;
+}
+
 .stat .value {
   font-size: 22px;
   font-weight: 700;

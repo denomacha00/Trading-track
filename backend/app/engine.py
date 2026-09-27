@@ -509,17 +509,19 @@ class TradingEngine:
         Fed into the daily-loss circuit breaker so a large *open* drawdown blocks
         NEW entries even before any losing trade is realized — capital
         preservation ("less loss") shouldn't wait for a stop to fire.
+
+        RAISES (via ``_price``) if any open position can't be priced right now. A
+        feed outage must NOT be silently valued at ``entry_price`` — that reads as
+        zero unrealized PnL and would blind the loss breaker / kill-switch to a
+        real drawdown. Callers treat the raise as "account currently unvaluable"
+        and degrade safe rather than trusting a fabricated all-clear.
         """
         open_trades = db.scalars(
             self._scope_book(select(Trade).where(Trade.status == TradeStatus.open.value))
         ).all()
         total = 0.0
         for t in open_trades:
-            try:
-                price = self._price(t.symbol, fallback=t.entry_price)
-            except Exception:
-                price = t.entry_price
-            total += self.unrealized_pnl(t, price)
+            total += self.unrealized_pnl(t, self._price(t.symbol))
         return total
 
     # ---- risk safeguards --------------------------------------------
@@ -530,6 +532,12 @@ class TradingEngine:
 
         Matches the ``equity`` figure reported by ``status`` and is the basis for
         the max-drawdown kill-switch.
+
+        RAISES (via ``_price``) if any open position can't be priced right now, so
+        the kill-switch's "can't value the account → never fabricate a breach"
+        branch fires instead of reading a fabricated, unchanged equity off
+        ``entry_price``. On a feed outage the honest answer is "unknown", not
+        "break-even".
         """
         balance = self._equity(db)
         position_value = 0.0
@@ -537,10 +545,7 @@ class TradingEngine:
             self._scope_book(select(Trade).where(Trade.status == TradeStatus.open.value))
         ).all()
         for t in open_trades:
-            try:
-                price = self._price(t.symbol, fallback=t.entry_price)
-            except Exception:
-                price = t.entry_price
+            price = self._price(t.symbol)
             position_value += t.entry_price * t.amount + self.unrealized_pnl(t, price)
         return balance + position_value
 
@@ -902,6 +907,19 @@ class TradingEngine:
             # intended fill), not the current market price.
             ref_price = limit_price if limit_price else price
             equity = self._equity(db)
+            # Value the rest of the book to feed the loss/exposure checks. If a
+            # currently-open position can't be priced (feed outage), we're blind to
+            # real exposure — refuse the NEW entry rather than deploy capital on a
+            # fabricated all-clear. Existing positions keep their own stops.
+            try:
+                day_unrealized = self._open_unrealized(db)
+                equity_for_limits = self._total_equity(db)
+            except Exception:
+                return False, (
+                    "Rejected by risk manager: can't value open positions right "
+                    "now (price feed unavailable) — holding new entries until it "
+                    "recovers."
+                ), None
             decision = self.risk.check(
                 db,
                 equity=equity,
@@ -909,8 +927,8 @@ class TradingEngine:
                 requested_amount=amount,
                 is_opening=True,
                 stop_price=stop_loss,
-                day_unrealized=self._open_unrealized(db),
-                equity_for_limits=self._total_equity(db),
+                day_unrealized=day_unrealized,
+                equity_for_limits=equity_for_limits,
             )
             if not decision.allowed:
                 return False, f"Rejected by risk manager: {decision.reason}", None
@@ -1233,11 +1251,22 @@ class TradingEngine:
             # Size the TOTAL once (validates daily-loss, notional, exposure), then
             # split equally. Sizing uses the CURRENT price, which is conservative
             # because most legs rest below it (slightly less notional than sized).
+            # Refuse the ladder if the rest of the book can't be valued (feed
+            # outage): scaling in while blind to real exposure is exactly the
+            # account-blowup risk this bot is meant to prevent.
+            try:
+                day_unrealized = self._open_unrealized(db)
+                equity_for_limits = self._total_equity(db)
+            except Exception:
+                return False, (
+                    "Can't value open positions right now (price feed "
+                    "unavailable) — holding new entries until it recovers."
+                ), []
             decision = self.risk.check(
                 db, equity=equity, price=price, requested_amount=amount,
                 is_opening=True, stop_price=stop_loss,
-                day_unrealized=self._open_unrealized(db),
-                equity_for_limits=self._total_equity(db),
+                day_unrealized=day_unrealized,
+                equity_for_limits=equity_for_limits,
             )
             if not decision.allowed:
                 return False, f"Rejected by risk manager: {decision.reason}", []
@@ -1563,10 +1592,22 @@ class TradingEngine:
         return None
 
     def _close_trade(
-        self, db: Session, trade: Trade, reason: str
+        self, db: Session, trade: Trade, reason: str,
+        fill_price: float | None = None,
     ) -> tuple[bool, str, Optional[Trade]]:
-        """Close an open trade at current market price. Caller holds the lock."""
-        price = self._price(trade.symbol, fallback=trade.entry_price)
+        """Close an open trade. Caller holds the lock.
+
+        ``fill_price``, when given, is the price the caller already observed for
+        this close (e.g. the monitor tick that tripped a stop/target, capped at
+        the level by :meth:`_paper_exit_fill`). On PAPER it is booked directly,
+        avoiding a redundant re-fetch and the ``entry_price`` fallback. On LIVE the
+        REAL exchange fill always governs; ``fill_price`` only serves as the
+        last-resort ticker fallback if the venue reports no average.
+        """
+        if fill_price is not None:
+            price = fill_price
+        else:
+            price = self._price(trade.symbol, fallback=trade.entry_price)
 
         if self.settings.is_live:
             # Read-only key? Say so honestly BEFORE touching the exchange, so the
@@ -1784,6 +1825,46 @@ class TradingEngine:
             return (price - trade.entry_price) * trade.amount
         return (trade.entry_price - price) * trade.amount
 
+    @staticmethod
+    def _cap_fill_at_level(
+        side: str, hit: str, observed: float, level: float | None
+    ) -> float:
+        """Cap a PAPER stop/target exit fill at its LEVEL when the observed tick
+        has overshot it.
+
+        This bot places REAL resting stop/target orders on live, which fire AT
+        their trigger. But the paper monitor only samples price every ~5s, so by
+        the time it notices a stop was crossed the tick can be well past the
+        level — and booking that raw overshoot fabricates an exit no resting order
+        would have gotten (extra profit on a target, or a deeper-than-real loss on
+        a stop, purely from poll timing). Cap at the level so paper matches how the
+        live resting order actually behaves. Returns the price to book.
+
+        ``level`` None/≤0 (no level set) → book the observed tick unchanged.
+        """
+        if not level or level <= 0:
+            return observed
+        if side == "buy":  # long: stop below entry, target above
+            return max(observed, level) if hit == "stop-loss" else min(observed, level)
+        # short: stop above entry, target below
+        return min(observed, level) if hit == "stop-loss" else max(observed, level)
+
+    def _paper_exit_fill(self, trade: Trade, observed: float, hit: str) -> float | None:
+        """Price to book a monitor-triggered close at, or None on live.
+
+        On LIVE the REAL exchange fill governs (``None`` lets ``_close_trade`` use
+        the exchange average). On PAPER we book the price the monitor actually
+        observed — capped at the stop/target LEVEL for a stop/target hit (see
+        :meth:`_cap_fill_at_level`); a reversal/other close books the raw tick.
+        """
+        if self.settings.is_live:
+            return None
+        if hit == "stop-loss":
+            return self._cap_fill_at_level(trade.side, hit, observed, trade.stop_loss)
+        if hit == "take-profit":
+            return self._cap_fill_at_level(trade.side, hit, observed, trade.take_profit)
+        return observed
+
     # ---- monitoring (stop-loss / take-profit) ------------------------
 
     def check_open_positions(self, db: Session) -> list[tuple[Trade, str]]:
@@ -1845,6 +1926,10 @@ class TradingEngine:
                     "banked profit on confirmed reversal"
                     if hit == "reversal" else f"{hit} triggered"
                 )
+                # Paper books at the level (capped on overshoot) so a gap past the
+                # stop/target can't fabricate a better- or worse-than-real fill;
+                # live passes None so the REAL exchange fill governs.
+                fill = self._paper_exit_fill(trade, price, hit)
                 with self._lock:
                     # Re-read under the lock: a manual close (on a different DB
                     # session) may have closed this trade between our SELECT and
@@ -1852,7 +1937,7 @@ class TradingEngine:
                     db.refresh(trade)
                     if trade.status != TradeStatus.open.value:
                         continue
-                    ok, _msg, _t = self._close_trade(db, trade, reason)
+                    ok, _msg, _t = self._close_trade(db, trade, reason, fill_price=fill)
                 self._reversal_flags.pop(trade.id, None)
                 if ok:
                     closed.append((trade, hit))
@@ -2305,11 +2390,16 @@ class TradingEngine:
         )
         unrealized = 0.0
         position_value = 0.0
+        prices_stale = False  # True if the feed can't value ≥1 open position now
         for t in open_trades:
             try:
-                price = self._price(t.symbol, fallback=t.entry_price)
+                # No entry_price fallback here: pretending "price == entry" during
+                # a feed outage would report a FAKE break-even equity/unrealized.
+                # Mark the totals stale instead and let the UI show "-".
+                price = self._price(t.symbol)
             except Exception:
-                price = t.entry_price
+                prices_stale = True
+                continue
             u = self.unrealized_pnl(t, price)
             unrealized += u
             # Current market value of an open position = its entry notional plus
@@ -2350,9 +2440,13 @@ class TradingEngine:
             "exchange_connected": self.connector.connected,
             "open_positions": len(open_trades),
             "balance": balance,
-            "equity": balance + position_value,
+            # Equity / unrealized are NULL (not a fabricated break-even) whenever a
+            # position can't be priced, so the UI shows "-". Free cash is still
+            # honest and reported. `prices_stale` lets the UI flag the degraded read.
+            "equity": None if prices_stale else balance + position_value,
             "realized_pnl": realized,
-            "unrealized_pnl": unrealized,
+            "unrealized_pnl": None if prices_stale else unrealized,
+            "prices_stale": prices_stale,
             "day_pnl": self.risk.day_realized_pnl(db),
             "max_open_positions": self.settings.max_open_positions,
             # Risk-safeguard state (honest, in-memory): the kill-switch flag lets
