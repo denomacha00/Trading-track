@@ -15,6 +15,10 @@ venv/
 *.db
 *.sqlite
 *.sqlite3
+# SQLite WAL/SHM sidecars (created at runtime in WAL mode; runtime data, never commit)
+*.db-wal
+*.db-shm
+*.db-journal
 
 # Node / frontend
 node_modules/

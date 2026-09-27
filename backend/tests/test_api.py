@@ -8,33 +8,11 @@ on the underlying modules.
 """
 from __future__ import annotations
 
-import atexit
-import os
-import tempfile
-
-os.environ.setdefault("TRADING_MODE", "paper")
-
-# Run the suite against a private, throwaway SQLite file — never the developer's
-# persistent tranding_track.db. A stale dev DB (e.g. a legacy admin row created
-# before the `username` column existed) otherwise poisons fixtures. This MUST be
-# set before importing app.database, which binds its engine at import time.
-_TEST_DB = os.path.join(tempfile.gettempdir(), f"tt_test_{os.getpid()}.db")
-for _p in (_TEST_DB, _TEST_DB + "-wal", _TEST_DB + "-shm"):
-    try:
-        os.remove(_p)
-    except OSError:
-        pass
-os.environ["DATABASE_URL"] = "sqlite:///" + _TEST_DB.replace("\\", "/")
-
-
-@atexit.register
-def _cleanup_test_db() -> None:
-    for _p in (_TEST_DB, _TEST_DB + "-wal", _TEST_DB + "-shm"):
-        try:
-            os.remove(_p)
-        except OSError:
-            pass
-
+# DB isolation + paper mode live in tests/conftest.py, which pytest imports
+# before any test module — the only point early enough to redirect DATABASE_URL
+# before app.database binds its engine. (Doing it here, after `from app.main
+# import app` below, would be too late: whichever module imports the app first
+# wins, so the suite would silently run against the real tranding_track.db.)
 
 import pytest
 from fastapi.testclient import TestClient
@@ -734,11 +712,17 @@ def test_autopilot_flag_gates_live_orders_but_not_paper():
     # A chart (view-only) change is always in the safe subset.
     assert _normalize_proposed_action({"type": "chart", "timeframe": "1h"}, eng)["auto"] is True
 
-    # Autopilot ON + LIVE: a real-money order is NEVER auto (always confirm-gated),
-    # even though non-money actions still are.
+    # Autopilot ON + LIVE: every real-money action is confirm-gated (never auto).
+    # A live order, a live risk-/autonomy-setting change and STARTING live trading
+    # all wait for a human Confirm; only capital-neutral actions (stop the bot,
+    # view-only chart) stay auto. See test_ai_action_live_guard.py for the full
+    # live matrix.
     eng_live = _AutopilotEngine(autopilot=True, live=True)
     assert _normalize_proposed_action(order, eng_live)["auto"] is False
-    assert _normalize_proposed_action({"type": "bot", "state": "start"}, eng_live)["auto"] is True
+    assert _normalize_proposed_action({"type": "bot", "state": "start"}, eng_live)["auto"] is False
+    assert _normalize_proposed_action({"type": "bot", "state": "stop"}, eng_live)["auto"] is True
+    assert _normalize_proposed_action({"type": "settings", "changes": {"risk_per_trade_pct": 5.0}}, eng_live)["auto"] is False
+    assert _normalize_proposed_action({"type": "chart", "timeframe": "1h"}, eng_live)["auto"] is True
 
     # Autopilot OFF: nothing is auto — every action waits for a manual Confirm.
     eng_off = _AutopilotEngine(autopilot=False, live=False)

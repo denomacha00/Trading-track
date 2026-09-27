@@ -1893,10 +1893,16 @@ class TradingEngine:
     ):
         """Fetch candles and run the deterministic market analyzer.
 
+        The decision is made on CLOSED bars only — a live feed's last candle is
+        still forming, and acting on it would repaint the signal and diverge from
+        the backtest that validated it (see MarketAnalyzer.analyze_live). The live
+        price is kept for display and stop-anchoring.
+
         When ``apply_strategy`` is set (autonomous + observe paths), a saved,
         trained strategy for this symbol can OVERRIDE the analyzer verdict — but
         only if the user opted in and never against the capital-preservation
-        gates (see _apply_saved_strategy).
+        gates (see _apply_saved_strategy). The saved strategy runs on the SAME
+        closed-bar frame, so it can't repaint either.
         """
         import pandas as pd
 
@@ -1906,9 +1912,9 @@ class TradingEngine:
         df = pd.DataFrame(
             raw, columns=["timestamp", "open", "high", "low", "close", "volume"]
         )
-        analysis = self.analyzer.analyze(df, symbol.upper())
+        analysis, closed = self.analyzer.analyze_live(df, symbol.upper())
         if apply_strategy:
-            analysis = self._apply_saved_strategy(symbol, df, analysis)
+            analysis = self._apply_saved_strategy(symbol, closed, analysis)
         return analysis
 
     def auto_trade_symbol(

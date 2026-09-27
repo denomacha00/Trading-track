@@ -12,8 +12,11 @@ Design principles (why this is the honest way to be "smart"):
   returns HOLD with low confidence rather than forcing a trade. "No trade" is a
   valid, often correct, decision — that is how you avoid losing money.
 - Confidence-gated: callers should only act above a confidence threshold.
-- No look-ahead: every indicator uses only data up to the evaluated bar, so it
-  behaves identically in backtest, training and live.
+- No look-ahead / no repaint: every indicator uses only data up to the LAST bar
+  of the frame it is given, and that last bar is treated as CLOSED. Live callers
+  must therefore hand it CLOSED bars only (drop the still-forming candle) — see
+  MarketAnalyzer.analyze_live — so a live verdict is computed on exactly the bar
+  a backtest would have decided on, and never repaints as the candle fills in.
 
 An AI/LLM layer (see app/ai.py) can *narrate* this analysis, but the decision
 itself is deterministic and testable.
@@ -338,6 +341,34 @@ class MarketAnalyzer:
             factors=factors,
             summary=summary,
         )
+
+    def analyze_live(
+        self, candles: pd.DataFrame, symbol: str = ""
+    ) -> tuple[MarketAnalysis, pd.DataFrame]:
+        """Analyse a LIVE feed honestly: decide on CLOSED bars only.
+
+        A live OHLCV feed's most recent candle is still FORMING — its
+        open/high/low/close keep moving until the period closes. Reading a
+        verdict off that bar makes the signal *repaint* (it can flip as the
+        candle fills in) and makes live behave differently from backtest and
+        training, which only ever see closed bars. So we drop the forming bar
+        for the DECISION, then stamp the live (forming) close back onto the
+        result as ``price`` — the verdict, score and ATR are computed purely on
+        closed data while the UI still shows the CURRENT price.
+
+        Returns ``(analysis, closed_candles)`` so a caller can run a saved
+        strategy on the exact same closed-bar frame the verdict used.
+        """
+        n = len(candles)
+        live_price = float(candles["close"].iloc[-1]) if n else 0.0
+        # Drop the still-forming last bar when there is one to spare; keep the
+        # frame intact at the ragged edge so a short history still analyses.
+        closed = candles.iloc[:-1] if n >= 2 else candles
+        analysis = self.analyze(closed, symbol)
+        if live_price > 0:
+            analysis.price = live_price  # display the CURRENT price; verdict is closed-bar
+        return analysis, closed
+
 
     @staticmethod
     def _summarize(

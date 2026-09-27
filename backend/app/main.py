@@ -132,8 +132,11 @@ def _analysis_for(engine, symbol: str, timeframe: str = "1h", limit: int = 200):
         raw, columns=["timestamp", "open", "high", "low", "close", "volume"]
     )
     # Use THIS user's analyzer so the verdict honours their configured
-    # min_signal_confidence, not a module-global default.
-    return engine.analyzer.analyze(df, symbol.upper())
+    # min_signal_confidence, not a module-global default. analyze_live decides
+    # on CLOSED bars only (dropping the still-forming candle) so the verdict
+    # cannot repaint, and stamps the live price back on for display.
+    analysis, _ = engine.analyzer.analyze_live(df, symbol.upper())
+    return analysis
 
 
 def _bootstrap_admin(db: Session) -> None:
@@ -1581,6 +1584,30 @@ _AI_SETTINGS_BOOL = {
 }
 _AI_SETTINGS_STR = {"auto_symbols", "auto_timeframe", "auto_confirm_timeframe"}
 
+# The subset of proposable settings that govern real-money RISK or arm AUTONOMY.
+# In LIVE mode a change to ANY of these is never auto-applied by autopilot — an
+# LLM must not loosen a capital-preservation rule (sizing, stops, loss limits,
+# exposure, the profit-lock, the strategy-validation gate) or switch on
+# autonomous execution on real money without a human confirming first. (We gate
+# on "touches a risk key" rather than trying to judge loosen-vs-tighten, because
+# mis-judging direction on real money is the costly error.) Paper is a safe
+# sandbox, so autopilot may still auto-apply there. Note: the max-drawdown
+# kill-switch and trading_mode aren't proposable at all — the AI can't touch them.
+_AI_RISK_SETTINGS = {
+    # position sizing & loss limits
+    "risk_per_trade_pct", "daily_loss_limit_pct", "default_stop_loss_pct",
+    "trailing_stop_pct", "max_total_exposure_pct", "min_signal_confidence",
+    "max_open_positions",
+    # profit-lock protection
+    "profit_lock_enabled", "profit_lock_trigger_pct", "profit_lock_floor_pct",
+    # strategy-validation gate (unproven edges driving real money)
+    "require_strategy_validation", "strategy_min_return_pct",
+    "strategy_min_win_rate_pct", "strategy_max_drawdown_pct", "strategy_min_trades",
+    # autonomy / execution controls
+    "auto_trade_enabled", "use_saved_strategy", "ai_trade_confirm",
+    "auto_pause_in_bear", "take_profit_on_reversal", "reversal_confirm_count",
+}
+
 # Chart is a VIEW-ONLY action: it changes what the operator is LOOKING AT — the
 # symbol, the timeframe, which indicators/overlays are drawn, and clearing the
 # hand-drawn lines — and moves no money, touches no account state. So it's always
@@ -1688,13 +1715,22 @@ def _normalize_proposed_action(raw: dict | None, engine) -> dict | None:
                 # Anything else (e.g. trading_mode, api keys) is silently dropped.
             if not changes:
                 return None
-            return {"type": "settings", "changes": changes, "reason": reason, "auto": autopilot}
+            # LIVE guard: a change to any risk- or autonomy-governing setting is
+            # never auto-applied on real money — it always waits for a human
+            # Confirm tap, even under autopilot. Paper stays a safe sandbox.
+            touches_risk = any(k in _AI_RISK_SETTINGS for k in changes)
+            auto = autopilot and not (live and touches_risk)
+            return {"type": "settings", "changes": changes, "reason": reason, "auto": auto}
 
         if atype == "bot":
             state = str(raw.get("state", "")).strip().lower()
             if state not in ("start", "stop"):
                 return None
-            return {"type": "bot", "state": state, "reason": reason, "auto": autopilot}
+            # Stopping is always safe (it only reduces activity). STARTING live
+            # autonomous trading is a real-money escalation, so in live it needs a
+            # human confirm even under autopilot; a paper start may auto-apply.
+            auto = autopilot and not (live and state == "start")
+            return {"type": "bot", "state": state, "reason": reason, "auto": auto}
 
         if atype == "alert":
             symbol = str(raw.get("symbol", "")).strip().upper()
