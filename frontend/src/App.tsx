@@ -615,7 +615,6 @@ function Dashboard({
   // That's the "Performance reacting to the whole dashboard" jank, fixed at the
   // source: the panel now only re-renders on its OWN data, never on price ticks.
   const showPanelError = useCallback((m: string) => showToast('error', m), [showToast])
-
   // Read a line aloud via the browser's Web Speech API — ONLY when the user has
   // turned voice on (OFF by default) and the browser supports it. Shared by the
   // assistant's typed replies and the proactive monitor/alert call-outs.
@@ -669,6 +668,14 @@ function Dashboard({
       /* ignore */
     }
   }, [])
+
+  // Stable "history changed" callback for the History panel (see showPanelError):
+  // memoized so passing it as a prop doesn't defeat HistoryPanel's React.memo and
+  // re-render it on every 3s price tick. Refetches both lists after a delete there.
+  const refreshHistory = useCallback(() => {
+    refreshTrades()
+    refreshSignals()
+  }, [refreshTrades, refreshSignals])
 
   // The user's price alerts — refetched after one fires (its status flips to
   // "triggered"), after an add/delete, and on a slow poll as a safety net.
@@ -1043,6 +1050,81 @@ function Dashboard({
     }
   }
 
+  // Delete ONE closed trade from the journal. This is a HISTORY delete: it drops
+  // the record (and the stats built from it) but never rewinds the wallet —
+  // realized P/L was already banked when the trade closed — and never touches the
+  // exchange. Open/pending rows aren't deletable (the backend refuses with 409).
+  const deleteTradeRow = async (id: number) => {
+    try {
+      await api.deleteTrade(id)
+      showToast('ok', 'Trade removed from your history.')
+      refreshTrades()
+    } catch (e) {
+      showToast('error', (e as Error).message)
+    }
+  }
+
+  // Clear the whole CLOSED-trade journal (both books). Confirmed, with an honest
+  // note that it only wipes history + analytics, not the wallet or the exchange,
+  // and that open positions are kept.
+  const clearTradeHistory = async () => {
+    const closedCount = trades.filter((t) => t.status === 'closed').length
+    if (closedCount === 0) {
+      showToast('error', 'No closed trades to clear.')
+      return
+    }
+    if (
+      !window.confirm(
+        `Delete ${closedCount} closed trade${closedCount === 1 ? '' : 's'} from your history?\n\n` +
+          'This clears the trade journal and the performance stats built from it. ' +
+          'It does NOT change your wallet balance and never touches the exchange. ' +
+          'Open positions are kept. This cannot be undone.',
+      )
+    )
+      return
+    try {
+      const res = await api.clearTrades('all')
+      showToast('ok', `Cleared ${res.deleted} trade${res.deleted === 1 ? '' : 's'} from history.`)
+      refreshTrades()
+    } catch (e) {
+      showToast('error', (e as Error).message)
+    }
+  }
+
+  // Delete ONE signal-log entry. The log is read-only history, so this never
+  // affects positions, orders, or balance.
+  const deleteSignalRow = async (id: number) => {
+    try {
+      await api.deleteSignal(id)
+      refreshSignals()
+    } catch (e) {
+      showToast('error', (e as Error).message)
+    }
+  }
+
+  // Clear the entire signal log (all of the user's rows, not just the page shown).
+  const clearSignalHistory = async () => {
+    if (signals.length === 0) {
+      showToast('error', 'No signals to clear.')
+      return
+    }
+    if (
+      !window.confirm(
+        'Clear your entire signal log?\n\n' +
+          'This is a read-only history of incoming signals — clearing it never ' +
+          'affects positions, orders, or balance. This cannot be undone.',
+      )
+    )
+      return
+    try {
+      const res = await api.clearSignals()
+      showToast('ok', `Cleared ${res.deleted} signal${res.deleted === 1 ? '' : 's'}.`)
+      refreshSignals()
+    } catch (e) {
+      showToast('error', (e as Error).message)
+    }
+  }
+
   const doScaledOrder = async () => {
     if (scaling) return // guard against double-submit
     const amt = amount ? Number(amount) : undefined
@@ -1231,6 +1313,7 @@ function Dashboard({
             setNotifs([])
             setNotifUnread(0)
           }}
+          onDismiss={(id) => setNotifs((n) => n.filter((x) => x.id !== id))}
         />
         <ThemeToggle theme={theme} onToggle={onToggleTheme} />
         <button className="btn primary" onClick={toggleBot}>
@@ -1716,11 +1799,19 @@ function Dashboard({
                   trades={trades}
                   openTrades={openTrades}
                   onClose={closeTrade}
+                  onDelete={deleteTradeRow}
+                  onClear={clearTradeHistory}
                   pnlClass={pnlClass}
                   closingId={closing}
                 />
               )}
-              {tab === 'signals' && <SignalsTable signals={signals} />}
+              {tab === 'signals' && (
+                <SignalsTable
+                  signals={signals}
+                  onDelete={deleteSignalRow}
+                  onClear={clearSignalHistory}
+                />
+              )}
               {tab === 'performance' && (
                 <PerformancePanel onError={showPanelError} />
               )}
@@ -1729,6 +1820,7 @@ function Dashboard({
                   trades={trades}
                   signals={signals}
                   onError={showPanelError}
+                  onChanged={refreshHistory}
                 />
               )}
               {tab === 'assistant' && (
@@ -1953,11 +2045,13 @@ function NotificationsBell({
   unread,
   onOpen,
   onClear,
+  onDismiss,
 }: {
   items: Notif[]
   unread: number
   onOpen: () => void
   onClear: () => void
+  onDismiss: (id: number) => void
 }) {
   const [open, setOpen] = useState(false)
   const wrapRef = useRef<HTMLDivElement | null>(null)
@@ -2022,6 +2116,15 @@ function NotificationsBell({
                     <div>{n.text}</div>
                     <div className="notif-time">{relativeTime(n.ts)}</div>
                   </div>
+                  <button
+                    type="button"
+                    className="notif-x"
+                    onClick={() => onDismiss(n.id)}
+                    aria-label="Dismiss notification"
+                    title="Dismiss"
+                  >
+                    ✕
+                  </button>
                 </div>
               ))}
             </div>
@@ -2909,64 +3012,93 @@ function TradesTable({
   trades,
   openTrades,
   onClose,
+  onDelete,
+  onClear,
   pnlClass,
   closingId,
 }: {
   trades: Trade[]
   openTrades: Trade[]
   onClose: (id: number) => void
+  onDelete: (id: number) => void
+  onClear: () => void
   pnlClass: (n: number) => string
   closingId?: number | null
 }) {
   if (!trades.length) return <div className="empty">No trades yet.</div>
   const openIds = new Set(openTrades.map((t) => t.id))
+  const closedCount = trades.filter((t) => t.status === 'closed').length
   return (
-    <table>
-      <thead>
-        <tr>
-          <th>Symbol</th>
-          <th>Side</th>
-          <th className="mono">Entry</th>
-          <th className="mono">PnL</th>
-          <th>Status</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>
-        {trades.map((t) => (
-          <tr key={t.id}>
-            <td>{t.symbol}</td>
-            <td>
-              <span className={`tag ${t.side}`}>{t.side}</span>
-            </td>
-            <td className="mono">
-              {t.status === 'pending' && t.limit_price
-                ? `${fmt(t.limit_price)} (limit)`
-                : fmt(t.entry_price)}
-            </td>
-            <td className={`mono ${pnlClass(t.pnl)}`}>{fmt(t.pnl)}</td>
-            <td>
-              <span className={`tag ${t.status}`}>{t.status}</span>
-            </td>
-            <td>
-              {openIds.has(t.id) && (
-                <button
-                  className="btn"
-                  onClick={() => onClose(t.id)}
-                  disabled={closingId !== null && closingId !== undefined}
-                >
-                  {closingId === t.id
-                    ? 'Working…'
-                    : t.status === 'pending'
-                      ? 'Cancel'
-                      : 'Close'}
-                </button>
-              )}
-            </td>
+    <div className="table-wrap">
+      {closedCount > 0 && (
+        <div className="table-toolbar">
+          <span className="hint">{closedCount} closed in history</span>
+          <span className="spacer" />
+          <button type="button" className="btn ghost sm" onClick={onClear}>
+            🗑 Clear history
+          </button>
+        </div>
+      )}
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Side</th>
+            <th className="mono">Entry</th>
+            <th className="mono">PnL</th>
+            <th>Status</th>
+            <th></th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {trades.map((t) => (
+            <tr key={t.id}>
+              <td>{t.symbol}</td>
+              <td>
+                <span className={`tag ${t.side}`}>{t.side}</span>
+              </td>
+              <td className="mono">
+                {t.status === 'pending' && t.limit_price
+                  ? `${fmt(t.limit_price)} (limit)`
+                  : fmt(t.entry_price)}
+              </td>
+              <td className={`mono ${pnlClass(t.pnl)}`}>{fmt(t.pnl)}</td>
+              <td>
+                <span className={`tag ${t.status}`}>{t.status}</span>
+              </td>
+              <td>
+                {openIds.has(t.id) ? (
+                  <button
+                    className="btn"
+                    onClick={() => onClose(t.id)}
+                    disabled={closingId !== null && closingId !== undefined}
+                  >
+                    {closingId === t.id
+                      ? 'Working…'
+                      : t.status === 'pending'
+                        ? 'Cancel'
+                        : 'Close'}
+                  </button>
+                ) : (
+                  t.status === 'closed' && (
+                    // History delete only: removes this record (and its stats),
+                    // never the wallet balance or anything on the exchange.
+                    <button
+                      className="btn ghost sm icon-btn"
+                      onClick={() => onDelete(t.id)}
+                      title="Delete this trade from your history"
+                      aria-label="Delete this trade from your history"
+                    >
+                      🗑
+                    </button>
+                  )
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   )
 }
 
@@ -2990,7 +3122,15 @@ function ratingFor(
 type SigSource = 'all' | 'analyzer' | 'tradingview'
 type SigAction = 'all' | 'buy' | 'sell' | 'hold'
 
-function SignalsTable({ signals }: { signals: SignalRow[] }) {
+function SignalsTable({
+  signals,
+  onDelete,
+  onClear,
+}: {
+  signals: SignalRow[]
+  onDelete: (id: number) => void
+  onClear: () => void
+}) {
   const [srcFilter, setSrcFilter] = useState<SigSource>('all')
   const [actFilter, setActFilter] = useState<SigAction>('all')
 
@@ -3076,6 +3216,11 @@ function SignalsTable({ signals }: { signals: SignalRow[] }) {
         </div>
         <span className="spacer" />
         <span className="hint">{filtered.length} shown</span>
+        {signals.length > 0 && (
+          <button type="button" className="btn ghost sm" onClick={onClear}>
+            🗑 Clear log
+          </button>
+        )}
       </div>
 
       {!signals.length ? (
@@ -3097,6 +3242,7 @@ function SignalsTable({ signals }: { signals: SignalRow[] }) {
               <th>Confidence</th>
               <th>Acted</th>
               <th>Detail</th>
+              <th></th>
             </tr>
           </thead>
           <tbody>
@@ -3133,6 +3279,16 @@ function SignalsTable({ signals }: { signals: SignalRow[] }) {
                   </td>
                   <td>{s.accepted ? '✅' : '—'}</td>
                   <td className="muted sig-detail">{s.message ?? '-'}</td>
+                  <td>
+                    <button
+                      className="btn ghost sm icon-btn"
+                      onClick={() => onDelete(s.id)}
+                      title="Delete this signal from your log"
+                      aria-label="Delete this signal from your log"
+                    >
+                      🗑
+                    </button>
+                  </td>
                 </tr>
               )
             })}
@@ -3402,9 +3558,9 @@ function EquityCurve({ points }: { points: { t: string | null; cum: number; pnl:
 // a line), realized stat tiles, and a merged trade/signal/alert timeline.
 type HistMode = 'paper' | 'live'
 type HistEvent =
-  | { kind: 'trade'; ts: number; t: string | null; symbol: string; side: string; pnl: number; note: string | null }
-  | { kind: 'signal'; ts: number; t: string; symbol: string | null; action: string | null; source: string; accepted: number; confidence: number | null }
-  | { kind: 'alert'; ts: number; t: string; symbol: string; condition: string; price: number; hit: number | null }
+  | { kind: 'trade'; id: number; ts: number; t: string | null; symbol: string; side: string; pnl: number; note: string | null }
+  | { kind: 'signal'; id: number; ts: number; t: string; symbol: string | null; action: string | null; source: string; accepted: number; confidence: number | null }
+  | { kind: 'alert'; id: number; ts: number; t: string; symbol: string; condition: string; price: number; hit: number | null }
 
 // Memoized (see PerformancePanel): with stable `onError` it re-renders only when
 // its trades/signals props actually change, not on every dashboard price tick.
@@ -3413,10 +3569,14 @@ function HistoryPanelImpl({
   trades,
   signals,
   onError,
+  onChanged,
 }: {
   trades: Trade[]
   signals: SignalRow[]
   onError: (msg: string) => void
+  // Tell the Dashboard to refetch trades/signals after a history delete here, so
+  // the Trades/Signals tabs stay in sync with what this journal now shows.
+  onChanged: () => void
 }) {
   const [perf, setPerf] = useState<Performance | null>(null)
   const [alerts, setAlerts] = useState<Alert[]>([])
@@ -3500,20 +3660,38 @@ function HistoryPanelImpl({
       if (t.status !== 'closed' || t.mode !== mode) return
       if (sym !== 'all' && t.symbol !== sym) return
       if (!inRange(t.closed_at)) return
-      out.push({ kind: 'trade', ts: t.closed_at ? new Date(t.closed_at).getTime() : 0, t: t.closed_at, symbol: t.symbol, side: t.side, pnl: t.pnl, note: t.note })
+      out.push({ kind: 'trade', id: t.id, ts: t.closed_at ? new Date(t.closed_at).getTime() : 0, t: t.closed_at, symbol: t.symbol, side: t.side, pnl: t.pnl, note: t.note })
     })
     signals.forEach((s) => {
       if (sym !== 'all' && s.symbol !== sym) return
       if (!inRange(s.created_at)) return
-      out.push({ kind: 'signal', ts: new Date(s.created_at).getTime(), t: s.created_at, symbol: s.symbol, action: s.action, source: s.source, accepted: s.accepted, confidence: s.confidence })
+      out.push({ kind: 'signal', id: s.id, ts: new Date(s.created_at).getTime(), t: s.created_at, symbol: s.symbol, action: s.action, source: s.source, accepted: s.accepted, confidence: s.confidence })
     })
     alerts.forEach((a) => {
       if (a.status !== 'triggered' || (sym !== 'all' && a.symbol !== sym) || !inRange(a.triggered_at)) return
-      out.push({ kind: 'alert', ts: a.triggered_at ? new Date(a.triggered_at).getTime() : 0, t: a.triggered_at ?? '', symbol: a.symbol, condition: a.condition, price: a.price, hit: a.triggered_price })
+      out.push({ kind: 'alert', id: a.id, ts: a.triggered_at ? new Date(a.triggered_at).getTime() : 0, t: a.triggered_at ?? '', symbol: a.symbol, condition: a.condition, price: a.price, hit: a.triggered_price })
     })
     return out.sort((a, b) => b.ts - a.ts).slice(0, 200)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [trades, signals, alerts, mode, sym, days])
+
+  // Delete ONE journal entry from here, routed to the right record: a closed
+  // trade, a signal-log row, or a fired alert. All three are history deletes —
+  // they remove the record (and any stats built from it) but never rewind the
+  // wallet or touch the exchange. After it lands we refetch both the parent's
+  // trades/signals (so the Trades/Signals tabs match) and this panel's own perf
+  // + alerts (so the curve and stat tiles update).
+  const removeEvent = async (e: HistEvent) => {
+    try {
+      if (e.kind === 'trade') await api.deleteTrade(e.id)
+      else if (e.kind === 'signal') await api.deleteSignal(e.id)
+      else await api.deleteAlert(e.id)
+      onChanged()
+      await load()
+    } catch (err) {
+      onError((err as Error).message)
+    }
+  }
 
   if (loading && !perf)
     return <div className="empty" style={{ minHeight: 160 }}>Loading history…</div>
@@ -3651,6 +3829,14 @@ function HistoryPanelImpl({
                     {e.hit != null ? <span className="muted tiny"> · hit ${fmt(e.hit)}</span> : null}
                   </span>
                 )}
+                <button
+                  className="btn ghost sm icon-btn tl-del"
+                  onClick={() => removeEvent(e)}
+                  title="Delete this entry from your history"
+                  aria-label="Delete this entry from your history"
+                >
+                  🗑
+                </button>
               </li>
             ))}
           </ul>
@@ -4003,6 +4189,23 @@ function AssistantPanel({
     setTurns((arr) => arr.filter((x) => x !== m))
   }
 
+  // Clear the ENTIRE transcript (with confirm). Wipes the shared turns; the
+  // parent's save effect then persists the empty list, so the 24h browser-local
+  // store is cleared too. The assistant's memory of earlier turns is gone after
+  // this — nothing here is recoverable.
+  const clearChat = () => {
+    if (!turns.length) return
+    if (
+      !window.confirm(
+        'Clear this entire conversation? The assistant will forget the earlier ' +
+          'turns. This cannot be undone.',
+      )
+    )
+      return
+    setCopied(null)
+    setTurns([])
+  }
+
   // Attach an image the AI can read. Validates it's an image, caps the raw file at
   // 12 MB (pre-downscale), then downscales+re-encodes to a small JPEG. Any failure
   // surfaces as a toast — never a silent drop or a fabricated attachment.
@@ -4218,6 +4421,18 @@ function AssistantPanel({
   return (
     <div className="assistant">
       <div className="chat-col">
+        {turns.length > 0 && (
+          <div className="chat-toolbar">
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={clearChat}
+              title="Clear the whole conversation"
+            >
+              🗑 Clear chat
+            </button>
+          </div>
+        )}
         <div className="chat-list" ref={listRef}>
             {turns.length === 0 ? (
               <div className="chat-empty">

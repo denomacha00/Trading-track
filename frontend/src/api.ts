@@ -149,10 +149,22 @@ export const api = {
     req<Settings>('/api/settings', { method: 'PATCH', body: JSON.stringify(patch) }),
   trades: (status?: string) =>
     req<Trade[]>(`/api/trades${status ? `?status=${status}` : ''}`),
+  // Delete ONE closed trade from the journal (never an open/pending position;
+  // does not change the wallet — realized P/L was already banked).
+  deleteTrade: (id: number) =>
+    req<{ deleted: number }>(`/api/trades/${id}`, { method: 'DELETE' }),
+  // Clear CLOSED trade history for a book: 'paper' (default), 'live', or 'all'.
+  clearTrades: (mode: 'paper' | 'live' | 'all' = 'paper') =>
+    req<{ deleted: number }>(`/api/trades?mode=${mode}`, { method: 'DELETE' }),
   // Realized performance analytics computed live from the user's CLOSED trades
   // (win rate, profit factor, drawdown, per-symbol, paper/live splits).
   performance: () => req<Performance>('/api/performance'),
   signals: () => req<SignalRow[]>('/api/signals'),
+  // Signal log is read-only history — deleting entries never affects positions.
+  deleteSignal: (id: number) =>
+    req<{ deleted: number }>(`/api/signals/${id}`, { method: 'DELETE' }),
+  clearSignals: () =>
+    req<{ deleted: number }>('/api/signals', { method: 'DELETE' }),
   setBot: (state: 'start' | 'stop') =>
     req<{ running: boolean }>(`/api/bot/${state}`, { method: 'POST' }),
   order: (body: {

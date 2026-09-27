@@ -949,6 +949,62 @@ def list_trades(
     return list(db.scalars(stmt).all())
 
 
+@app.delete("/api/trades/{trade_id}")
+def delete_trade(
+    trade_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    """Delete ONE closed trade from this user's journal.
+
+    This only removes a historical record (and the performance stats derived from
+    it). It never touches the exchange and does not change your wallet balance —
+    realized profit/loss was already banked when the trade closed. An open or
+    pending position can't be deleted here; close it first. Irreversible.
+    """
+    trade = db.get(Trade, trade_id)
+    if not trade or trade.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    if trade.status != TradeStatus.closed.value:
+        raise HTTPException(
+            status_code=409,
+            detail="Only a closed trade can be deleted. Close the position first.",
+        )
+    db.delete(trade)
+    db.commit()
+    return {"deleted": 1}
+
+
+@app.delete("/api/trades")
+def clear_trades(
+    mode: str = "paper",
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    """Clear this user's CLOSED trade journal.
+
+    Never deletes an open or pending position — those are live state; close them
+    first. `mode` selects which book to clear: "paper" (default), "live", or
+    "all". Destructive and irreversible: it wipes the journal and the performance
+    stats computed from it, but does NOT move your wallet balance or touch
+    anything on the exchange.
+    """
+    mode = (mode or "paper").strip().lower()
+    if mode not in ("paper", "live", "all"):
+        raise HTTPException(
+            status_code=400, detail="mode must be paper, live, or all"
+        )
+    stmt = delete(Trade).where(
+        Trade.user_id == user.id,
+        Trade.status == TradeStatus.closed.value,
+    )
+    if mode != "all":
+        stmt = stmt.where(Trade.mode == mode)
+    result = db.execute(stmt)
+    db.commit()
+    return {"deleted": int(result.rowcount or 0)}
+
+
 @app.get("/api/performance", response_model=PerformanceOut)
 def performance(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Realized performance analytics for the current user, computed live from
@@ -974,6 +1030,35 @@ def list_signals(
         .limit(max(1, min(limit, 200)))
     )
     return list(db.scalars(stmt).all())
+
+
+@app.delete("/api/signals/{signal_id}")
+def delete_signal(
+    signal_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    """Delete ONE entry from this user's signal log. Read-only history; removing
+    it never affects any open position, order, or balance. Irreversible."""
+    slog = db.get(SignalLog, signal_id)
+    if not slog or slog.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Signal not found")
+    db.delete(slog)
+    db.commit()
+    return {"deleted": 1}
+
+
+@app.delete("/api/signals")
+def clear_signals(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    """Clear this user's entire signal log. It is a read-only history of
+    incoming signals, so clearing it never touches positions, orders, or
+    balances. Destructive and irreversible."""
+    result = db.execute(delete(SignalLog).where(SignalLog.user_id == user.id))
+    db.commit()
+    return {"deleted": int(result.rowcount or 0)}
 
 
 # ---- Status & settings ---------------------------------------------

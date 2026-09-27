@@ -2161,6 +2161,36 @@ pre.code {
 .notif-time { color: var(--muted); font-size: 11px; margin-top: 2px; }
 .notif-empty { padding: 18px 12px; color: var(--muted); font-size: 12px; text-align: center; line-height: 1.5; }
 
+/* ── Delete / clear-history affordances ─────────────────────────────────
+   A compact icon button (🗑) for per-row/per-item history deletes, a small
+   toolbar above tables for the bulk "Clear history" action, and the per-item ✕
+   in the notifications feed. These are all HISTORY deletes (see the confirms in
+   App.tsx): they remove a record and the stats built from it, never money on the
+   wallet or anything on the exchange. */
+.icon-btn { line-height: 1; padding: 4px 8px; }
+.notif-item .notif-x {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 5px;
+  border-radius: 6px;
+}
+.notif-item .notif-x:hover { color: var(--red); background: rgba(226, 85, 90, 0.12); }
+.table-wrap { min-width: 0; }
+.table-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.chat-toolbar { display: flex; justify-content: flex-end; padding: 4px 4px 6px; }
+.tl-del { flex: 0 0 auto; align-self: center; opacity: 0.55; }
+.tl-del:hover { opacity: 1; }
+
 /* News has its own tab now, so it fills the panel body rather than sitting in a
    bordered side rail next to the chat. */
 .news-panel {

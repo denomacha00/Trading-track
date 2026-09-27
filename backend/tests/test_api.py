@@ -1207,6 +1207,150 @@ def test_reset_paper_data_preserves_live_trades(client):
         db.commit()
         db.close()
 
+
+def _mk_trade(uid, *, status, mode="paper", symbol="BTC/USDT", pnl=0.0):
+    """Insert a trade row directly and return its id."""
+    from app.database import SessionLocal
+    from app.models import Trade, TradeStatus
+    from datetime import datetime, timezone
+    db = SessionLocal()
+    try:
+        closed = status == TradeStatus.closed.value
+        t = Trade(
+            user_id=uid, symbol=symbol, side="buy", amount=0.1,
+            entry_price=100.0, exit_price=110.0 if closed else None,
+            status=status, mode=mode, pnl=pnl if closed else None,
+            closed_at=datetime.now(timezone.utc) if closed else None,
+        )
+        db.add(t)
+        db.commit()
+        return t.id
+    finally:
+        db.close()
+
+
+def _purge_trades(uid):
+    from app.database import SessionLocal
+    from app.models import Trade
+    from sqlalchemy import select
+    db = SessionLocal()
+    try:
+        for t in db.scalars(select(Trade).where(Trade.user_id == uid)).all():
+            db.delete(t)
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_delete_closed_trade_removes_it_from_journal(client):
+    from app.models import TradeStatus
+    email = "del-closed@example.com"
+    c = _sub_client(email)
+    _, uid = _engine_by_email(email)
+    tid = _mk_trade(uid, status=TradeStatus.closed.value, pnl=5.0)
+    try:
+        r = c.delete(f"/api/trades/{tid}")
+        assert r.status_code == 200 and r.json() == {"deleted": 1}
+        # Gone from the caller's journal.
+        remaining = c.get("/api/trades").json()
+        assert all(t["id"] != tid for t in remaining)
+    finally:
+        _purge_trades(uid)
+
+
+def test_cannot_delete_open_or_pending_trade(client):
+    from app.models import TradeStatus
+    email = "del-open@example.com"
+    c = _sub_client(email)
+    _, uid = _engine_by_email(email)
+    open_id = _mk_trade(uid, status=TradeStatus.open.value)
+    pend_id = _mk_trade(uid, status=TradeStatus.pending.value)
+    try:
+        # A live/open position is not history — it must never be deletable.
+        assert c.delete(f"/api/trades/{open_id}").status_code == 409
+        assert c.delete(f"/api/trades/{pend_id}").status_code == 409
+        ids = {t["id"] for t in c.get("/api/trades").json()}
+        assert open_id in ids and pend_id in ids  # both survived
+    finally:
+        _purge_trades(uid)
+
+
+def test_delete_trade_is_ownership_scoped(client):
+    from app.models import TradeStatus
+    owner_email, other_email = "del-owner@example.com", "del-other@example.com"
+    owner = _sub_client(owner_email)
+    other = _sub_client(other_email)
+    _, owner_uid = _engine_by_email(owner_email)
+    tid = _mk_trade(owner_uid, status=TradeStatus.closed.value)
+    try:
+        # A different user cannot delete someone else's record (404, not 403,
+        # so its existence isn't even disclosed).
+        assert other.delete(f"/api/trades/{tid}").status_code == 404
+        assert owner.delete(f"/api/trades/{tid}").status_code == 200
+    finally:
+        _purge_trades(owner_uid)
+
+
+def test_clear_trades_closed_only_and_mode_filter(client):
+    from app.models import TradeStatus
+    email = "clear-trades@example.com"
+    c = _sub_client(email)
+    _, uid = _engine_by_email(email)
+    closed_paper = _mk_trade(uid, status=TradeStatus.closed.value, mode="paper")
+    closed_live = _mk_trade(uid, status=TradeStatus.closed.value, mode="live")
+    open_paper = _mk_trade(uid, status=TradeStatus.open.value, mode="paper")
+    try:
+        # Default mode=paper clears only the CLOSED paper row.
+        r = c.delete("/api/trades")
+        assert r.status_code == 200 and r.json() == {"deleted": 1}
+        ids = {t["id"] for t in c.get("/api/trades").json()}
+        assert closed_paper not in ids           # cleared
+        assert closed_live in ids                # other book untouched
+        assert open_paper in ids                 # open position never cleared
+        # mode=all clears the remaining CLOSED row but still spares the open one.
+        r = c.delete("/api/trades", params={"mode": "all"})
+        assert r.status_code == 200 and r.json() == {"deleted": 1}
+        ids = {t["id"] for t in c.get("/api/trades").json()}
+        assert closed_live not in ids and open_paper in ids
+    finally:
+        _purge_trades(uid)
+
+
+def test_clear_trades_rejects_bad_mode(client):
+    email = "clear-badmode@example.com"
+    c = _sub_client(email)
+    assert c.delete("/api/trades", params={"mode": "bogus"}).status_code == 400
+
+
+def test_delete_and_clear_signals(client):
+    from app.database import SessionLocal
+    from app.models import SignalLog
+    from sqlalchemy import select
+    owner_email, other_email = "sig-owner@example.com", "sig-other@example.com"
+    c = _sub_client(owner_email)
+    other = _sub_client(other_email)
+    _, uid = _engine_by_email(owner_email)
+    db = SessionLocal()
+    try:
+        for _ in range(3):
+            db.add(SignalLog(user_id=uid, source="analyzer", symbol="BTC/USDT",
+                             action="buy", raw="{}", accepted=1))
+        db.commit()
+        rows = db.scalars(select(SignalLog).where(SignalLog.user_id == uid)).all()
+        first_id = rows[0].id
+        # Ownership isolation on the per-row delete.
+        assert other.delete(f"/api/signals/{first_id}").status_code == 404
+        assert c.delete(f"/api/signals/{first_id}").status_code == 200
+        # Bulk clear removes the rest for this user only.
+        r = c.delete("/api/signals")
+        assert r.status_code == 200 and r.json()["deleted"] == 2
+        assert c.get("/api/signals").json() == []
+    finally:
+        for s in db.scalars(select(SignalLog).where(SignalLog.user_id == uid)).all():
+            db.delete(s)
+        db.commit()
+        db.close()
+
 # __APPEND_MARKER3__
 
 def test_connector_list_symbols_filters_and_hoists():
