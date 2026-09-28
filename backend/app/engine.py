@@ -21,7 +21,7 @@ from app.config import Settings
 from app.exchange import BinanceConnector
 from app.analysis import MarketAnalyzer
 from app.ai import AICommentator
-from app.models import SignalLog, Trade, TradeStatus
+from app.models import AutoConfirmation, SignalLog, Trade, TradeStatus, _as_utc
 from app.risk import RiskManager
 from app.notifier import Notifier
 from app.strategies import build_strategy
@@ -911,8 +911,18 @@ class TradingEngine:
         source: str,
         note: str | None = None,
         limit_price: float | None = None,
+        confirmed: bool = False,
+        confidence: float | None = None,
+        timeframe: str | None = None,
     ) -> tuple[bool, str, Optional[Trade]]:
-        """Execute a buy/sell/close signal. Returns (accepted, message, trade)."""
+        """Execute a buy/sell/close signal. Returns (accepted, message, trade).
+
+        ``confirmed`` bypasses the confirm-before-live gate for an entry the
+        operator has just APPROVED (see :meth:`resolve_auto_confirmation`) — it
+        is never set by the autonomous path itself. ``confidence`` and
+        ``timeframe`` are carried only to annotate a queued auto-confirmation
+        (what the analyzer read at proposal time); they do not affect execution.
+        """
         symbol = symbol.upper().strip()
         action = action.lower().strip()
         if action not in {"buy", "sell", "close"}:
@@ -1038,6 +1048,38 @@ class TradingEngine:
                 return False, f"Rejected by risk manager: {decision.reason}", None
 
             qty = decision.amount
+
+            # ---- Confirm-before-LIVE gate for AUTONOMOUS entries ----------
+            # The bot may watch the real market all night and decide entries on
+            # its own, but on a REAL-money account it asks first when
+            # auto_live_confirm is on ("it can trade real market but it will
+            # confirm when given permission"). We queue the fully risk-checked
+            # decision and ping the operator instead of placing it. This never
+            # touches paper (simulated), exits/closes (a protective exit must
+            # never wait on a human — closes returned far above), or deliberate
+            # MANUAL orders; and the one-shot ``confirmed`` flag lets the approve
+            # endpoint re-run this method fresh without re-queuing. Turning the
+            # gate OFF restores full "trade alone" autonomy.
+            if (
+                source == "auto"
+                and action == "buy"
+                and self.settings.is_live
+                and not confirmed
+                and getattr(self.settings, "auto_live_confirm", True)
+            ):
+                return self._queue_auto_confirmation(
+                    db,
+                    symbol=symbol,
+                    side=action,
+                    qty=qty,
+                    ref_price=ref_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    note=note,
+                    confidence=confidence,
+                    timeframe=timeframe,
+                )
+
             exchange_order_id: str | None = None
             entry_fee = 0.0  # real quote fee observed on a LIVE open; paper stays 0
 
@@ -1183,6 +1225,180 @@ class TradingEngine:
                 f"{price:.2f} ({self.settings.trading_mode})"
             )
             return True, f"Opened {action} {qty:.8f} {symbol} @ {price:.2f}", trade
+
+    # ---- confirm-before-live gate (autonomous entries) --------------
+    def _confirm_scope(self, stmt):
+        if self.user_id is not None:
+            stmt = stmt.where(AutoConfirmation.user_id == self.user_id)
+        return stmt
+
+    def _confirm_ttl_minutes(self) -> float:
+        raw = getattr(self.settings, "auto_confirm_ttl_minutes", 10.0) or 10.0
+        return max(float(raw), 0.5)
+
+    def _prune_expired_confirmations(self, db: Session) -> int:
+        """Flip any pending confirmation past its freshness window to expired.
+
+        A queued live entry is a snapshot of a market that keeps moving; once it
+        is stale we must not let a late "yes" fire into a changed book. Returns
+        how many were expired (0 usually). Safe to call every monitor tick.
+        """
+        now = _utcnow()
+        stmt = self._confirm_scope(
+            select(AutoConfirmation).where(AutoConfirmation.status == "pending")
+        )
+        expired = 0
+        for row in db.scalars(stmt).all():
+            exp = _as_utc(row.expires_at)
+            if exp is not None and now >= exp:
+                row.status = "expired"
+                row.resolved_at = now
+                expired += 1
+                self._emit("auto_confirm_resolved",
+                           {"id": row.id, "symbol": row.symbol, "status": "expired"})
+        if expired:
+            db.commit()
+        return expired
+
+    def _queue_auto_confirmation(
+        self, db: Session, *, symbol: str, side: str, qty: float,
+        ref_price: float, stop_loss: float | None, take_profit: float | None,
+        note: str | None, confidence: float | None, timeframe: str | None,
+    ) -> tuple[bool, str, Optional[Trade]]:
+        """Hold an autonomous live entry for the operator's approval.
+
+        De-duped so the ~5s monitor loop can't stack hundreds of copies of the
+        same standing setup: while one proposal for (symbol, side) is pending we
+        don't queue another, and a freshly REJECTED symbol is left alone for a
+        backoff window (the re-entry cooldown, or the confirm TTL when that is
+        off) rather than re-asked every tick. Returns an accepted=False result so
+        the auto loop logs it honestly as "queued, not placed".
+        """
+        self._prune_expired_confirmations(db)
+        # Already awaiting a decision for this symbol/side — don't stack or re-ping.
+        pending = db.scalars(self._confirm_scope(
+            select(AutoConfirmation).where(
+                AutoConfirmation.symbol == symbol,
+                AutoConfirmation.side == side,
+                AutoConfirmation.status == "pending",
+            )
+        )).first()
+        if pending is not None:
+            return False, (
+                f"{symbol}: already awaiting your confirmation (id {pending.id})"
+            ), None
+        # Back off after a recent rejection so we don't nag every tick.
+        backoff = getattr(self.settings, "reentry_cooldown_minutes", 0.0) or 0.0
+        if backoff <= 0:
+            backoff = self._confirm_ttl_minutes()
+        recent = db.scalars(self._confirm_scope(
+            select(AutoConfirmation).where(
+                AutoConfirmation.symbol == symbol,
+                AutoConfirmation.status == "rejected",
+            ).order_by(AutoConfirmation.resolved_at.desc())
+        )).first()
+        if recent is not None and recent.resolved_at is not None:
+            age_min = (_utcnow() - _as_utc(recent.resolved_at)).total_seconds() / 60.0
+            if age_min < backoff:
+                return False, (
+                    f"{symbol}: rejected {age_min:.0f}m ago — holding off "
+                    f"re-proposing for {backoff:.0f}m"
+                ), None
+        ttl = self._confirm_ttl_minutes()
+        expires_at = _utcnow() + dt.timedelta(minutes=ttl)
+        row = AutoConfirmation(
+            user_id=self.user_id, symbol=symbol, side=side, amount=qty,
+            ref_price=ref_price, stop_loss=stop_loss, take_profit=take_profit,
+            confidence=confidence, timeframe=timeframe, note=note,
+            status="pending", expires_at=expires_at,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        self._emit("auto_confirm_pending", {
+            "id": row.id, "symbol": symbol, "side": side,
+            "amount": round(qty, 8), "ref_price": round(ref_price, 8),
+            "stop_loss": round(stop_loss, 8) if stop_loss else None,
+            "confidence": round(confidence, 3) if confidence is not None else None,
+            "timeframe": timeframe, "note": note,
+            "expires_at": expires_at.isoformat(),
+        })
+        conf_txt = f" ({confidence:.0%} conf)" if confidence is not None else ""
+        self._notify(
+            f"\U0001F514 The bot wants to BUY <b>{qty:.8f} {symbol}</b> @ ~"
+            f"{ref_price:.2f}{conf_txt} on LIVE.\nApprove it in the app to place, "
+            f"or it expires in {ttl:.0f} min. (Turn off 'confirm before live' to "
+            f"let it trade alone.)"
+        )
+        return False, (
+            f"Queued BUY {qty:.8f} {symbol} @ ~{ref_price:.2f} for your "
+            f"confirmation (expires in {ttl:.0f}m)."
+        ), None
+
+    def list_auto_confirmations(self, db: Session) -> list[AutoConfirmation]:
+        """Pending (still-fresh) confirmations for this user, newest first."""
+        self._prune_expired_confirmations(db)
+        stmt = self._confirm_scope(
+            select(AutoConfirmation)
+            .where(AutoConfirmation.status == "pending")
+            .order_by(AutoConfirmation.created_at.desc())
+        )
+        return list(db.scalars(stmt).all())
+
+    def pending_confirmation_count(self, db: Session) -> int:
+        try:
+            return len(self.list_auto_confirmations(db))
+        except Exception:
+            return 0
+
+    def resolve_auto_confirmation(
+        self, db: Session, confirmation_id: int, approve: bool
+    ) -> tuple[bool, str, Optional[Trade]]:
+        """Approve (place, re-priced/re-sized/re-checked) or reject a queued entry.
+
+        Approval re-runs the full order path fresh with ``confirmed=True`` so the
+        gate doesn't re-queue and every live guard (balance, spread, drawdown,
+        risk) re-applies to CURRENT conditions — a stale snapshot never fires.
+        """
+        row = db.scalars(self._confirm_scope(
+            select(AutoConfirmation).where(AutoConfirmation.id == confirmation_id)
+        )).first()
+        if row is None:
+            return False, "Confirmation not found", None
+        if row.status != "pending":
+            return False, f"Already {row.status}", None
+        if row.is_expired:
+            row.status = "expired"
+            row.resolved_at = _utcnow()
+            db.commit()
+            self._emit("auto_confirm_resolved",
+                       {"id": row.id, "symbol": row.symbol, "status": "expired"})
+            return False, (
+                "This proposal expired — the market has moved on. The bot will "
+                "re-propose if the setup still holds."
+            ), None
+        if not approve:
+            row.status = "rejected"
+            row.resolved_at = _utcnow()
+            db.commit()
+            self._emit("auto_confirm_resolved",
+                       {"id": row.id, "symbol": row.symbol, "status": "rejected"})
+            return True, f"Rejected — no order placed for {row.symbol}", None
+        # Approved: place it fresh.
+        ok, msg, trade = self.execute_signal(
+            db, action=row.side, symbol=row.symbol, amount=None,
+            stop_loss=row.stop_loss, take_profit=row.take_profit,
+            source="auto", note=row.note, confirmed=True,
+        )
+        row.status = "approved"
+        row.resolved_at = _utcnow()
+        row.trade_id = trade.id if trade is not None else None
+        db.commit()
+        self._emit("auto_confirm_resolved", {
+            "id": row.id, "symbol": row.symbol, "status": "approved",
+            "ok": ok, "trade_id": row.trade_id, "message": msg,
+        })
+        return ok, msg, trade
 
     # ---- scaled (DCA) entries ---------------------------------------
     def _place_leg(
@@ -2366,6 +2582,7 @@ class TradingEngine:
                 db, action="buy", symbol=symbol, amount=None,
                 stop_loss=self._atr_floored_stop(analysis), take_profit=None,
                 source="auto", note=note,
+                confidence=getattr(analysis, "confidence", None), timeframe=timeframe,
             )
             return ok, msg
         # sell verdict: close a long if we hold one, else stand aside.
@@ -2562,6 +2779,10 @@ class TradingEngine:
             "peak_equity": round(self._peak_equity, 2),
             # Autopilot / pause-resume visibility.
             "auto_trade_enabled": bool(getattr(self.settings, "auto_trade_enabled", False)),
+            # Live-autonomy confirm gate + how many entries are waiting on the
+            # operator right now (0 unless the bot proposed a live buy).
+            "auto_live_confirm": bool(getattr(self.settings, "auto_live_confirm", True)),
+            "pending_confirmations": self.pending_confirmation_count(db),
             "consecutive_losses": streak,
             "max_consecutive_losses": max_streak,
             "entries_paused": entries_paused,

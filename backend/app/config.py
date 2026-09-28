@@ -199,6 +199,24 @@ class Settings(BaseSettings):
     # timeframe is not a buy. Empty = single-timeframe (disabled).
     auto_confirm_timeframe: str = Field(default="")
 
+    # Confirm-before-LIVE gate for autonomous entries (beginner-safe, ON by
+    # default). When true, an entry the BOT itself decided to open (source
+    # "auto") on a REAL-money account is not placed straight away: it is queued
+    # as a pending AutoConfirmation and the operator is pinged (WebSocket +
+    # Telegram) to approve or reject it. This is the "it will confirm when given
+    # permission" behaviour — the bot watches the market autonomously but asks
+    # before spending real money. Turn OFF to let it "trade all night alone"
+    # (full autonomous live execution). Never applies to paper (simulated, $0
+    # risk), to exits/closes (a protective exit must never wait on a human), or
+    # to deliberate MANUAL orders. Approvals are freshness-checked: a queued
+    # entry expires once the market has moved on, so a stale "yes" can't fire
+    # into a changed book — the bot simply re-proposes if the setup still holds.
+    auto_live_confirm: bool = Field(default=True)
+    # How long a queued live-entry confirmation stays valid before it is treated
+    # as stale and expired (the market has moved). Clamped sane; used by the
+    # monitor loop and the approve endpoint's freshness check.
+    auto_confirm_ttl_minutes: float = Field(default=10.0)
+
     # Stand aside in a bad market, step back in when it recovers. When true
     # (default) an autonomous/saved-strategy BUY is paused while price is in a
     # bear regime (under a falling long-term trend); entries resume automatically
@@ -410,7 +428,7 @@ class Settings(BaseSettings):
             "daily_loss_limit_pct", "paper_starting_balance", "max_open_positions",
             "ai_timeout_seconds", "ai_connect_timeout_seconds", "ai_max_tokens",
             "access_token_ttl_minutes", "monitor_interval_seconds",
-            "reversal_confirm_count",
+            "reversal_confirm_count", "auto_confirm_ttl_minutes",
         )
         for name in positive:
             val = getattr(self, name)

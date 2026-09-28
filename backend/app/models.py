@@ -221,6 +221,58 @@ class PriceAlert(Base):
     triggered_price: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
+class AutoConfirmation(Base):
+    """A LIVE entry the bot decided on itself, held for the operator's yes/no.
+
+    When ``auto_live_confirm`` is on, an autonomous (source "auto") BUY on a
+    real-money account is NOT placed immediately — a row is queued here and the
+    operator is pinged to approve or reject it ("it will confirm when given
+    permission"). Approving re-runs the order fresh (re-priced, re-sized,
+    re-risk-checked) so a stale snapshot never fires; rejecting drops it. A row
+    also ``expires`` once the market has moved on past ``expires_at`` so a late
+    "yes" can't fire into a changed book. The stored ``amount``/``ref_price`` are
+    the snapshot AT PROPOSAL TIME — shown to the operator for context only; the
+    actual fill is sized live on approval. Nothing here is fabricated: every
+    field is the real decision the analyzer just made.
+    """
+
+    __tablename__ = "auto_confirmations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    side: Mapped[str] = mapped_column(String(8), default="buy")
+    # Snapshot at proposal time (informational — re-sized/re-priced on approval).
+    amount: Mapped[float] = mapped_column(Float)
+    ref_price: Mapped[float] = mapped_column(Float)
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    timeframe: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # pending | approved | rejected | expired
+    status: Mapped[str] = mapped_column(String(12), default="pending", index=True)
+    # The Trade opened when this confirmation was approved (else NULL).
+    trade_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    expires_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    resolved_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    @property
+    def is_expired(self) -> bool:
+        """True once a still-pending row has passed its freshness window."""
+        if self.status != "pending":
+            return False
+        exp = _as_utc(self.expires_at)
+        return exp is not None and _utcnow() >= exp
+
+
 class KeyValue(Base):
     """Simple persisted key/value store for runtime state.
 

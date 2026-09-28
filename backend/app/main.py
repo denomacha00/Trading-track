@@ -60,8 +60,10 @@ from app.schemas import (
     AddLicenseDays,
     AlertCreate,
     AlertOut,
+    AutoConfirmationOut,
     BotStatus,
     CloseAllResult,
+    ConfirmationResolveResult,
     CredentialsUpdate,
     ExecutionResult,
     LicenseKeyCreate,
@@ -1167,6 +1169,8 @@ def _settings_out(engine, user: User, db: Session | None = None) -> SettingsOut:
         auto_symbols=s.auto_symbols,
         auto_timeframe=s.auto_timeframe,
         auto_confirm_timeframe=s.auto_confirm_timeframe,
+        auto_live_confirm=getattr(s, "auto_live_confirm", True),
+        auto_confirm_ttl_minutes=getattr(s, "auto_confirm_ttl_minutes", 10.0),
         use_saved_strategy=getattr(s, "use_saved_strategy", False),
         ai_trade_confirm=getattr(s, "ai_trade_confirm", False),
         ai_pretrade_analysis=getattr(s, "ai_pretrade_analysis", False),
@@ -1314,6 +1318,52 @@ def delete_alert(
     db.delete(alert)
     db.commit()
     return {"deleted": alert_id}
+
+
+# ---- Autonomous live-entry confirmations ----------------------------
+# The confirm-before-live gate (Settings.auto_live_confirm): when the bot
+# decides a LIVE buy on its own it queues it here and waits for the operator's
+# approval instead of spending real money unattended. Exits/closes and paper are
+# never gated. Approving re-runs the order fresh (re-priced/re-sized/re-checked).
+
+
+@app.get("/api/auto/confirmations", response_model=list[AutoConfirmationOut])
+def list_auto_confirmations(
+    db: Session = Depends(get_db), user: User = Depends(get_current_user)
+):
+    engine = _engine_for(db, user)
+    rows = engine.list_auto_confirmations(db)
+    return [AutoConfirmationOut.model_validate(r, from_attributes=True) for r in rows]
+
+
+@app.post(
+    "/api/auto/confirmations/{cid}/approve",
+    response_model=ConfirmationResolveResult,
+)
+def approve_auto_confirmation(
+    cid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    engine = _engine_for(db, user)
+    ok, msg, trade = engine.resolve_auto_confirmation(db, cid, approve=True)
+    return ConfirmationResolveResult(
+        ok=ok, message=msg, trade_id=(trade.id if trade is not None else None)
+    )
+
+
+@app.post(
+    "/api/auto/confirmations/{cid}/reject",
+    response_model=ConfirmationResolveResult,
+)
+def reject_auto_confirmation(
+    cid: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    engine = _engine_for(db, user)
+    ok, msg, _ = engine.resolve_auto_confirmation(db, cid, approve=False)
+    return ConfirmationResolveResult(ok=ok, message=msg, trade_id=None)
 
 
 # ---- Market data ----------------------------------------------------
@@ -1895,6 +1945,7 @@ _AI_SETTINGS_FLOAT = {
     "strategy_min_win_rate_pct",
     "strategy_max_drawdown_pct",
     "monitor_interval_seconds",
+    "auto_confirm_ttl_minutes",
 }
 _AI_SETTINGS_INT = {"max_open_positions", "strategy_min_trades", "reversal_confirm_count"}
 _AI_SETTINGS_BOOL = {
@@ -1907,6 +1958,9 @@ _AI_SETTINGS_BOOL = {
     "require_strategy_validation",
     "profit_lock_enabled",
     "take_profit_on_reversal",
+    # Confirm-before-live gate. Proposable, but ALSO a risk key below so the AI
+    # can propose it yet never auto-flip it OFF on real money.
+    "auto_live_confirm",
     # ICT/smart-money lens is read-only (no money behaviour), so it's safe for the
     # AI to toggle and is deliberately NOT in _AI_RISK_SETTINGS below.
     "ict_enabled",
@@ -1935,6 +1989,9 @@ _AI_RISK_SETTINGS = {
     # autonomy / execution controls
     "auto_trade_enabled", "use_saved_strategy", "ai_trade_confirm",
     "auto_pause_in_bear", "take_profit_on_reversal", "reversal_confirm_count",
+    # confirm-before-live safety gate: the LLM must never silently disarm the
+    # human-in-the-loop on real money (nor stretch its freshness window).
+    "auto_live_confirm", "auto_confirm_ttl_minutes",
 }
 
 # Chart is a VIEW-ONLY action: it changes what the operator is LOOKING AT — the

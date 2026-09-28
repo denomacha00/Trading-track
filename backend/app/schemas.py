@@ -219,6 +219,9 @@ class BotStatus(BaseModel):
     max_drawdown_pct: float = 0.0
     peak_equity: float = 0.0
     auto_trade_enabled: bool = False
+    # Confirm-before-live gate + count of autonomous entries awaiting approval.
+    auto_live_confirm: bool = True
+    pending_confirmations: int = 0
     consecutive_losses: int = 0
     max_consecutive_losses: int = 0
     entries_paused: bool = False
@@ -245,6 +248,8 @@ class SettingsOut(BaseModel):
     auto_symbols: str
     auto_timeframe: str
     auto_confirm_timeframe: str
+    auto_live_confirm: bool = True
+    auto_confirm_ttl_minutes: float = 10.0
     use_saved_strategy: bool = False
     ai_trade_confirm: bool = False
     ai_pretrade_analysis: bool = False
@@ -287,6 +292,8 @@ class SettingsUpdate(BaseModel):
     auto_symbols: Optional[str] = None
     auto_timeframe: Optional[str] = None
     auto_confirm_timeframe: Optional[str] = None
+    auto_live_confirm: Optional[bool] = None
+    auto_confirm_ttl_minutes: Optional[float] = Field(default=None, gt=0, le=1440)
     use_saved_strategy: Optional[bool] = None
     ai_trade_confirm: Optional[bool] = None
     ai_pretrade_analysis: Optional[bool] = None
@@ -336,6 +343,38 @@ class AlertOut(BaseModel):
     created_at: Optional[dt.datetime] = None
     triggered_at: Optional[dt.datetime] = None
     triggered_price: Optional[float] = None
+
+
+class AutoConfirmationOut(BaseModel):
+    """A live entry the bot proposed on its own, awaiting the operator's yes/no.
+
+    ``amount``/``ref_price`` are the snapshot at proposal time (shown for
+    context); the actual fill is re-priced and re-sized when approved.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    symbol: str
+    side: str
+    amount: float
+    ref_price: float
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    confidence: Optional[float] = None
+    timeframe: Optional[str] = None
+    note: Optional[str] = None
+    status: str
+    created_at: Optional[dt.datetime] = None
+    expires_at: Optional[dt.datetime] = None
+
+
+class ConfirmationResolveResult(BaseModel):
+    """Outcome of approving/rejecting a queued live entry."""
+
+    ok: bool
+    message: str
+    trade_id: Optional[int] = None
 
 
 # ---- Auth & multi-user ----------------------------------------------
