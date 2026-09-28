@@ -21,6 +21,7 @@ import type {
   ProposedAction,
   ScaledResult,
   SavedStrategy,
+  ScheduledOrder,
   Settings,
   SignalRow,
   StrategyInfo,
@@ -332,6 +333,32 @@ export const api = {
   }) => req<Alert>('/api/alerts', { method: 'POST', body: JSON.stringify(body) }),
   deleteAlert: (id: number) =>
     req<{ deleted: number }>(`/api/alerts/${id}`, { method: 'DELETE' }),
+
+  // ---- scheduled / timed orders ("buy at 20:00") ----
+  // The order fires ONCE at `scheduled_for` through the same execute_signal path
+  // a manual order uses. `scheduled_for` is an ABSOLUTE instant — send UTC ISO
+  // (the UI converts the local datetime pick with new Date(local).toISOString()).
+  // A blank amount is risk-sized; a set limit_price rests the fired order as a
+  // limit. A refused run becomes an honest `error`, never a fabricated fill.
+  listScheduled: () => req<ScheduledOrder[]>('/api/orders/scheduled'),
+  createScheduled: (body: {
+    action: 'buy' | 'sell' | 'close'
+    symbol: string
+    scheduled_for: string
+    amount?: number | null
+    limit_price?: number | null
+    stop_loss?: number | null
+    take_profit?: number | null
+    note?: string | null
+  }) =>
+    req<ScheduledOrder>('/api/orders/scheduled', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  cancelScheduled: (id: number) =>
+    req<{ canceled: number; status: string }>(`/api/orders/scheduled/${id}`, {
+      method: 'DELETE',
+    }),
 
   // ---- confirm-before-live (autonomous entries awaiting your yes/no) ----
   // The bot may decide a LIVE entry on its own; when the gate is on it QUEUES it

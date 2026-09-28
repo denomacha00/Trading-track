@@ -797,7 +797,7 @@ def test_normalize_chart_rejects_empty_and_bad_fields():
     from app.main import _normalize_proposed_action
 
     assert _normalize_proposed_action({"type": "chart"}, None) is None
-    assert _normalize_proposed_action({"type": "chart", "timeframe": "2h"}, None) is None  # not in the picker
+    assert _normalize_proposed_action({"type": "chart", "timeframe": "3h"}, None) is None  # not in the picker
     assert _normalize_proposed_action({"type": "chart", "symbol": "BTC"}, None) is None  # no pair
     assert _normalize_proposed_action({"type": "chart", "indicators": {"nope": True}}, None) is None
     # A single valid field is enough to render a card.

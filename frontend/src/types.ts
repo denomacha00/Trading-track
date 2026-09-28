@@ -863,6 +863,28 @@ export interface Alert {
   triggered_price: number | null
 }
 
+// A timed order — "buy BTC at 20:00". Fires ONCE at `scheduled_for` through the
+// same execute_signal path a manual order uses: a set `limit_price` makes it a
+// resting limit, a blank `amount` is risk-sized. Lifecycle: armed → fired (with
+// `result_trade_id`) | error (with a real `error` message) | canceled. Nothing
+// is fabricated — a refused run is an honest error, never a fake fill.
+export interface ScheduledOrder {
+  id: number
+  symbol: string
+  action: 'buy' | 'sell' | 'close'
+  amount: number | null
+  limit_price: number | null
+  stop_loss: number | null
+  take_profit: number | null
+  scheduled_for: string
+  status: 'armed' | 'fired' | 'canceled' | 'error'
+  note: string | null
+  created_at: string | null
+  fired_at: string | null
+  result_trade_id: number | null
+  error: string | null
+}
+
 export type WsMessage =
   | { event: 'status'; data: BotStatus; user_id?: number }
   | { event: 'trade_opened'; data: { id: number; symbol: string; side: string } }
@@ -942,7 +964,7 @@ export type WsMessage =
       event: 'assistant'
       user_id?: number
       data: {
-        kind: 'alert' | 'monitor'
+        kind: 'alert' | 'monitor' | 'scheduled'
         event: string
         symbol: string | null
         text: string

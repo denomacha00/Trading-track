@@ -21,10 +21,10 @@ import { Admin } from './Admin'
 import { useSocket } from './useSocket'
 import { useTheme, type Theme } from './theme'
 import { ThemeToggle } from './ThemeToggle'
-import type { AiHealth, Alert, AutoConfirmation, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, Fundamentals, IctAnalysis, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, Settings, SignalRow, StrategyInfo, Technicals, TechGauge, TechItem, Ticker, Trade, TrainingReport } from './types'
+import type { AiHealth, Alert, AutoConfirmation, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, Fundamentals, IctAnalysis, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, ScheduledOrder, Settings, SignalRow, StrategyInfo, Technicals, TechGauge, TechItem, Ticker, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
-const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
+const TIMEFRAMES = ['1m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d', '1w']
 
 // WS events that mean the trades table on screen is now stale and must be
 // refetched: a position opened/closed, a resting order placed/cancelled, the
@@ -616,6 +616,11 @@ function Dashboard({
   // backend, driving the chart markers and the alerts panel. Never fabricated.
   const [alerts, setAlerts] = useState<Alert[]>([])
 
+  // The user's timed "buy at 20:00" orders (armed + recently fired/errored):
+  // real rows from the backend, driving the scheduled-orders panel. A blank
+  // amount is risk-sized; a set limit_price rests the fired order as a limit.
+  const [scheduled, setScheduled] = useState<ScheduledOrder[]>([])
+
   // LIVE entries the bot decided on its own and is holding for the operator's
   // yes/no (confirm-before-live gate). Real proposals from the backend — approving
   // re-runs the order FRESH; nothing is placed until you say yes. Empty unless the
@@ -710,6 +715,17 @@ function Dashboard({
   const refreshAlerts = useCallback(async () => {
     try {
       setAlerts(await api.listAlerts())
+    } catch {
+      /* ignore */
+    }
+  }, [])
+
+  // The user's scheduled/timed orders — refetched after one fires (its status
+  // flips to "fired"/"error" over the socket), after an add/cancel, and on a
+  // slow poll as a safety net.
+  const refreshScheduled = useCallback(async () => {
+    try {
+      setScheduled(await api.listScheduled())
     } catch {
       /* ignore */
     }
@@ -826,6 +842,12 @@ function Dashboard({
         showToast(d.level === 'warn' ? 'error' : 'ok', d.text)
         speak(d.text)
         if (d.kind === 'alert') refreshAlerts()
+        // A scheduled "buy at 20:00" order just fired (or was refused) — refetch
+        // the list so its status flips, and trades since a fill may have opened.
+        if (d.kind === 'scheduled') {
+          refreshScheduled()
+          refreshTrades()
+        }
       }
       if (m.event === 'profit_locked') {
         // The bot ratcheted an open winner's stop up INTO profit. It's fee-aware:
@@ -941,8 +963,9 @@ function Dashboard({
     refreshTrades()
     refreshSignals()
     refreshAlerts()
+    refreshScheduled()
     refreshAutoConfirms()
-  }, [loadSettings, refreshAccess, loadAiHealth, refreshTrades, refreshSignals, refreshAlerts, refreshAutoConfirms, applyStatus])
+  }, [loadSettings, refreshAccess, loadAiHealth, refreshTrades, refreshSignals, refreshAlerts, refreshScheduled, refreshAutoConfirms, applyStatus])
 
   // Pull the REAL tradable pairs from the exchange once, so the symbol picker
   // reflects what actually exists on Binance instead of a hardcoded guess. If
@@ -980,6 +1003,13 @@ function Dashboard({
     const id = setInterval(refreshAlerts, 30000)
     return () => clearInterval(id)
   }, [refreshAlerts])
+
+  // Slow safety-net poll for scheduled orders (they also refresh on fire over the
+  // socket and on add/cancel), so one due/fired on another device still shows up.
+  useEffect(() => {
+    const id = setInterval(refreshScheduled, 30000)
+    return () => clearInterval(id)
+  }, [refreshScheduled])
 
   // Safety-net poll for pending confirm-before-live proposals. They're pushed over
   // the socket (auto_confirm_pending / _resolved), but a dropped socket could miss
@@ -1730,6 +1760,13 @@ function Dashboard({
             alerts={alerts}
             lastPrice={livePrice ?? ticker?.last ?? null}
             onChanged={refreshAlerts}
+            onError={(m) => showToast('error', m)}
+          />
+
+          <ScheduledOrdersPanel
+            symbol={symbol}
+            scheduled={scheduled}
+            onChanged={refreshScheduled}
             onError={(m) => showToast('error', m)}
           />
 
@@ -3111,6 +3148,210 @@ function AlertsPanel({
         {others > 0 && (
           <div className="hint">
             {others} alert{others > 1 ? 's' : ''} on other symbols (switch pair to see them).
+          </div>
+        )}
+      </div>
+    </section>
+  )
+}
+
+// Timed "buy at 20:00" orders: schedule a one-shot buy/sell/close for a future
+// instant. It fires ONCE through the same risk/exec path a manual order uses —
+// a blank amount is risk-sized, a set limit price rests it as a limit. The local
+// datetime pick is converted to an absolute UTC instant on submit; a refused run
+// shows the real error, never a fake fill.
+function ScheduledOrdersPanel({
+  symbol,
+  scheduled,
+  onChanged,
+  onError,
+}: {
+  symbol: string
+  scheduled: ScheduledOrder[]
+  onChanged: () => void
+  onError: (msg: string) => void
+}) {
+  const [action, setAction] = useState<'buy' | 'sell' | 'close'>('buy')
+  const [when, setWhen] = useState('')
+  const [amount, setAmount] = useState('')
+  const [limit, setLimit] = useState('')
+  const [note, setNote] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const sym = symbol.toUpperCase()
+  const mine = scheduled.filter((s) => s.symbol.toUpperCase() === sym)
+  const others = scheduled.length - mine.length
+
+  // datetime-local needs "YYYY-MM-DDTHH:mm" in LOCAL time; default the min to now.
+  const localMin = (() => {
+    const d = new Date(Date.now() - new Date().getTimezoneOffset() * 60000)
+    return d.toISOString().slice(0, 16)
+  })()
+
+  const add = async () => {
+    if (!when.trim()) {
+      onError('Pick a date & time for the order.')
+      return
+    }
+    const at = new Date(when)
+    if (!Number.isFinite(at.getTime())) {
+      onError('That date & time is not valid.')
+      return
+    }
+    if (at.getTime() <= Date.now()) {
+      onError('Schedule a time in the future.')
+      return
+    }
+    const amt = action === 'close' ? null : amount.trim() ? Number(amount) : null
+    if (amt !== null && (!Number.isFinite(amt) || amt <= 0)) {
+      onError('Amount must be a positive number (or blank to auto-size).')
+      return
+    }
+    const lim = action === 'close' ? null : limit.trim() ? Number(limit) : null
+    if (lim !== null && (!Number.isFinite(lim) || lim <= 0)) {
+      onError('Limit price must be a positive number (or blank for market).')
+      return
+    }
+    setBusy(true)
+    try {
+      await api.createScheduled({
+        action,
+        symbol,
+        scheduled_for: at.toISOString(),
+        amount: amt,
+        limit_price: lim,
+        note: note.trim() || null,
+      })
+      setWhen('')
+      setAmount('')
+      setLimit('')
+      setNote('')
+      onChanged()
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+  const cancel = async (id: number) => {
+    try {
+      await api.cancelScheduled(id)
+      onChanged()
+    } catch (e) {
+      onError((e as Error).message)
+    }
+  }
+
+  return (
+    <section className="panel scheduled">
+      <div className="panel-head">
+        <span>Scheduled orders</span>
+        <span className="hint">fires once at your time</span>
+      </div>
+      <div className="panel-body">
+        <div className="row">
+          <div className="field">
+            <label>Action</label>
+            <select
+              className="select"
+              value={action}
+              onChange={(e) => setAction(e.target.value as 'buy' | 'sell' | 'close')}
+            >
+              <option value="buy">Buy {sym}</option>
+              <option value="sell">Sell {sym}</option>
+              <option value="close">Close {sym}</option>
+            </select>
+          </div>
+          <div className="field">
+            <label>When (your time)</label>
+            <input
+              className="input"
+              type="datetime-local"
+              min={localMin}
+              value={when}
+              onChange={(e) => setWhen(e.target.value)}
+            />
+          </div>
+        </div>
+        <div className="row">
+          <div className="field">
+            <label>Amount (blank = auto-size)</label>
+            <input
+              className="input"
+              placeholder="auto"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              inputMode="decimal"
+              disabled={action === 'close'}
+            />
+          </div>
+          <div className="field">
+            <label>Limit price (blank = market)</label>
+            <input
+              className="input"
+              placeholder="market"
+              value={limit}
+              onChange={(e) => setLimit(e.target.value)}
+              inputMode="decimal"
+              disabled={action === 'close'}
+            />
+          </div>
+        </div>
+        <div className="field">
+          <label>Note (optional)</label>
+          <input
+            className="input"
+            placeholder="e.g. DCA leg / news event"
+            value={note}
+            maxLength={200}
+            onChange={(e) => setNote(e.target.value)}
+          />
+        </div>
+        <button type="button" className="btn" onClick={add} disabled={busy}>
+          {busy ? 'Scheduling…' : 'Schedule order'}
+        </button>
+        {mine.length === 0 ? (
+          <div className="empty">No scheduled orders for {sym} yet.</div>
+        ) : (
+          <ul className="alert-list">
+            {mine.map((s) => (
+              <li key={s.id} className={`alert-row ${s.status}`}>
+                <div className="alert-main">
+                  <span className="alert-cond">
+                    {s.action === 'buy' ? '▲' : s.action === 'sell' ? '▼' : '✕'} {s.action}
+                    {s.amount != null ? ` ${s.amount}` : ''}
+                    {s.limit_price != null ? ` @ ${fmtPx(s.limit_price)}` : ' @ market'}
+                  </span>
+                  <span className="alert-note">{new Date(s.scheduled_for).toLocaleString()}</span>
+                  {s.note && <span className="alert-note">{s.note}</span>}
+                  {s.status === 'error' && s.error && (
+                    <span className="alert-note err">{s.error}</span>
+                  )}
+                </div>
+                <div className="alert-side">
+                  {s.status === 'armed' ? (
+                    <span className="alert-armed">● armed</span>
+                  ) : (
+                    <span className={`alert-fired ${s.status}`}>{s.status}</span>
+                  )}
+                  {s.status === 'armed' && (
+                    <button
+                      type="button"
+                      className="btn ghost sm"
+                      onClick={() => cancel(s.id)}
+                      title="Cancel this scheduled order"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        {others > 0 && (
+          <div className="hint">
+            {others} scheduled order{others > 1 ? 's' : ''} on other symbols (switch pair to see them).
           </div>
         )}
       </div>

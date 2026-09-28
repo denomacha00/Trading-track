@@ -2172,7 +2172,7 @@ _AI_CHART_INDICATORS = {
     "ema9", "ema21", "sma50", "sma200", "bb", "vwap",
     "rsi", "macd", "volume", "volumeProfile",
 }
-_AI_CHART_TIMEFRAMES = {"1m", "5m", "15m", "1h", "4h", "1d"}
+_AI_CHART_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w"}
 # The ICT / smart-money overlay keys the assistant may toggle on the chart. These
 # mirror the frontend's IctOverlayPrefs (see ictOverlays.ts) exactly; anything else
 # is dropped. Toggling an overlay only VIEWS a level the analyzer already computed —
