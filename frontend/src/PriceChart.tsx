@@ -34,6 +34,12 @@ import {
   pointNearSegment,
   pointNearRect,
   pointNearHLine,
+  pointNearRay,
+  channelOffset,
+  fibLevels,
+  positionStats,
+  measure,
+  TOOL_ANCHORS,
   type Drawing,
   type Pt,
   type Tool,
@@ -141,11 +147,20 @@ type SubPane = {
 const DRAW_TOOLS: { key: Tool; glyph: string; label: string }[] = [
   { key: 'cursor', glyph: '↖', label: 'Cursor — click a drawing to select, right-click it to remove' },
   { key: 'trend', glyph: '╱', label: 'Trend line — click start, then click end' },
+  { key: 'ray', glyph: '↗', label: 'Ray — click start, then a point on it; the line extends to the right edge' },
   { key: 'hline', glyph: '─', label: 'Horizontal line — click a price level' },
   { key: 'rect', glyph: '▭', label: 'Rectangle — click two opposite corners' },
+  { key: 'channel', glyph: '⫽', label: 'Parallel channel — click two points for the line, then a third to set its width' },
+  { key: 'fib', glyph: 'φ', label: 'Fibonacci retracement — click the swing start, then the swing end' },
+  { key: 'measure', glyph: '↔', label: 'Measure — click two points to read Δprice, Δ% and bar count' },
+  { key: 'position', glyph: '⇅', label: 'Position tool — click entry, then target, then stop (shows reward:risk)' },
 ]
 const DRAW_COLORS = ['#2962ff', '#f0b90b', '#16c784', '#ea3943']
 const HIT_TOL = 6 // px — how near a click must land to select a drawing
+// Fixed profit/loss tints for the position tool, independent of the stroke
+// colour so the reward zone always reads green and the risk zone red.
+const POS_REWARD = '#16c784'
+const POS_RISK = '#ea3943'
 
 // Tiny media-space canvas helpers (no deps). Coordinates are CSS pixels, which
 // is exactly what priceToCoordinate / timeToCoordinate return.
@@ -166,6 +181,33 @@ function strokeHandle(ctx: CanvasRenderingContext2D, x: number, y: number, color
   ctx.fill()
   ctx.stroke()
   ctx.restore()
+}
+// A compact text label on a translucent dark plate so it stays legible over the
+// candles in either theme. (x,y) is the plate's top-left unless align==='right',
+// in which case the plate's RIGHT edge sits at x (used to keep labels on-screen
+// at the right edge). Returns the plate width so callers can stack labels.
+function fillLabel(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  text: string,
+  color: string,
+  align: 'left' | 'right' = 'left',
+): number {
+  ctx.save()
+  ctx.font = '11px ui-sans-serif, system-ui, -apple-system, sans-serif'
+  const padX = 4
+  const w = Math.ceil(ctx.measureText(text).width) + padX * 2
+  const h = 15
+  const bx = align === 'right' ? x - w : x
+  ctx.fillStyle = 'rgba(15,17,26,0.72)'
+  ctx.fillRect(bx, y, w, h)
+  ctx.textBaseline = 'middle'
+  ctx.textAlign = 'left'
+  ctx.fillStyle = color
+  ctx.fillText(text, bx + padX, y + h / 2 + 0.5)
+  ctx.restore()
+  return w
 }
 
 // Seconds per candle — used to count down to the forming bar's close (the
@@ -327,10 +369,17 @@ export function PriceChart({
   const colorRef = useRef<string>(DRAW_COLORS[0])
   const drawingsRef = useRef<Drawing[]>([])
   const selectedRef = useRef<string | null>(null)
-  // First anchor of a two-click drawing (trend/rect) awaiting its second click.
-  const pendingRef = useRef<Pt | null>(null)
+  // Anchors already clicked for the drawing in progress, in order. Two-click
+  // tools (trend/rect/ray/fib/measure) hold one here awaiting the second click;
+  // the three-click tools (channel/position) hold up to two. Empty = nothing
+  // being placed. TOOL_ANCHORS says how many each tool needs before it commits.
+  const pendingRef = useRef<Pt[]>([])
   // Latest pointer position in data space, for the rubber-band preview.
   const hoverRef = useRef<Pt | null>(null)
+  // Seconds per bar for this timeframe, kept fresh from the prop each render so
+  // the measure tool (built once at mount) reads the current bar duration when
+  // it counts how many bars a span covers.
+  const barSecRef = useRef(0)
   // Handle to the attached primitive's requestUpdate, so any state change can
   // ask lightweight-charts to repaint the drawing layer.
   const drawViewRef = useRef<{ requestUpdate: () => void } | null>(null)
@@ -462,7 +511,7 @@ export function PriceChart({
           tm = (t as number | null) ?? undefined
         }
         hoverRef.current = pr != null && tm != null ? { time: tm, price: pr } : null
-        if (pendingRef.current) drawViewRef.current?.requestUpdate()
+        if (pendingRef.current.length) drawViewRef.current?.requestUpdate()
       } else {
         hoverRef.current = null
       }
@@ -734,6 +783,19 @@ export function PriceChart({
       }
       const box = (a: { x: number; y: number }, b: { x: number; y: number }) =>
         [Math.min(a.x, b.x), Math.min(a.y, b.y), Math.abs(b.x - a.x), Math.abs(b.y - a.y)] as const
+      // Far endpoint of the ray a→b at whichever vertical chart edge it heads
+      // toward, so the line runs off-screen like TradingView's Ray. A vertical
+      // ray just shoots far up or down.
+      const rayEnd = (a: { x: number; y: number }, b: { x: number; y: number }) => {
+        const dx = b.x - a.x
+        const dy = b.y - a.y
+        if (dx === 0) return { x: b.x, y: dy >= 0 ? 1e5 : -1e5 }
+        const tx = dx > 0 ? width : 0
+        const k = (tx - a.x) / dx
+        return { x: tx, y: a.y + dy * k }
+      }
+      const dp = priceDpRef.current // price precision shared by every label
+      const bs = barSecRef.current // seconds/bar, for the measure read-out
       ctx.save()
       for (const d of drawingsRef.current) {
         const sel = d.id === selectedRef.current
@@ -749,7 +811,14 @@ export function PriceChart({
           if (!a || !b) continue
           strokeSeg(ctx, a.x, a.y, b.x, b.y)
           if (sel) { strokeHandle(ctx, a.x, a.y, d.color); strokeHandle(ctx, b.x, b.y, d.color) }
-        } else {
+        } else if (d.kind === 'ray') {
+          const a = px(d.a)
+          const b = px(d.b)
+          if (!a || !b) continue
+          const far = rayEnd(a, b)
+          strokeSeg(ctx, a.x, a.y, far.x, far.y)
+          if (sel) { strokeHandle(ctx, a.x, a.y, d.color); strokeHandle(ctx, b.x, b.y, d.color) }
+        } else if (d.kind === 'rect') {
           const a = px(d.a)
           const b = px(d.b)
           if (!a || !b) continue
@@ -760,25 +829,136 @@ export function PriceChart({
           ctx.globalAlpha = 1
           ctx.strokeRect(rx, ry, rw, rh)
           if (sel) { strokeHandle(ctx, a.x, a.y, d.color); strokeHandle(ctx, b.x, b.y, d.color) }
+        } else if (d.kind === 'fib') {
+          const a = px(d.a)
+          const b = px(d.b)
+          if (!a || !b) continue
+          const x0 = Math.min(a.x, b.x)
+          for (const lv of fibLevels(d.a, d.b)) {
+            const ly = s.priceToCoordinate(lv.price)
+            if (ly == null) continue
+            ctx.globalAlpha = sel ? 0.9 : 0.55
+            ctx.lineWidth = lv.ratio === 0 || lv.ratio === 1 ? (sel ? 2 : 1.5) : 1
+            strokeSeg(ctx, x0, ly, width, ly)
+            ctx.globalAlpha = 1
+            fillLabel(ctx, x0 + 2, ly - 7, `${(lv.ratio * 100).toFixed(1)}%  ${fmtPrice(lv.price, dp)}`, d.color)
+          }
+          if (sel) { strokeHandle(ctx, a.x, a.y, d.color); strokeHandle(ctx, b.x, b.y, d.color) }
+        } else if (d.kind === 'measure') {
+          const a = px(d.a)
+          const b = px(d.b)
+          if (!a || !b) continue
+          const m = measure(d.a, d.b, bs)
+          const dc = m.direction === 'up' ? POS_REWARD : m.direction === 'down' ? POS_RISK : d.color
+          const [rx, ry, rw, rh] = box(a, b)
+          ctx.globalAlpha = 0.1
+          ctx.fillStyle = dc
+          ctx.fillRect(rx, ry, rw, rh)
+          ctx.globalAlpha = 1
+          ctx.strokeStyle = dc
+          ctx.setLineDash([3, 3])
+          strokeSeg(ctx, a.x, a.y, b.x, b.y)
+          ctx.setLineDash([])
+          const arrow = m.direction === 'up' ? '▲' : m.direction === 'down' ? '▼' : '▶'
+          const sp = m.dPrice >= 0 ? '+' : ''
+          const pp = m.dPct >= 0 ? '+' : ''
+          fillLabel(ctx, b.x + 4, b.y - 7, `${arrow} ${sp}${fmtPrice(m.dPrice, dp)} (${pp}${m.dPct.toFixed(2)}%) · ${m.bars} bars`, dc)
+          if (sel) { strokeHandle(ctx, a.x, a.y, d.color); strokeHandle(ctx, b.x, b.y, d.color) }
+        } else if (d.kind === 'channel') {
+          const a = px(d.a)
+          const b = px(d.b)
+          const cc = px(d.c)
+          if (!a || !b) continue
+          const off = channelOffset(d.a, d.b, d.c)
+          const a2 = px({ time: d.a.time, price: d.a.price + off })
+          const b2 = px({ time: d.b.time, price: d.b.price + off })
+          if (a2 && b2) {
+            ctx.globalAlpha = sel ? 0.12 : 0.07
+            ctx.fillStyle = d.color
+            ctx.beginPath()
+            ctx.moveTo(a.x, a.y)
+            ctx.lineTo(b.x, b.y)
+            ctx.lineTo(b2.x, b2.y)
+            ctx.lineTo(a2.x, a2.y)
+            ctx.closePath()
+            ctx.fill()
+            ctx.globalAlpha = 1
+            strokeSeg(ctx, a2.x, a2.y, b2.x, b2.y)
+          }
+          strokeSeg(ctx, a.x, a.y, b.x, b.y)
+          if (sel) { strokeHandle(ctx, a.x, a.y, d.color); strokeHandle(ctx, b.x, b.y, d.color); if (cc) strokeHandle(ctx, cc.x, cc.y, d.color) }
+        } else {
+          // Position planner: entry (a), target (b, its time = right edge), stop
+          // (c.price). Green reward zone entry→target, red risk zone entry→stop.
+          const e = px(d.a)
+          if (!e) continue
+          const st = positionStats(d.a.price, d.b.price, d.c.price)
+          const rp = px(d.b)
+          const yT = s.priceToCoordinate(d.b.price)
+          const yS = s.priceToCoordinate(d.c.price)
+          const xL = Math.min(e.x, rp?.x ?? e.x)
+          const xR = Math.max(e.x, rp?.x ?? width)
+          const w2 = Math.max(8, xR - xL)
+          if (yT != null) {
+            ctx.globalAlpha = sel ? 0.2 : 0.12
+            ctx.fillStyle = POS_REWARD
+            ctx.fillRect(xL, Math.min(e.y, yT), w2, Math.abs(yT - e.y))
+          }
+          if (yS != null) {
+            ctx.globalAlpha = sel ? 0.2 : 0.12
+            ctx.fillStyle = POS_RISK
+            ctx.fillRect(xL, Math.min(e.y, yS), w2, Math.abs(yS - e.y))
+          }
+          ctx.globalAlpha = 1
+          ctx.strokeStyle = d.color
+          ctx.lineWidth = sel ? 2 : 1.5
+          strokeSeg(ctx, xL, e.y, xL + w2, e.y)
+          ctx.setLineDash([3, 3])
+          if (yT != null) { ctx.strokeStyle = POS_REWARD; strokeSeg(ctx, xL, yT, xL + w2, yT) }
+          if (yS != null) { ctx.strokeStyle = POS_RISK; strokeSeg(ctx, xL, yS, xL + w2, yS) }
+          ctx.setLineDash([])
+          fillLabel(ctx, xL + w2, e.y - 7, `${st.dir.toUpperCase()} @ ${fmtPrice(d.a.price, dp)} · R:R ${st.rr.toFixed(2)}`, d.color, 'right')
+          if (yT != null) fillLabel(ctx, xL + w2, yT - 7, `TP ${fmtPrice(d.b.price, dp)} +${st.rewardPct.toFixed(2)}%`, POS_REWARD, 'right')
+          if (yS != null) fillLabel(ctx, xL + w2, yS - 7, `SL ${fmtPrice(d.c.price, dp)} -${st.riskPct.toFixed(2)}%`, POS_RISK, 'right')
+          if (sel) { strokeHandle(ctx, e.x, e.y, d.color); if (rp && yT != null) strokeHandle(ctx, rp.x, yT, d.color); if (yS != null) strokeHandle(ctx, xL + w2, yS, d.color) }
         }
       }
-      // Rubber-band preview between the first click and the pointer, for the
-      // two-click tools (trend / rect), drawn dashed until the second click.
+      // Rubber-band preview from the anchors placed so far to the pointer,
+      // dashed until the drawing commits. Mirrors what the next click(s) will
+      // lay down, for every placing tool (not just trend/rect).
       const pend = pendingRef.current
       const hov = hoverRef.current
       const t = toolRef.current
-      if (pend && hov && (t === 'trend' || t === 'rect')) {
-        const a = px(pend)
-        const b = px(hov)
-        if (a && b) {
+      if (pend.length && hov) {
+        const p0 = px(pend[0])
+        const hv = px(hov)
+        if (p0 && hv) {
           ctx.strokeStyle = colorRef.current
           ctx.lineWidth = 1.5
           ctx.setLineDash([4, 4])
-          if (t === 'trend') {
-            strokeSeg(ctx, a.x, a.y, b.x, b.y)
-          } else {
-            const [rx, ry, rw, rh] = box(a, b)
+          if (t === 'rect' || t === 'fib') {
+            const [rx, ry, rw, rh] = box(p0, hv)
             ctx.strokeRect(rx, ry, rw, rh)
+          } else if (t === 'ray') {
+            const far = rayEnd(p0, hv)
+            strokeSeg(ctx, p0.x, p0.y, far.x, far.y)
+          } else if ((t === 'channel' || t === 'position') && pend.length >= 2) {
+            const p1 = px(pend[1])
+            if (p1) {
+              ctx.setLineDash([])
+              strokeSeg(ctx, p0.x, p0.y, p1.x, p1.y)
+              ctx.setLineDash([4, 4])
+              if (t === 'channel') {
+                const off = channelOffset(pend[0], pend[1], hov)
+                const a2 = px({ time: pend[0].time, price: pend[0].price + off })
+                const b2 = px({ time: pend[1].time, price: pend[1].price + off })
+                if (a2 && b2) strokeSeg(ctx, a2.x, a2.y, b2.x, b2.y)
+              } else {
+                strokeSeg(ctx, p0.x, hv.y, p1.x, hv.y)
+              }
+            }
+          } else {
+            strokeSeg(ctx, p0.x, p0.y, hv.x, hv.y)
           }
           ctx.setLineDash([])
         }
@@ -837,14 +1017,23 @@ export function PriceChart({
         commit({ id: newDrawingId(), kind: 'hline', price, color: colorRef.current })
         return
       }
-      if (time == null) return // trend / rect need a time anchor
-      if (!pendingRef.current) {
-        pendingRef.current = { time, price }
+      if (time == null) return // every other tool anchors on a bar time
+      // Collect anchors click by click; commit once the tool has all it needs
+      // (2 for trend/ray/rect/fib/measure, 3 for channel/position).
+      const anchors = [...pendingRef.current, { time, price }]
+      const need = TOOL_ANCHORS[activeTool]
+      if (anchors.length < need) {
+        pendingRef.current = anchors
         drawViewRef.current?.requestUpdate()
+        return
+      }
+      pendingRef.current = []
+      const id = newDrawingId()
+      const col = colorRef.current
+      if (activeTool === 'channel' || activeTool === 'position') {
+        commit({ id, kind: activeTool, a: anchors[0], b: anchors[1], c: anchors[2], color: col })
       } else {
-        const a = pendingRef.current
-        pendingRef.current = null
-        commit({ id: newDrawingId(), kind: activeTool, a, b: { time, price }, color: colorRef.current })
+        commit({ id, kind: activeTool, a: anchors[0], b: anchors[1], color: col })
       }
     }
     chart.subscribeClick(onClick)
@@ -855,7 +1044,7 @@ export function PriceChart({
       const next = [...drawingsRef.current, d]
       drawingsRef.current = next
       setDrawings(next)
-      pendingRef.current = null
+      pendingRef.current = []
       hoverRef.current = null
       toolRef.current = 'cursor'
       setTool('cursor')
@@ -882,14 +1071,52 @@ export function PriceChart({
         if (d.kind === 'hline') {
           const ly = s.priceToCoordinate(d.price)
           if (ly != null && pointNearHLine(y, ly, HIT_TOL)) return d.id
-        } else if (d.kind === 'trend') {
+        } else if (d.kind === 'trend' || d.kind === 'measure') {
           const a = px(d.a)
           const b = px(d.b)
           if (a && b && pointNearSegment({ x, y }, a, b, HIT_TOL)) return d.id
-        } else {
+        } else if (d.kind === 'ray') {
+          const a = px(d.a)
+          const b = px(d.b)
+          if (a && b && pointNearRay({ x, y }, a, b, HIT_TOL)) return d.id
+        } else if (d.kind === 'rect') {
           const a = px(d.a)
           const b = px(d.b)
           if (a && b && pointNearRect({ x, y }, a, b, HIT_TOL)) return d.id
+        } else if (d.kind === 'fib') {
+          const a = px(d.a)
+          const b = px(d.b)
+          if (!a || !b) continue
+          const x0 = Math.min(a.x, b.x)
+          if (x >= x0 - HIT_TOL) {
+            for (const lv of fibLevels(d.a, d.b)) {
+              const ly = s.priceToCoordinate(lv.price)
+              if (ly != null && pointNearHLine(y, ly, HIT_TOL)) return d.id
+            }
+          }
+        } else if (d.kind === 'channel') {
+          const a = px(d.a)
+          const b = px(d.b)
+          if (!a || !b) continue
+          const off = channelOffset(d.a, d.b, d.c)
+          const a2 = px({ time: d.a.time, price: d.a.price + off })
+          const b2 = px({ time: d.b.time, price: d.b.price + off })
+          if (pointNearSegment({ x, y }, a, b, HIT_TOL)) return d.id
+          if (a2 && b2 && pointNearSegment({ x, y }, a2, b2, HIT_TOL)) return d.id
+        } else {
+          // position: the outline of the zone box, plus the entry line
+          const e = px(d.a)
+          if (!e) continue
+          const rp = px(d.b)
+          const paneW = containerRef.current?.clientWidth ?? 0
+          const yT = s.priceToCoordinate(d.b.price)
+          const yS = s.priceToCoordinate(d.c.price)
+          const xR = rp?.x ?? paneW
+          const ys = [e.y, yT, yS].filter((v) => v != null).map(Number)
+          const tl = { x: Math.min(e.x, xR), y: Math.min(...ys) }
+          const br = { x: Math.max(e.x, xR), y: Math.max(...ys) }
+          if (pointNearRect({ x, y }, tl, br, HIT_TOL)) return d.id
+          if (pointNearHLine(y, e.y, HIT_TOL) && x >= tl.x - HIT_TOL && x <= br.x + HIT_TOL) return d.id
         }
       }
       return null
@@ -1398,7 +1625,7 @@ export function PriceChart({
     skipSaveRef.current = true
     drawingsRef.current = loaded
     selectedRef.current = null
-    pendingRef.current = null
+    pendingRef.current = []
     setSelected(null)
     setDrawings(loaded)
     drawViewRef.current?.requestUpdate()
@@ -1427,7 +1654,7 @@ export function PriceChart({
     const next = t !== 'cursor' && toolRef.current === t ? 'cursor' : t
     toolRef.current = next
     setTool(next)
-    pendingRef.current = null
+    pendingRef.current = []
     hoverRef.current = null
     drawViewRef.current?.requestUpdate()
   }
@@ -1459,14 +1686,14 @@ export function PriceChart({
     setDrawings([])
     selectedRef.current = null
     setSelected(null)
-    pendingRef.current = null
+    pendingRef.current = []
     drawViewRef.current?.requestUpdate()
   }
   // Escape: abandon a half-placed drawing first, else drop the selection; either
   // way fall back to the cursor tool so the chart is navigable again.
   const cancelDraw = () => {
-    if (pendingRef.current) {
-      pendingRef.current = null
+    if (pendingRef.current.length) {
+      pendingRef.current = []
     } else {
       selectedRef.current = null
       setSelected(null)
@@ -1477,6 +1704,8 @@ export function PriceChart({
   }
   // Keep the ref the window keydown handler calls pointed at the live closures.
   actionsRef.current = { del: deleteSelected, cancel: cancelDraw }
+  // And keep the bar duration fresh for the measure tool's bar count.
+  barSecRef.current = TF_SECONDS[timeframe ?? ''] ?? 0
 
   // Wipe all drawings when the parent bumps clearSignal (the assistant's "clear
   // the drawings" command). A change in value is the trigger; the value seen on

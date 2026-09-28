@@ -4,6 +4,13 @@ import {
   pointNearSegment,
   pointNearRect,
   pointNearHLine,
+  distToRay,
+  pointNearRay,
+  priceOnLine,
+  channelOffset,
+  fibLevels,
+  FIB_LEVELS,
+  positionStats,
   measure,
   drawingsKey,
   serializeDrawings,
@@ -12,6 +19,7 @@ import {
   loadDrawings,
   saveDrawings,
   newDrawingId,
+  TOOL_ANCHORS,
   type Drawing,
 } from './drawings'
 
@@ -104,6 +112,107 @@ describe('measure', () => {
   })
 })
 
+describe('distToRay / pointNearRay (near end clamps, far end is infinite)', () => {
+  const a = { x: 0, y: 0 }
+  const b = { x: 10, y: 0 }
+  it('is the perpendicular drop when the foot is on the drawn part', () => {
+    expect(distToRay({ x: 5, y: 4 }, a, b)).toBe(4)
+  })
+  it('does NOT clamp past b — the ray runs to infinity', () => {
+    expect(distToRay({ x: 100, y: 3 }, a, b)).toBe(3) // segment would clamp to b (~90px away)
+  })
+  it('clamps behind a to the distance to a', () => {
+    expect(distToRay({ x: -3, y: 4 }, a, b)).toBeCloseTo(5) // foot pulled back to a=(0,0)
+  })
+  it('handles a degenerate ray as distance to a', () => {
+    expect(distToRay({ x: 3, y: 4 }, a, a)).toBe(5)
+  })
+  it('pointNearRay respects tolerance', () => {
+    expect(pointNearRay({ x: 100, y: 3 }, a, b, 4)).toBe(true)
+    expect(pointNearRay({ x: 100, y: 3 }, a, b, 2)).toBe(false)
+  })
+})
+
+describe('priceOnLine (linear inter/extrapolation in data space)', () => {
+  const a = { time: 0, price: 10 }
+  const b = { time: 10, price: 20 }
+  it('interpolates between anchors', () => {
+    expect(priceOnLine(a, b, 5)).toBeCloseTo(15)
+  })
+  it('extrapolates past b', () => {
+    expect(priceOnLine(a, b, 20)).toBeCloseTo(30)
+  })
+  it('falls back to a.price for a vertical line (no divide-by-zero)', () => {
+    expect(priceOnLine({ time: 5, price: 10 }, { time: 5, price: 99 }, 7)).toBe(10)
+  })
+})
+
+describe('channelOffset (vertical gap from c to the a→b line)', () => {
+  it('is the price of c minus the line price at c.time', () => {
+    // line price == time here; c sits 3 above the line at time 5.
+    expect(channelOffset({ time: 0, price: 0 }, { time: 10, price: 10 }, { time: 5, price: 8 })).toBeCloseTo(3)
+  })
+})
+
+describe('fibLevels', () => {
+  const a = { time: 0, price: 100 }
+  const b = { time: 10, price: 0 }
+  it('exposes the standard ratio ladder', () => {
+    expect(FIB_LEVELS).toEqual([0, 0.236, 0.382, 0.5, 0.618, 0.786, 1, 1.272, 1.618])
+  })
+  it('anchors 0 at b.price and 1 at a.price, extends past 1', () => {
+    const levels = fibLevels(a, b)
+    expect(levels).toHaveLength(FIB_LEVELS.length)
+    expect(levels[0]).toEqual({ ratio: 0, price: 0 }) // b.price
+    expect(levels[levels.length - 3]).toEqual({ ratio: 1, price: 100 }) // a.price
+    expect(levels.find((l) => l.ratio === 0.5)?.price).toBeCloseTo(50)
+    expect(levels.find((l) => l.ratio === 1.618)?.price).toBeCloseTo(161.8) // extension past a
+  })
+})
+
+describe('positionStats (direction + risk/reward, derived not guessed)', () => {
+  it('reads a long: target above entry', () => {
+    const s = positionStats(100, 130, 90)
+    expect(s.dir).toBe('long')
+    expect(s.risk).toBeCloseTo(10)
+    expect(s.reward).toBeCloseTo(30)
+    expect(s.riskPct).toBeCloseTo(10)
+    expect(s.rewardPct).toBeCloseTo(30)
+    expect(s.rr).toBeCloseTo(3)
+  })
+  it('reads a short: target below entry', () => {
+    const s = positionStats(100, 80, 110)
+    expect(s.dir).toBe('short')
+    expect(s.risk).toBeCloseTo(10)
+    expect(s.reward).toBeCloseTo(20)
+    expect(s.rr).toBeCloseTo(2)
+  })
+  it('rr is 0 (not Infinity) when stop === entry', () => {
+    expect(positionStats(100, 130, 100).rr).toBe(0)
+  })
+  it('percentages are 0 when entry is 0 (no divide-by-zero)', () => {
+    const s = positionStats(0, 5, -5)
+    expect(s.riskPct).toBe(0)
+    expect(s.rewardPct).toBe(0)
+  })
+})
+
+describe('TOOL_ANCHORS', () => {
+  it('gives every tool the right number of clicks', () => {
+    expect(TOOL_ANCHORS).toEqual({
+      cursor: 0,
+      hline: 1,
+      trend: 2,
+      rect: 2,
+      ray: 2,
+      fib: 2,
+      measure: 2,
+      channel: 3,
+      position: 3,
+    })
+  })
+})
+
 describe('drawingsKey', () => {
   it('namespaces per symbol and timeframe', () => {
     expect(drawingsKey('BTC/USDT', '1h')).toBe('tt.drawings.BTC/USDT.1h')
@@ -115,6 +224,25 @@ const sample: Drawing[] = [
   { id: 'a', kind: 'trend', a: { time: 1, price: 10 }, b: { time: 2, price: 20 }, color: '#fff' },
   { id: 'b', kind: 'hline', price: 42, color: '#f0b90b' },
   { id: 'c', kind: 'rect', a: { time: 3, price: 5 }, b: { time: 9, price: 8 }, color: '#3b82f6' },
+  { id: 'd', kind: 'ray', a: { time: 1, price: 10 }, b: { time: 4, price: 16 }, color: '#22d3ee' },
+  { id: 'e', kind: 'fib', a: { time: 2, price: 30 }, b: { time: 7, price: 10 }, color: '#a78bfa' },
+  { id: 'f', kind: 'measure', a: { time: 1, price: 100 }, b: { time: 5, price: 108 }, color: '#eab308' },
+  {
+    id: 'g',
+    kind: 'channel',
+    a: { time: 1, price: 10 },
+    b: { time: 5, price: 30 },
+    c: { time: 2, price: 5 },
+    color: '#f472b6',
+  },
+  {
+    id: 'h',
+    kind: 'position',
+    a: { time: 1, price: 100 },
+    b: { time: 6, price: 130 },
+    c: { time: 1, price: 90 },
+    color: '#16c784',
+  },
 ]
 
 describe('serialize / parse round trip', () => {
@@ -150,9 +278,7 @@ describe('parseDrawings is defensive about untrusted storage', () => {
 
 describe('validateDrawing', () => {
   it('accepts each valid kind', () => {
-    expect(validateDrawing(sample[0])).toEqual(sample[0])
-    expect(validateDrawing(sample[1])).toEqual(sample[1])
-    expect(validateDrawing(sample[2])).toEqual(sample[2])
+    for (const d of sample) expect(validateDrawing(d)).toEqual(d)
   })
   it('rejects empty id, missing/overlong color, and non-objects', () => {
     expect(validateDrawing({ ...sample[1], id: '' })).toBeNull()
@@ -160,6 +286,18 @@ describe('validateDrawing', () => {
     expect(validateDrawing({ ...sample[1], color: 'x'.repeat(40) })).toBeNull()
     expect(validateDrawing(null)).toBeNull()
     expect(validateDrawing('nope')).toBeNull()
+  })
+  it('rejects a 2-point kind missing an anchor', () => {
+    expect(validateDrawing({ id: 'r', kind: 'ray', a: { time: 1, price: 2 }, color: '#fff' })).toBeNull()
+    expect(
+      validateDrawing({ id: 'r', kind: 'fib', a: { time: 1, price: 2 }, b: { time: 3, price: NaN }, color: '#fff' }),
+    ).toBeNull()
+  })
+  it('rejects a 3-point kind (channel/position) missing the third anchor', () => {
+    const noC = { id: 'g2', kind: 'channel', a: { time: 1, price: 2 }, b: { time: 3, price: 4 }, color: '#fff' }
+    expect(validateDrawing(noC)).toBeNull()
+    const noCPos = { id: 'h2', kind: 'position', a: { time: 1, price: 2 }, b: { time: 3, price: 4 }, color: '#fff' }
+    expect(validateDrawing(noCPos)).toBeNull()
   })
 })
 
