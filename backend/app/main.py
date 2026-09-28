@@ -47,6 +47,7 @@ from app.models import (
     LicenseKeyStatus,
     LicenseStatus,
     PriceAlert,
+    ScheduledOrder,
     SignalLog,
     Trade,
     TradeStatus,
@@ -78,6 +79,8 @@ from app.schemas import (
     RedeemLicenseKey,
     ScaledOrder,
     ScaledResult,
+    ScheduledOrderCreate,
+    ScheduledOrderOut,
     SettingsOut,
     SettingsUpdate,
     SignalOut,
@@ -1348,6 +1351,82 @@ def delete_alert(
     return {"deleted": alert_id}
 
 
+# ---- Scheduled / timed orders ---------------------------------------
+# "Buy at 20:00": a resting instruction that fires ONCE at a chosen time through
+# the SAME risk/execution chain a manual order uses (execute_signal). It never
+# fabricates a fill — if the market/account refuses it when the time comes, the
+# row is marked errored with the real reason. Immediate orders use POST /api/order.
+
+
+@app.get("/api/orders/scheduled", response_model=list[ScheduledOrderOut])
+def list_scheduled_orders(
+    db: Session = Depends(get_db), user: User = Depends(get_current_user)
+):
+    rows = db.scalars(
+        select(ScheduledOrder)
+        .where(ScheduledOrder.user_id == user.id)
+        .order_by(ScheduledOrder.scheduled_for.desc())
+    ).all()
+    return [ScheduledOrderOut.model_validate(r, from_attributes=True) for r in rows]
+
+
+@app.post("/api/orders/scheduled", response_model=ScheduledOrderOut)
+def create_scheduled_order(
+    body: ScheduledOrderCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    symbol = body.symbol.strip().upper()
+    if "/" not in symbol:
+        raise HTTPException(
+            status_code=400,
+            detail="Symbol must look like BASE/QUOTE, e.g. BTC/USDT.",
+        )
+    # Interpret the target as aware UTC (a naive value is read as UTC) to match
+    # every stored timestamp, and require it in the future so a mistyped past
+    # time can't fire the instant it's saved.
+    when = body.scheduled_for
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    when = when.astimezone(dt.timezone.utc)
+    if when <= _utcnow():
+        raise HTTPException(status_code=400, detail="Scheduled time must be in the future.")
+    order = ScheduledOrder(
+        user_id=user.id,
+        symbol=symbol,
+        action=body.action,
+        amount=(float(body.amount) if body.amount is not None else None),
+        limit_price=(float(body.limit_price) if body.limit_price is not None else None),
+        stop_loss=(float(body.stop_loss) if body.stop_loss is not None else None),
+        take_profit=(float(body.take_profit) if body.take_profit is not None else None),
+        scheduled_for=when,
+        note=(body.note or None),
+        status="armed",
+    )
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+    return ScheduledOrderOut.model_validate(order, from_attributes=True)
+
+
+@app.delete("/api/orders/scheduled/{order_id}")
+def cancel_scheduled_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    order = db.get(ScheduledOrder, order_id)
+    if order is None or order.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Scheduled order not found.")
+    # Only an armed order can be cancelled; a fired/errored one is history and is
+    # left as-is so the record stays honest.
+    if order.status == "armed":
+        order.status = "canceled"
+        db.add(order)
+        db.commit()
+    return {"canceled": order_id, "status": order.status}
+
+
 # ---- Autonomous live-entry confirmations ----------------------------
 # The confirm-before-live gate (Settings.auto_live_confirm): when the bot
 # decides a LIVE buy on its own it queues it here and waits for the operator's
@@ -2429,9 +2508,15 @@ def ai_chat(
     except Exception:
         pass
 
+    # Live market headlines default ON (like fundamentals/technicals) so the
+    # assistant can name the CAUSE of a move — a macro print, a geopolitical
+    # shock, an equities/bond risk-off — instead of reading only the crypto proxy
+    # and saying "I'd need headlines". Real public RSS, no API key; an empty pull
+    # stays honestly empty (never fabricated). A news-grounded reply can still
+    # never AUTO-apply an action — see the injection guard below.
     news: list[dict] = []
     used_news = False
-    if payload.get("include_news"):
+    if payload.get("include_news", True):
         try:
             news, _errors = fetch_market_news(get_settings().news_feed_list, limit=8)
         except Exception:

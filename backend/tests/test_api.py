@@ -1080,7 +1080,8 @@ def test_ai_chat_news_grounded_action_is_never_auto(client, monkeypatch):
     )
 
     # Baseline: WITHOUT news, autopilot + paper => a paper order auto-applies.
-    r0 = client.post("/api/ai/chat", json={"question": "buy"})
+    # News now defaults ON, so opt OUT explicitly to isolate the no-news path.
+    r0 = client.post("/api/ai/chat", json={"question": "buy", "include_news": False})
     assert r0.status_code == 200
     assert r0.json()["proposed_action"]["auto"] is True
 

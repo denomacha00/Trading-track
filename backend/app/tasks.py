@@ -195,6 +195,11 @@ def _tick_all(manager) -> tuple[list[dict], list[dict]]:
                 # letting them fill into the very drawdown that just halted us.
                 engine._update_drawdown(db)
                 engine.check_pending_orders(db)
+                # Timed "buy at 20:00" orders fire here too — ALWAYS, even when the
+                # bot is stopped: like a resting limit, a scheduled order is a
+                # deliberate human instruction, not autonomous trading. Any fire
+                # (or honest refusal) becomes a broadcast call-out.
+                events.extend(engine.check_scheduled_orders(db))
                 engine.check_open_positions(db)
                 statuses.append({"user_id": user.id, "status": engine.status(db)})
 

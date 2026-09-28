@@ -151,6 +151,34 @@ def test_etf_flows_source_failure_is_none_plus_error(monkeypatch):
     assert snap["coin"] is not None  # other sections intact
 
 
+def test_etf_flows_api_error_envelope_is_surfaced(monkeypatch):
+    # CoinGlass answers HTTP 200 even for a bad/inactive/expired key or a plan or
+    # rate limit -- it carries a non-"0" ``code`` + a human ``msg`` and a null
+    # ``data``. That MUST become a visible, honest error (so the operator sees why),
+    # never a silent empty gap that reads like "no ETF flows today".
+    def fake(url, *, params=None, headers=None, timeout=8.0):
+        if "/api/etf/bitcoin/flow-history" in url:
+            return {"code": "40001", "msg": "apikey invalid or expired", "data": None}
+        return _fake_get_json(url, params=params, headers=headers, timeout=timeout)
+    monkeypatch.setattr(fundamentals, "_get_json", fake)
+    monkeypatch.setattr(fundamentals, "_ETF_FLOW_TOKEN", "bad-key")
+    snap, errors = fundamentals.fetch_fundamentals("BTC/USDT")
+    assert snap["etf_flows"] is None
+    assert any("ETF flows" in e for e in errors)  # surfaced, not swallowed
+    assert snap["coin"] is not None  # other sections intact
+
+
+def test_summarize_flags_absent_etf_for_btc():
+    # No ETF figure this pull -> the summary still tells the model that ETF flows
+    # come from the ETF feed (NOT headlines), so it never mis-sources or invents
+    # them. This directly answers a real chat where the model wrongly claimed ETF
+    # flows "live in live headlines".
+    text = fundamentals.summarize_fundamentals({"asset": "BTC", "etf_flows": None})
+    assert "Spot ETF flows (BTC)" in text
+    assert "not available" in text
+    assert "headlines" in text.lower()
+
+
 def test_etf_flows_survives_one_bad_fund_leg(monkeypatch):
     # A single malformed fund leg in the payload (missing ticker / non-numeric flow)
     # must NOT sink the section -- the total + the well-formed funds still come

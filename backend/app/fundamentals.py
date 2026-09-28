@@ -314,6 +314,18 @@ def _etf_series(asset_path: str) -> list[dict[str, Any]]:
     """
     url = f"{_ETF_FLOW_BASE}/api/etf/{asset_path}/flow-history"
     data = _get_json(url, headers={"CG-API-KEY": _ETF_FLOW_TOKEN})
+    # CoinGlass answers HTTP 200 even when the key is missing/invalid/expired, the
+    # plan doesn't cover the endpoint, or a rate limit is hit -- it signals that in
+    # a non-"0" ``code`` plus a human ``msg`` with a null ``data``. Turn that into a
+    # real error so the operator SEES exactly why (never a silent empty gap that
+    # reads like a quiet no-flow day, and never a fabricated number).
+    if isinstance(data, dict):
+        code = data.get("code")
+        if code is not None and str(code) != "0":
+            raise RuntimeError(
+                f"CoinGlass rejected the ETF flow-history request: "
+                f"{data.get('msg') or code} (check COINGLASS_API_KEY / plan)"
+            )
     rows = data.get("data") if isinstance(data, dict) else data
     out: list[dict[str, Any]] = []
     if isinstance(rows, list):
@@ -603,6 +615,17 @@ def summarize_fundamentals(snapshot: dict | None) -> str:
             seg += f" [{top}]"
         seg += f" (src {etf.get('source')})"
         lines.append(seg)
+    elif snapshot.get("asset") in _ETF_FLOW_ASSETS:
+        # BTC/ETH have real US spot ETFs but there's no flow figure in THIS pull
+        # (either the feed is off, or the ETF-flow source returned nothing this
+        # time). Say so plainly so the model neither invents a number nor
+        # mis-sources it: ETF flows come from the dedicated ETF-flow feed, NEVER
+        # from news headlines.
+        lines.append(
+            f"- Spot ETF flows ({snapshot.get('asset')}): not available in this "
+            "snapshot (comes from the dedicated ETF-flow feed, NOT from news "
+            "headlines; a missing figure is never fabricated)."
+        )
 
     if not lines:
         return ""

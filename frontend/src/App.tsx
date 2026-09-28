@@ -4331,7 +4331,11 @@ function AssistantPanel({
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [useSymbol, setUseSymbol] = useState(true)
-  const [useNews, setUseNews] = useState(false)
+  // On by default: the operator wants the assistant to name the CAUSE of a move
+  // (a macro print, a geopolitical shock, an equities/bond risk-off) from REAL
+  // public headlines, not just read the crypto proxy. No API key; an empty pull
+  // stays honestly empty. Users can still untick "Attach live news" to opt out.
+  const [useNews, setUseNews] = useState(true)
   // On by default: the operator explicitly wants the AI to ANALYSE live
   // fundamentals (Fear & Greed, dominance, funding/OI, per-coin returns) and act
   // on them, not disclaim them. Server still gates on `fundamentals_enabled`.
@@ -5293,6 +5297,14 @@ function FundamentalsPanelImpl({
   // Only BTC/ETH have live US spot ETFs — for them we always show the card (with a
   // "how to switch it on" note when unconfigured); other assets simply omit it.
   const hasEtfMarket = ['BTC', 'ETH'].includes((data?.asset ?? '').toUpperCase())
+  // Distinguish "feature off (no key configured)" from "key IS set but the
+  // ETF-flow source returned nothing / rejected the key on this pull". Otherwise a
+  // user who already pasted a working key wrongly reads "set the key" and thinks it
+  // never saved. The backend emits an "ETF flows off …" note only when no key is
+  // set; any other ETF error means the key is present but the fetch didn't land.
+  const etfOff = errors.some((e) => e.toLowerCase().startsWith('etf flows off'))
+  const etfFailed =
+    !etf && !etfOff && errors.some((e) => e.toLowerCase().includes('etf flows'))
   const fundingNote =
     d?.funding_rate_pct == null
       ? ''
@@ -5489,6 +5501,13 @@ function FundamentalsPanelImpl({
                     ))}
                   <div className="hint tiny" style={{ marginTop: 4 }}>Real net creations/redemptions · src {etf.source}</div>
                 </>
+              ) : etfFailed ? (
+                <div className="muted tiny">
+                  Key is set, but the ETF-flow source returned no data on this pull
+                  — it may have rejected the key or hit a rate limit (see the note
+                  below). This comes from the dedicated ETF-flow feed, not news.
+                  Never faked — a gap stays blank until real flows return.
+                </div>
               ) : (
                 <div className="muted tiny">
                   Off — set <code>COINGLASS_API_KEY</code> (free key from{' '}

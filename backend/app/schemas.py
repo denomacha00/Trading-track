@@ -367,6 +367,45 @@ class AlertOut(BaseModel):
     triggered_price: Optional[float] = None
 
 
+class ScheduledOrderCreate(BaseModel):
+    """Schedule an order to run at a chosen time — e.g. "buy at 20:00".
+
+    ``scheduled_for`` is an ABSOLUTE instant: send an ISO-8601 timestamp. The UI
+    converts the user's local pick to UTC (``new Date(local).toISOString()``); a
+    value without a timezone is read as UTC. A blank ``amount`` is risk-sized
+    just like a manual order; a set ``limit_price`` makes the fired order a
+    resting limit instead of a market fill.
+    """
+
+    action: Literal["buy", "sell", "close"]
+    symbol: str
+    scheduled_for: dt.datetime
+    amount: Optional[float] = Field(default=None, gt=0)
+    limit_price: Optional[float] = Field(default=None, gt=0)
+    stop_loss: Optional[float] = Field(default=None, gt=0)
+    take_profit: Optional[float] = Field(default=None, gt=0)
+    note: Optional[str] = Field(default=None, max_length=200)
+
+
+class ScheduledOrderOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    symbol: str
+    action: str
+    amount: Optional[float] = None
+    limit_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    scheduled_for: dt.datetime
+    status: str
+    note: Optional[str] = None
+    created_at: Optional[dt.datetime] = None
+    fired_at: Optional[dt.datetime] = None
+    result_trade_id: Optional[int] = None
+    error: Optional[str] = None
+
+
 class AutoConfirmationOut(BaseModel):
     """A live entry the bot proposed on its own, awaiting the operator's yes/no.
 

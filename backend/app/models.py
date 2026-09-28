@@ -45,6 +45,13 @@ class OrderType(str, Enum):
     limit = "limit"
 
 
+class ScheduledOrderStatus(str, Enum):
+    armed = "armed"        # waiting for its scheduled time
+    fired = "fired"        # its time came and a Trade was placed
+    canceled = "canceled"  # user cancelled it before it fired
+    error = "error"        # its time came but execution was refused / failed
+
+
 class UserRole(str, Enum):
     admin = "admin"
     user = "user"
@@ -219,6 +226,58 @@ class PriceAlert(Base):
         DateTime(timezone=True), nullable=True
     )
     triggered_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class ScheduledOrder(Base):
+    """A user-scheduled order that fires ONCE at a chosen wall-clock time.
+
+    "Buy 0.01 BTC at 20:00": the row rests ``armed`` until ``scheduled_for``
+    (stored as aware UTC, like every timestamp here), then the monitor loop runs
+    it through the EXACT SAME risk/execution chain a manual order uses
+    (:meth:`TradingEngine.execute_signal`). It fires once — on success ``status``
+    flips to ``fired`` and ``result_trade_id`` links the opened Trade; if
+    execution is refused at fire time (insufficient balance, a tripped
+    kill-switch, an already-open position) ``status`` flips to ``error`` with the
+    real ``error`` message. It is NEVER silently retried and NEVER records a
+    fabricated fill. A blank ``limit_price`` fires at market when the time comes;
+    a set ``limit_price`` places a resting limit that then fills on price.
+    """
+
+    __tablename__ = "scheduled_orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    action: Mapped[str] = mapped_column(String(8))  # buy | sell | close
+    # Base quantity; NULL lets the risk manager size it (same as a manual order).
+    amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    limit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    scheduled_for: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    status: Mapped[str] = mapped_column(String(12), default="armed", index=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    # Set the moment the loop tried to run it (whether it filled or errored).
+    fired_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # The Trade opened when this fired (else NULL, e.g. still armed or errored).
+    result_trade_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The honest reason it could not run, when status is "error" (never faked).
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    @property
+    def is_due(self) -> bool:
+        """True once an armed row has reached its scheduled instant."""
+        if self.status != "armed":
+            return False
+        when = _as_utc(self.scheduled_for)
+        return when is not None and _utcnow() >= when
 
 
 class AutoConfirmation(Base):

@@ -21,7 +21,7 @@ from app.config import Settings
 from app.exchange import BinanceConnector
 from app.analysis import MarketAnalyzer
 from app.ai import AICommentator
-from app.models import AutoConfirmation, SignalLog, Trade, TradeStatus, _as_utc
+from app.models import AutoConfirmation, ScheduledOrder, SignalLog, Trade, TradeStatus, _as_utc
 from app.risk import RiskManager
 from app.money_manager import MoneyManager
 from app.notifier import Notifier
@@ -2014,6 +2014,65 @@ class TradingEngine:
                 self._fill_pending(db, trade, fill_price)
             filled.append(trade)
         return filled
+
+    def check_scheduled_orders(self, db: Session) -> list[dict]:
+        """Fire user-scheduled timed orders whose target time has arrived.
+
+        "Buy at 20:00": an armed :class:`ScheduledOrder` rests until its
+        ``scheduled_for`` instant, then runs through the SAME ``execute_signal``
+        risk/exec chain a manual order uses. Fires ONCE — success flips it to
+        ``fired`` and links the Trade; a refused/failed run flips it to ``error``
+        with the real message (never silently retried, never a fabricated fill).
+        Returns call-out events to broadcast. NOT lock-guarded here: it must not
+        hold ``self._lock`` while calling ``execute_signal`` (which locks itself).
+        """
+        events: list[dict] = []
+        now = _utcnow()
+        stmt = select(ScheduledOrder).where(ScheduledOrder.status == "armed")
+        if self.user_id is not None:
+            stmt = stmt.where(ScheduledOrder.user_id == self.user_id)
+        try:
+            rows = list(db.scalars(stmt).all())
+        except Exception:
+            return events
+        for so in rows:
+            when = _as_utc(so.scheduled_for)
+            if when is None or now < when:
+                continue  # not due yet — leave it armed
+            try:
+                accepted, message, trade = self.execute_signal(
+                    db, action=so.action, symbol=so.symbol, amount=so.amount,
+                    stop_loss=so.stop_loss, take_profit=so.take_profit,
+                    source="scheduled", note=so.note or "scheduled order",
+                    limit_price=so.limit_price,
+                )
+            except Exception as exc:  # a bad row must never sink the whole tick
+                accepted, message, trade = False, f"scheduled order failed: {exc}", None
+            # Re-read + flip status exactly once so a concurrent tick/cancel on
+            # another session can't fire the same row twice.
+            db.refresh(so)
+            if so.status != "armed":
+                continue
+            so.fired_at = _utcnow()
+            if accepted and trade is not None:
+                so.status, so.result_trade_id, so.error = "fired", trade.id, None
+                text = f"⏰ Scheduled {so.action.upper()} {so.symbol} fired — {message}"
+                level = "info"
+            else:
+                so.status, so.error = "error", message
+                text = (f"⏰ Scheduled {so.action.upper()} {so.symbol} "
+                        f"could not run — {message}")
+                level = "warn"
+            db.add(so)
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+                continue
+            events.append({"user_id": self.user_id, "kind": "scheduled",
+                           "event": so.status, "symbol": so.symbol,
+                           "text": text, "level": level})
+        return events
 
     def _exchange_stop_filled_price(self, trade: Trade) -> Optional[float]:
         """Average fill price if this trade's exchange-side stop has ALREADY fired.

@@ -379,13 +379,20 @@ class Settings(BaseSettings):
     ai_autopilot_enabled: bool = Field(default=False)
 
     # Live market-news sources for the AI assistant + News panel. Comma-separated
-    # public RSS/Atom feed URLs (crypto/markets). Real headlines only — if a feed
-    # is unreachable it's reported as unavailable, never faked. No user data is
-    # sent to fetch these (plain GETs to public feeds).
+    # public RSS/Atom feed URLs. Real headlines only — NO API key, no user data
+    # sent (plain GETs to public feeds); an unreachable feed is reported as
+    # unavailable, never faked. The default basket is deliberately MIXED so the
+    # assistant can name the CAUSE of a move, not just the crypto reaction:
+    # crypto-native (CoinDesk, Cointelegraph) + broad markets/macro (Yahoo
+    # Finance, CNBC) + world/geopolitical (BBC World). Operators can override the
+    # list in Settings; each feed is fetched independently and degrades gracefully.
     news_feeds: str = Field(
         default=(
             "https://www.coindesk.com/arc/outboundfeeds/rss/,"
-            "https://cointelegraph.com/rss"
+            "https://cointelegraph.com/rss,"
+            "https://finance.yahoo.com/news/rssindex,"
+            "https://www.cnbc.com/id/10000664/device/rss/rss.html,"
+            "https://feeds.bbci.co.uk/news/world/rss.xml"
         )
     )
 
