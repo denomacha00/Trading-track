@@ -94,6 +94,7 @@ class RiskManager:
         stop_price: float | None = None,
         day_unrealized: float = 0.0,
         equity_for_limits: float | None = None,
+        unattended: bool = False,
     ) -> RiskDecision:
         """Validate a prospective trade and return a sized decision.
 
@@ -157,21 +158,30 @@ class RiskManager:
         notional = amount * price
 
         # Per-position CONCENTRATION cap (the primary blow-up guard). No single
-        # position may exceed max_position_pct% of TOTAL equity. We clamp the
-        # AUTO-sizer only: when the caller passed no explicit amount, the bot
-        # chose the size, so shrinking it to the cap is honest (caps only ever
-        # reduce risk). An EXPLICIT amount is the operator's / webhook's / saved-
-        # strategy's deliberate choice — we don't silently resize it here (that
-        # would trade a different size than asked); it's still bounded by free
-        # cash and the exposure cap below.
+        # position may exceed max_position_pct% of TOTAL equity.
+        #  • AUTO-sizer (no explicit amount): clamp down to the cap — the bot chose
+        #    the size, so shrinking it is honest (caps only ever reduce risk).
+        #  • UNATTENDED explicit amount (autonomous decision / TradingView alert):
+        #    refuse it rather than trade a size the sender didn't ask for OR let an
+        #    automated feed quietly breach the blow-up guard.
+        #  • MANUAL explicit amount: a deliberate human action — honoured here
+        #    (still bounded by free cash and the exposure cap below).
         max_pos_pct = getattr(self.settings, "max_position_pct", 0.0)
-        if is_opening and not requested_amount and max_pos_pct > 0 and basis > 0:
+        if is_opening and max_pos_pct > 0 and basis > 0:
             pos_cap = basis * (max_pos_pct / 100.0)
             if notional > pos_cap:
-                amount = pos_cap / price
-                notional = amount * price
-                if amount <= 0:
-                    return RiskDecision(False, "Computed position size is zero")
+                if not requested_amount:
+                    amount = pos_cap / price
+                    notional = amount * price
+                    if amount <= 0:
+                        return RiskDecision(False, "Computed position size is zero")
+                elif unattended:
+                    return RiskDecision(
+                        False,
+                        f"Order notional {notional:.2f} exceeds the per-position "
+                        f"cap {pos_cap:.2f} ({max_pos_pct:.0f}% of equity). Reduce "
+                        f"the size or raise max_position_pct.",
+                    )
 
         if is_opening and notional > equity:
             return RiskDecision(

@@ -204,6 +204,32 @@ def test_concentration_cap_does_not_resize_explicit_amount(db):
     assert decision.amount == pytest.approx(40.0)
 
 
+def test_concentration_cap_rejects_unattended_explicit_over_cap(db):
+    # An UNATTENDED explicit size (autonomous decision / TradingView alert) that
+    # breaches the 25% per-position cap is REFUSED — we neither trade a size the
+    # feed didn't ask for nor let it quietly breach the blow-up guard. (A MANUAL
+    # explicit over-cap amount is still honoured — see the test above.)
+    rm = RiskManager(_settings(max_position_pct=25.0))
+    decision = rm.check(
+        db, equity=10_000, price=100, requested_amount=40,
+        is_opening=True, equity_for_limits=10_000, unattended=True,
+    )
+    assert not decision.allowed
+    assert "cap" in decision.reason.lower()
+
+
+def test_concentration_cap_allows_unattended_within_cap(db):
+    # The unattended guard only bites when the size actually breaches the cap:
+    # 20 @ 100 = 2000 (20% < 25%) from a webhook is allowed and honoured as-is.
+    rm = RiskManager(_settings(max_position_pct=25.0))
+    decision = rm.check(
+        db, equity=10_000, price=100, requested_amount=20,
+        is_opening=True, equity_for_limits=10_000, unattended=True,
+    )
+    assert decision.allowed
+    assert decision.amount == pytest.approx(20.0)
+
+
 def test_concentration_cap_disabled_allows_full_auto_size(db):
     # With the cap off (0), the auto-sizer's full 50%-of-equity position stands.
     rm = RiskManager(_settings(max_position_pct=0.0))

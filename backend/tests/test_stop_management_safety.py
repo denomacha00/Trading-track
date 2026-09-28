@@ -275,5 +275,47 @@ def test_paper_resting_limit_fills_on_real_cross(db):
     assert t.entry_price == pytest.approx(100.0)
 
 
+# ---- live-open safety: honest stop + honest balance -----------------
+
+
+def test_live_buy_warns_when_exchange_stop_cannot_be_placed(db):
+    # A live BUY whose exchange-side stop can't rest must STILL open (the in-process
+    # monitor guards it while the bot runs), but the bot must loudly flag the
+    # missing hard stop rather than leave the operator with silent false safety.
+    conn = FakeConnector(price=100.0)
+    conn._stop_result = None  # venue won't rest the protective stop
+    eng = _engine(conn, trading_mode="live", default_stop_loss_pct=2.0)
+    events: list[tuple] = []
+    eng._emit = lambda kind, payload: events.append((kind, payload))
+    ok, msg, trade = eng.execute_signal(
+        db, action="buy", symbol="BTC/USDT", amount=1.0,
+        stop_loss=98.0, take_profit=None, source="manual",
+    )
+    assert ok and trade is not None
+    assert trade.stop_order_id is None                # honestly: no exchange stop
+    assert trade.stop_loss == pytest.approx(98.0)     # in-process stop still armed
+    kinds = [k for k, _ in events]
+    assert "stop_unprotected" in kinds
+    payload = next(p for k, p in events if k == "stop_unprotected")
+    assert payload["symbol"] == "BTC/USDT"
+    assert payload["stop"] == pytest.approx(98.0)
+
+
+def test_live_open_refused_clearly_when_balance_unreadable(db):
+    # If the live balance can't be read, _equity falls back to 0.0 — which must
+    # NOT surface as the misleading "position size is zero". The open is refused
+    # with an explicit "balance unavailable" message, and no order is attempted.
+    conn = FakeConnector(price=100.0)
+    conn.fetch_balance = lambda quote="USDT": None  # feed/exchange can't answer
+    eng = _engine(conn, trading_mode="live", default_stop_loss_pct=2.0)
+    ok, msg, trade = eng.execute_signal(
+        db, action="buy", symbol="BTC/USDT", amount=1.0,
+        stop_loss=98.0, take_profit=None, source="manual",
+    )
+    assert not ok and trade is None
+    assert "balance unavailable" in msg.lower()
+    assert conn.stop_orders == []  # never got as far as placing anything
+
+
 
 

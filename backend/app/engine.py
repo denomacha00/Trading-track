@@ -994,6 +994,22 @@ class TradingEngine:
             # intended fill), not the current market price.
             ref_price = limit_price if limit_price else price
             equity = self._equity(db)
+            # A live open needs a readable balance. _equity returns 0.0 BOTH when
+            # the account is genuinely empty AND when the balance can't be read
+            # (network/exchange hiccup) — sizing would then fail with an opaque
+            # "Computed position size is zero". Disambiguate so the operator sees
+            # the true reason instead of a misleading one.
+            if self.settings.is_live and equity <= 0:
+                if self.connector.fetch_balance("USDT") is None:
+                    return False, (
+                        "Live balance unavailable — couldn't read your account "
+                        "balance right now (network or exchange issue). Holding "
+                        "new entries until it recovers."
+                    ), None
+                return False, (
+                    "Live account has no free USDT to open a new position — "
+                    "deposit or free up funds on the exchange first."
+                ), None
             # Value the rest of the book to feed the loss/exposure checks. If a
             # currently-open position can't be priced (feed outage), we're blind to
             # real exposure — refuse the NEW entry rather than deploy capital on a
@@ -1016,6 +1032,7 @@ class TradingEngine:
                 stop_price=stop_loss,
                 day_unrealized=day_unrealized,
                 equity_for_limits=equity_for_limits,
+                unattended=source in {"auto", "tradingview"},
             )
             if not decision.allowed:
                 return False, f"Rejected by risk manager: {decision.reason}", None
@@ -1123,6 +1140,22 @@ class TradingEngine:
                 )
                 if stop_order:
                     stop_order_id = str(stop_order.get("id"))
+                else:
+                    # The venue rejected / couldn't rest the protective stop. The
+                    # in-process SL/TP monitor still guards this position WHILE the
+                    # bot runs, but nothing rests on the exchange if the process
+                    # goes offline. Surface it loudly rather than let the operator
+                    # believe a hard stop is in place (silent gap = false safety).
+                    self._emit("stop_unprotected", {
+                        "symbol": symbol, "side": action, "stop": round(sl, 8),
+                    })
+                    self._notify(
+                        f"⚠️ {symbol}: could NOT place an exchange-side "
+                        f"stop-loss @ {sl:.2f}. The bot will still exit at your "
+                        f"stop while it is running, but no stop is resting on the "
+                        f"exchange if the bot goes offline — consider setting "
+                        f"one on the exchange manually."
+                    )
 
             trade = Trade(
                 symbol=symbol,
