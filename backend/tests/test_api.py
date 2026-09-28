@@ -171,6 +171,23 @@ def test_webhook_keyless_is_not_deduped(client):
         assert "no open position" in r.json()["message"].lower()
 
 
+def test_webhook_buy_blocked_when_bot_stopped(client):
+    # The STOP switch halts NEW entries — the autonomous monitor gates new-entry
+    # analysis on the bot being "running", and a webhook BUY is an unattended new
+    # entry, so it must not open a position while the bot is stopped. An exit
+    # (close) must still fire. Runs before the rotate test (token still valid).
+    path = _webhook_path(client)
+    assert client.post("/api/bot/stop").json()["running"] is False
+    r = client.post(
+        path, content=b'{"action":"buy","symbol":"ZZZ/USDT","amount":0.01}'
+    )
+    assert r.status_code == 409
+    assert "stop" in r.json()["detail"].lower()
+    # A close on the same (positionless) symbol is still accepted while stopped.
+    rc = client.post(path, content=b'{"action":"close","symbol":"ZZZ/USDT"}')
+    assert rc.status_code == 200
+
+
 def test_webhook_rotate_invalidates_old_token(client):
     # Rotating mints a fresh token and kills the old URL immediately. Run LAST
     # among webhook tests since it changes the admin's token (others re-read it).

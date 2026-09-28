@@ -1049,19 +1049,22 @@ class TradingEngine:
 
             qty = decision.amount
 
-            # ---- Confirm-before-LIVE gate for AUTONOMOUS entries ----------
+            # ---- Confirm-before-LIVE gate for UNATTENDED entries ----------
             # The bot may watch the real market all night and decide entries on
             # its own, but on a REAL-money account it asks first when
             # auto_live_confirm is on ("it can trade real market but it will
             # confirm when given permission"). We queue the fully risk-checked
-            # decision and ping the operator instead of placing it. This never
-            # touches paper (simulated), exits/closes (a protective exit must
-            # never wait on a human — closes returned far above), or deliberate
-            # MANUAL orders; and the one-shot ``confirmed`` flag lets the approve
-            # endpoint re-run this method fresh without re-queuing. Turning the
-            # gate OFF restores full "trade alone" autonomy.
+            # decision and ping the operator instead of placing it. This covers
+            # BOTH the autopilot ("auto") and a TradingView webhook
+            # ("tradingview") — both are machine-decided entries with no human in
+            # the loop at fire time, so the same safety switch guards them. It
+            # never touches paper (simulated), exits/closes (a protective exit
+            # must never wait on a human — closes returned far above), or
+            # deliberate MANUAL orders; and the one-shot ``confirmed`` flag lets
+            # the approve endpoint re-run this method fresh without re-queuing.
+            # Turning the gate OFF restores full "trade alone" autonomy.
             if (
-                source == "auto"
+                source in {"auto", "tradingview"}
                 and action == "buy"
                 and self.settings.is_live
                 and not confirmed

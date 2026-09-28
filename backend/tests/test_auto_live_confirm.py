@@ -171,6 +171,35 @@ def test_gate_off_places_live_auto_buy_immediately(db):
     assert _pending(db) == []                # nothing queued
 
 
+def test_live_tradingview_buy_is_also_gated(db):
+    # A TradingView webhook BUY is an UNATTENDED, machine-decided live entry just
+    # like the autopilot's own — the confirm-before-live gate covers it too, so a
+    # stray/compromised alert can't spend REAL money without the operator's yes.
+    conn = FakeConnector(price=100.0)
+    eng = _engine(conn)  # gate ON, live
+    ok, msg, trade = eng.execute_signal(
+        db, action="buy", symbol="BTC/USDT", amount=None,
+        stop_loss=98.0, take_profit=None, source="tradingview",
+    )
+    assert not ok and trade is None
+    assert conn.market_orders == []          # nothing hit the exchange
+    rows = _pending(db)
+    assert len(rows) == 1 and rows[0].side == "buy"
+
+
+def test_gate_off_places_live_tradingview_buy(db):
+    # Turning the gate off restores hands-off webhook execution.
+    conn = FakeConnector(price=100.0)
+    eng = _engine(conn, auto_live_confirm=False)
+    ok, msg, trade = eng.execute_signal(
+        db, action="buy", symbol="BTC/USDT", amount=None,
+        stop_loss=98.0, take_profit=None, source="tradingview",
+    )
+    assert ok and trade is not None
+    assert len(conn.market_orders) == 1
+    assert _pending(db) == []
+
+
 def test_paper_auto_buy_not_gated(db):
     conn = FakeConnector(price=100.0)
     eng = _engine(conn, trading_mode="paper")  # gate is live-only

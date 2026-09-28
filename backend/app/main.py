@@ -610,6 +610,20 @@ async def tradingview_webhook(
         return ExecutionResult(accepted=False, message=msg, trade=None)
 
     engine = _engine_for(db, user)
+    # Respect the STOP switch. Stopping the bot halts NEW entries — that's what
+    # the autonomous monitor loop does (tasks.py gates new-entry analysis on
+    # ``engine.running``), and the operator reasonably expects Stop to mean "open
+    # nothing new." A webhook BUY is an unattended new entry, so it must not open
+    # a position while the bot is stopped. An exit is never blocked: a ``close``
+    # (and a live sell, which can only close) still runs so a protective exit can
+    # always fire and open positions keep their SL/TP protection.
+    if signal.action == "buy" and not engine.running:
+        msg = (
+            "Bot is stopped — start it to accept new webhook entries. "
+            "(Exits still run while stopped.)"
+        )
+        _log_signal(db, user.id, "tradingview", signal.symbol, signal.action, safe_raw, False, msg)
+        raise HTTPException(status_code=409, detail=msg)
     accepted, message, trade = await asyncio.to_thread(
         engine.execute_signal,
         db,
