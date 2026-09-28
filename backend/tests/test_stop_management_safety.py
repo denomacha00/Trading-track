@@ -317,5 +317,47 @@ def test_live_open_refused_clearly_when_balance_unreadable(db):
     assert conn.stop_orders == []  # never got as far as placing anything
 
 
+# ---- a THROWN exchange-stop must not strand a filled position -------
+
+
+def test_live_buy_stop_that_raises_still_opens_and_warns(db):
+    # The market order already filled a REAL position. If create_stop_loss_order
+    # then THROWS, the old code let the exception propagate and the Trade row was
+    # never written — an untracked naked position on the exchange. Now the throw is
+    # caught, the position is recorded (in-process stop armed), and the missing
+    # hard stop is flagged loudly.
+    conn = FakeConnector(price=100.0)
+    conn._stop_raises = True
+    eng = _engine(conn, trading_mode="live", default_stop_loss_pct=2.0)
+    events: list[tuple] = []
+    eng._emit = lambda kind, payload: events.append((kind, payload))
+    ok, msg, trade = eng.execute_signal(
+        db, action="buy", symbol="BTC/USDT", amount=1.0,
+        stop_loss=98.0, take_profit=None, source="manual",
+    )
+    assert ok and trade is not None                   # position recorded, not lost
+    assert trade.stop_order_id is None                # honestly: no exchange stop
+    assert trade.stop_loss == pytest.approx(98.0)     # in-process stop still armed
+    assert "stop_unprotected" in [k for k, _ in events]
+
+
+def test_live_limit_fill_warns_when_exchange_stop_cannot_be_placed(db):
+    # A resting-limit fill IS a real new position; its exchange-stop failure must
+    # be flagged on the SAME honest path as a market open, not swallowed silently.
+    conn = FakeConnector(price=100.0)
+    conn._stop_result = None  # venue won't rest the protective stop
+    eng = _engine(conn, trading_mode="live")
+    events: list[tuple] = []
+    eng._emit = lambda kind, payload: events.append((kind, payload))
+    t = _open_trade(
+        db, status=TradeStatus.pending.value, entry_price=0.0, stop_loss=98.0,
+        stop_order_id=None, order_type="limit", limit_price=99.0, amount=1.0,
+    )
+    eng._fill_pending(db, t, fill_price=99.0)
+    assert t.status == TradeStatus.open.value         # promoted to an open position
+    assert t.stop_order_id is None                    # honestly: no exchange stop
+    assert "stop_unprotected" in [k for k, _ in events]
+
+
 
 

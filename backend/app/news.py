@@ -11,15 +11,27 @@ from __future__ import annotations
 import logging
 import time
 from email.utils import parsedate_to_datetime
-from xml.etree import ElementTree as ET
 
 import httpx
+
+# Parse feeds with defusedxml so a hostile or malformed feed can't mount an XML
+# attack (billion-laughs entity expansion, external-entity/SSRF, DTD retrieval)
+# against the parser. Fall back to the stdlib parser only if defusedxml isn't
+# installed — the response body is size-capped either way — so news never breaks.
+try:
+    from defusedxml.ElementTree import fromstring as _xml_fromstring
+except Exception:  # pragma: no cover - dependency present in requirements.txt
+    from xml.etree.ElementTree import fromstring as _xml_fromstring
 
 logger = logging.getLogger(__name__)
 
 # Small in-process cache: {feeds_key: (fetched_at, items, errors)}.
 _CACHE: dict[str, tuple[float, list[dict], list[str]]] = {}
 _UA = "Tranding-track/1.0 (+news reader)"
+# Hard cap on how much of a feed we read. Real RSS/Atom feeds are a few hundred KB
+# at most; refusing to buffer more protects memory against a huge/hostile body
+# (and pairs with defusedxml, which stops entity-expansion blowups after decode).
+_MAX_FEED_BYTES = 4 * 1024 * 1024  # 4 MiB
 
 
 def _localname(tag: str) -> str:
@@ -88,7 +100,7 @@ def _select_recent(
 def _parse_feed(xml_text: str, source: str) -> list[dict]:
     """Parse an RSS or Atom document into a list of {title, link, source, published}."""
     items: list[dict] = []
-    root = ET.fromstring(xml_text)
+    root = _xml_fromstring(xml_text)
     # RSS: channel/item ; Atom: feed/entry. Search by local name to ignore ns.
     entries = [el for el in root.iter() if _localname(el.tag) in ("item", "entry")]
     for el in entries:
@@ -123,6 +135,28 @@ def _source_name(url: str) -> str:
     return host.replace("www.", "")
 
 
+def _fetch_capped(client: httpx.Client, url: str) -> str:
+    """GET a feed, reading at most ``_MAX_FEED_BYTES`` of body.
+
+    Streams the response and aborts if the body grows past the cap, so a huge or
+    hostile feed can't exhaust memory. Decodes with the response's declared
+    charset (best-effort, replacing undecodable bytes) rather than trusting the
+    body to be valid UTF-8."""
+    with client.stream("GET", url, follow_redirects=True) as resp:
+        resp.raise_for_status()
+        total = 0
+        chunks: list[bytes] = []
+        for chunk in resp.iter_bytes():
+            total += len(chunk)
+            if total > _MAX_FEED_BYTES:
+                raise ValueError(
+                    f"feed exceeded {_MAX_FEED_BYTES // (1024 * 1024)} MiB cap"
+                )
+            chunks.append(chunk)
+        encoding = resp.encoding or "utf-8"
+    return b"".join(chunks).decode(encoding, errors="replace")
+
+
 def fetch_market_news(
     feeds: list[str], limit: int = 8, ttl: float = 60.0, max_age_hours: float = 24.0
 ) -> tuple[list[dict], list[str]]:
@@ -143,9 +177,8 @@ def fetch_market_news(
     for url in feeds:
         try:
             with httpx.Client(timeout=8.0, headers={"User-Agent": _UA}) as client:
-                resp = client.get(url, follow_redirects=True)
-                resp.raise_for_status()
-                items.extend(_parse_feed(resp.text, _source_name(url)))
+                xml_text = _fetch_capped(client, url)
+            items.extend(_parse_feed(xml_text, _source_name(url)))
         except Exception as exc:
             logger.warning("news feed failed %s: %s", url, exc)
             errors.append(f"{_source_name(url)} unavailable")

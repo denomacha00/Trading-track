@@ -88,6 +88,14 @@ class TradingEngine:
         # Last equity peak actually written to the KV store, so the monitor tick
         # can throttle peak persistence (only write on a materially higher peak).
         self._last_persisted_peak: float = 0.0
+        # The trading mode (paper/live) the drawdown baseline currently reflects.
+        # A runtime paper<->live flip measures a DIFFERENT money pool (the
+        # simulated wallet vs a real balance), so the peak/kill-switch must be
+        # re-armed on a flip rather than carried across — otherwise a ~10k paper
+        # peak would make a small live balance look like a ~100% drawdown and
+        # falsely trip the kill-switch. Tracked separately from settings so a flip
+        # is still detectable when apply_settings mutates the same Settings object.
+        self._active_mode: str = settings.trading_mode
         # Per-symbol time of the last LOSING exit, for the re-entry cooldown.
         self._last_loss_exit: dict[str, dt.datetime] = {}
         # Symbols whose price feed is currently unreachable during monitoring, so
@@ -147,6 +155,10 @@ class TradingEngine:
             self.risk.update(self.settings)
             self.connector.reload(self.settings)
             self.analyzer.min_confidence = self.settings.min_signal_confidence
+        # Sync the drawdown-baseline mode tracker to the RESTORED mode so the first
+        # runtime settings change isn't mistaken for a paper<->live flip (which
+        # would needlessly re-arm the just-restored equity peak below).
+        self._active_mode = self.settings.trading_mode
         # Paper wallet: restore or seed from configured starting balance.
         self.paper_balance = load_paper_balance(
             db, self.settings.paper_starting_balance, self.user_id
@@ -257,13 +269,24 @@ class TradingEngine:
         current.update(overrides)
         save_settings_overrides(db, current, self.user_id)
 
-    def apply_settings(self, settings: Settings) -> None:
+    def apply_settings(self, settings: Settings, db: Session | None = None) -> None:
         self.settings = settings
         self.risk.update(settings)
         self.connector.reload(settings)
         self.analyzer.min_confidence = settings.min_signal_confidence
         self.notifier.reload(settings)
         self.ai.reload(settings)
+        # A paper<->live flip re-points the drawdown kill-switch at a DIFFERENT
+        # money pool (the simulated wallet vs a real balance). The equity peak is
+        # tracked in whatever mode was active, so carrying, say, a ~10k paper peak
+        # into live with a small real balance would make the next _update_drawdown
+        # tick see a ~100% drawdown and FALSELY trip the kill-switch — blocking the
+        # user's real trading straight away. The pools are unrelated, so re-arm the
+        # baseline fresh for the new mode (exactly what tapping Start does). Passing
+        # db persists the re-arm immediately; without it the next tick persists.
+        if settings.trading_mode != self._active_mode:
+            self._active_mode = settings.trading_mode
+            self.reset_killswitch(db)
 
     # ---- saved strategies (train once, let the bot trade it) ---------
 
@@ -641,11 +664,13 @@ class TradingEngine:
         return day_pnl <= loss_limit
 
     def reset_killswitch(self, db: Session | None = None) -> None:
-        """Clear the kill-switch and reseed the equity peak (human re-arm).
+        """Clear the kill-switch and reseed the equity peak (a fresh re-arm).
 
-        Called when the operator (re)starts the bot: restarting is the explicit
-        human acknowledgement that resumes trading, and the drawdown budget is
-        measured fresh from the equity at restart rather than an old, higher peak.
+        Called when the operator (re)starts the bot, and when the trading mode is
+        flipped (paper<->live) — both are explicit human actions that legitimately
+        re-baseline the drawdown budget: restarting resumes trading from the equity
+        at restart rather than an old, higher peak, and a mode flip points the
+        kill-switch at a different money pool that the previous peak never measured.
         When ``db`` is supplied the cleared state is persisted immediately, so the
         re-arm itself survives a later restart/rebuild.
         """
@@ -1003,6 +1028,30 @@ class TradingEngine:
             # For a limit order, size and validate against the LIMIT price (the
             # intended fill), not the current market price.
             ref_price = limit_price if limit_price else price
+            # Validate an externally-supplied stop-loss BEFORE risking capital. A
+            # zero/None stop means "use the safe auto stop" (handled downstream);
+            # but a NEGATIVE price, or one on the wrong side of the entry (at/above
+            # entry for a long, at/below for a short), is malformed — typically a
+            # stray or compromised webhook payload — and would arm a nonsensical or
+            # instantly-triggered "protective" stop. Refuse the entry outright
+            # rather than open a real position behind a broken stop.
+            if stop_loss is not None and stop_loss < 0:
+                return False, (
+                    f"{symbol}: stop-loss can't be negative ({stop_loss:g})."
+                ), None
+            if stop_loss and ref_price > 0:
+                if action == "buy" and stop_loss >= ref_price:
+                    return False, (
+                        f"{symbol}: stop-loss {stop_loss:g} must be BELOW the entry "
+                        f"price {ref_price:g} for a long — refusing a stop that "
+                        f"would trigger immediately."
+                    ), None
+                if action == "sell" and stop_loss <= ref_price:
+                    return False, (
+                        f"{symbol}: stop-loss {stop_loss:g} must be ABOVE the entry "
+                        f"price {ref_price:g} for a short — refusing a stop that "
+                        f"would trigger immediately."
+                    ), None
             equity = self._equity(db)
             # A live open needs a readable balance. _equity returns 0.0 BOTH when
             # the account is genuinely empty AND when the balance can't be read
@@ -1180,27 +1229,11 @@ class TradingEngine:
             # monitor remains the fallback.
             stop_order_id: str | None = None
             if self.settings.is_live and sl and action == "buy":
-                stop_order = self.connector.create_stop_loss_order(
-                    symbol, "sell", qty, sl
-                )
-                if stop_order:
-                    stop_order_id = str(stop_order.get("id"))
-                else:
-                    # The venue rejected / couldn't rest the protective stop. The
-                    # in-process SL/TP monitor still guards this position WHILE the
-                    # bot runs, but nothing rests on the exchange if the process
-                    # goes offline. Surface it loudly rather than let the operator
-                    # believe a hard stop is in place (silent gap = false safety).
-                    self._emit("stop_unprotected", {
-                        "symbol": symbol, "side": action, "stop": round(sl, 8),
-                    })
-                    self._notify(
-                        f"⚠️ {symbol}: could NOT place an exchange-side "
-                        f"stop-loss @ {sl:.2f}. The bot will still exit at your "
-                        f"stop while it is running, but no stop is resting on the "
-                        f"exchange if the bot goes offline — consider setting "
-                        f"one on the exchange manually."
-                    )
+                # Best-effort exchange-side stop so the position is protected even
+                # if this bot process is down. A rejection/throw is surfaced loudly
+                # (stop_unprotected) rather than left as silent false safety; the
+                # in-process SL/TP monitor remains the fallback while the bot runs.
+                stop_order_id = self._place_exchange_stop(symbol, qty, sl)
 
             trade = Trade(
                 symbol=symbol,
@@ -1403,6 +1436,43 @@ class TradingEngine:
         })
         return ok, msg, trade
 
+    # ---- protective stops -------------------------------------------
+    def _place_exchange_stop(
+        self, symbol: str, qty: float, sl: float, *, side: str = "sell"
+    ) -> str | None:
+        """Best-effort place a LIVE exchange-side protective stop — honestly.
+
+        Returns the resting stop order's id, or ``None`` when no stop rests on the
+        exchange. Used by EVERY live-entry path (market open, DCA/scaled leg,
+        resting-limit fill) so protection is placed — and its FAILURE reported —
+        identically everywhere. On a venue rejection (falsy result) OR an exception
+        from the venue call, it emits ``stop_unprotected`` and notifies the
+        operator, and still returns ``None`` so the caller records the (real,
+        already-filled) position rather than throwing and leaving an untracked
+        naked position. The in-process SL/TP monitor still guards the position
+        WHILE the bot runs; the warning makes the "nothing rests if the bot goes
+        offline" gap loud instead of silent false safety.
+        """
+        try:
+            stop_order = self.connector.create_stop_loss_order(symbol, side, qty, sl)
+        except Exception as exc:  # a throw must not strand a filled position
+            logger.warning(
+                "exchange stop placement raised for %s @ %.8f: %s", symbol, sl, exc
+            )
+            stop_order = None
+        if stop_order:
+            return str(stop_order.get("id"))
+        self._emit("stop_unprotected", {
+            "symbol": symbol, "side": "buy", "stop": round(sl, 8),
+        })
+        self._notify(
+            f"⚠️ {symbol}: could NOT place an exchange-side stop-loss @ {sl:.2f}. "
+            f"The bot will still exit at your stop while it is running, but no stop "
+            f"is resting on the exchange if the bot goes offline — consider setting "
+            f"one on the exchange manually."
+        )
+        return None
+
     # ---- scaled (DCA) entries ---------------------------------------
     def _place_leg(
         self,
@@ -1455,11 +1525,9 @@ class TradingEngine:
             tp = take_profit or self._auto_take(price, "buy")
             stop_order_id: str | None = None
             if self.settings.is_live and sl:
-                stop_order = self.connector.create_stop_loss_order(
-                    symbol, "sell", qty, sl
-                )
-                if stop_order:
-                    stop_order_id = str(stop_order.get("id"))
+                # Same honest exchange-stop placement as a single market open: a
+                # failure is flagged (stop_unprotected), never silently swallowed.
+                stop_order_id = self._place_exchange_stop(symbol, qty, sl)
             trade = Trade(
                 symbol=symbol, side="buy", amount=qty, entry_price=price,
                 stop_loss=sl, take_profit=tp, status=TradeStatus.open.value,
@@ -1771,11 +1839,11 @@ class TradingEngine:
         if trade.take_profit is None:
             trade.take_profit = self._auto_take(fill_price, trade.side)
         if self.settings.is_live and trade.stop_loss and trade.side == "buy":
-            stop_order = self.connector.create_stop_loss_order(
-                trade.symbol, "sell", trade.amount, trade.stop_loss
+            # A resting-limit fill IS a real new position — protect it (and flag a
+            # failed stop) exactly like a market open, never silently.
+            trade.stop_order_id = self._place_exchange_stop(
+                trade.symbol, trade.amount, trade.stop_loss
             )
-            if stop_order:
-                trade.stop_order_id = str(stop_order.get("id"))
         trade.opened_at = _utcnow()
         db.commit()
         db.refresh(trade)

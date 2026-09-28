@@ -1265,7 +1265,7 @@ def update_settings(
             )
     for key, value in data.items():
         setattr(s, key, value)
-    engine.apply_settings(s)
+    engine.apply_settings(s, db)
     # Monitor cadence is GLOBAL (one shared background loop for all users): persist
     # it to the unscoped KV the loop reads live, NOT as a per-user override.
     interval = data.pop("monitor_interval_seconds", None)

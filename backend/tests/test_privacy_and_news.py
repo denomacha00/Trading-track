@@ -4,8 +4,10 @@ from __future__ import annotations
 import datetime as dt
 import json
 
+import pytest
+
 from app.main import _redact_raw
-from app.news import _parse_feed, _select_recent, fetch_market_news
+from app.news import _fetch_capped, _parse_feed, _select_recent, fetch_market_news
 
 
 def test_redact_masks_secret_fields():
@@ -98,3 +100,63 @@ def test_select_recent_final_fallback_shows_real_older_items():
 
 def test_select_recent_empty_stays_empty():
     assert _select_recent([], 24.0, now=_REF.timestamp()) == []
+
+
+# ---- feed hardening: XML-attack resistance + body-size cap -------------
+
+
+def test_parse_feed_rejects_declared_entities():
+    # A feed that declares XML entities (billion-laughs / external-entity vector)
+    # must be REFUSED by the defused parser, not expanded. This also fails loudly
+    # if the deploy image is missing defusedxml (the stdlib fallback would expand).
+    payload = (
+        '<?xml version="1.0"?>'
+        '<!DOCTYPE lolz [<!ENTITY lol "lol">]>'
+        "<rss><channel><item><title>&lol;</title></item></channel></rss>"
+    )
+    with pytest.raises(Exception):
+        _parse_feed(payload, "x")
+
+
+class _FakeStreamResp:
+    def __init__(self, chunks: list[bytes], encoding: str = "utf-8"):
+        self._chunks = chunks
+        self.encoding = encoding
+
+    def raise_for_status(self):
+        return None
+
+    def iter_bytes(self):
+        yield from self._chunks
+
+
+class _FakeStreamCtx:
+    def __init__(self, resp: _FakeStreamResp):
+        self._resp = resp
+
+    def __enter__(self):
+        return self._resp
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeClient:
+    def __init__(self, chunks: list[bytes]):
+        self._chunks = chunks
+
+    def stream(self, method, url, follow_redirects=False):
+        return _FakeStreamCtx(_FakeStreamResp(self._chunks))
+
+
+def test_fetch_capped_aborts_on_oversize_body():
+    # A hostile/huge feed must not be buffered without bound.
+    one_mib = b"x" * (1024 * 1024)
+    client = _FakeClient([one_mib] * 5)  # 5 MiB > 4 MiB cap
+    with pytest.raises(ValueError):
+        _fetch_capped(client, "https://feed.example/rss")
+
+
+def test_fetch_capped_returns_small_body_decoded():
+    client = _FakeClient([b"<rss></rss>"])
+    assert _fetch_capped(client, "https://feed.example/rss") == "<rss></rss>"

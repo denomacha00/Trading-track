@@ -237,3 +237,46 @@ def test_equity_peak_is_persisted_as_it_grows(db):
     eng2 = _engine(conn, paper_starting_balance=10_000.0, max_drawdown_pct=20.0)
     eng2.restore_state(db)
     assert eng2._peak_equity == pytest.approx(10_000.0)
+
+
+# ---- a paper<->live flip re-arms the baseline (never a false trip) --
+
+
+def test_mode_flip_rearms_drawdown_baseline(db):
+    """Flipping paper->live must NOT carry the paper equity peak into live.
+
+    The peak is tracked per running mode; live measures a real balance, paper a
+    simulated wallet. If a ~10k paper peak leaked into a small live balance, the
+    next _update_drawdown tick would see a ~100% drawdown and falsely trip the
+    kill-switch, blocking the user's real trading. Flipping the mode re-arms the
+    baseline (like tapping Start) and persists it.
+    """
+    conn = _Conn()
+    eng = _engine(conn, trading_mode="paper")
+    eng._peak_equity = 10_000.0          # a peak accumulated on the paper wallet
+    eng._last_persisted_peak = 10_000.0
+    eng.persist_runtime(db)
+
+    eng.settings.trading_mode = "live"   # operator flips to live (small real acct)
+    eng.apply_settings(eng.settings, db)
+
+    assert eng._active_mode == "live"
+    assert eng._peak_equity == 0.0       # re-armed: no stale paper peak
+    assert eng._killswitch_tripped is False
+    # The re-arm is durable: a rebuild restores the fresh (zero) baseline, not 10k.
+    stored = load_engine_runtime(db, None)
+    assert stored["peak_equity"] == pytest.approx(0.0)
+
+
+def test_non_mode_settings_change_keeps_drawdown_peak(db):
+    """A settings change that does NOT touch trading_mode must leave the drawdown
+    baseline intact — only a real mode flip re-arms it."""
+    conn = _Conn()
+    eng = _engine(conn, trading_mode="paper")
+    eng._peak_equity = 10_000.0
+
+    eng.settings.risk_per_trade_pct = 2.0   # some unrelated tweak
+    eng.apply_settings(eng.settings, db)
+
+    assert eng._active_mode == "paper"
+    assert eng._peak_equity == pytest.approx(10_000.0)  # untouched
