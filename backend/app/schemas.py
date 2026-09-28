@@ -256,6 +256,7 @@ class SettingsOut(BaseModel):
     ai_monitor_enabled: bool = False
     ai_autopilot_enabled: bool = False
     ict_enabled: bool = True
+    ict_confluence: bool = True
     ai_enabled: bool
     ai_model: str = ""
     ai_style: str = ""
@@ -300,6 +301,7 @@ class SettingsUpdate(BaseModel):
     ai_monitor_enabled: Optional[bool] = None
     ai_autopilot_enabled: Optional[bool] = None
     ict_enabled: Optional[bool] = None
+    ict_confluence: Optional[bool] = None
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=100)
     max_total_exposure_pct: Optional[float] = Field(default=None, ge=0, le=1000)
     max_position_pct: Optional[float] = Field(default=None, ge=0, le=100)

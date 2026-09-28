@@ -52,7 +52,11 @@ class TradingEngine:
         self.connector = connector
         self.user_id = user_id
         self.risk = RiskManager(settings, user_id=user_id)
-        self.analyzer = MarketAnalyzer(min_confidence=settings.min_signal_confidence)
+        self.analyzer = MarketAnalyzer(
+            min_confidence=settings.min_signal_confidence,
+            ict_confluence=bool(getattr(settings, "ict_enabled", True))
+            and bool(getattr(settings, "ict_confluence", True)),
+        )
         self.notifier = Notifier(settings)
         self.ai = AICommentator(settings)
         self._lock = threading.Lock()
@@ -155,6 +159,9 @@ class TradingEngine:
             self.risk.update(self.settings)
             self.connector.reload(self.settings)
             self.analyzer.min_confidence = self.settings.min_signal_confidence
+            self.analyzer.ict_confluence = bool(
+                getattr(self.settings, "ict_enabled", True)
+            ) and bool(getattr(self.settings, "ict_confluence", True))
         # Sync the drawdown-baseline mode tracker to the RESTORED mode so the first
         # runtime settings change isn't mistaken for a paper<->live flip (which
         # would needlessly re-arm the just-restored equity peak below).
@@ -274,7 +281,9 @@ class TradingEngine:
         self.risk.update(settings)
         self.connector.reload(settings)
         self.analyzer.min_confidence = settings.min_signal_confidence
-        self.notifier.reload(settings)
+        self.analyzer.ict_confluence = bool(
+            getattr(settings, "ict_enabled", True)
+        ) and bool(getattr(settings, "ict_confluence", True))
         self.ai.reload(settings)
         # A paper<->live flip re-points the drawdown kill-switch at a DIFFERENT
         # money pool (the simulated wallet vs a real balance). The equity peak is
@@ -2563,7 +2572,7 @@ class TradingEngine:
         df = pd.DataFrame(
             raw, columns=["timestamp", "open", "high", "low", "close", "volume"]
         )
-        analysis, closed = self.analyzer.analyze_live(df, symbol.upper())
+        analysis, closed, _ict = self.analyzer.analyze_live(df, symbol.upper())
         if apply_strategy:
             analysis = self._apply_saved_strategy(symbol, closed, analysis)
         return analysis

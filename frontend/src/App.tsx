@@ -5962,6 +5962,7 @@ function SettingsPanel({
         ai_autopilot_enabled: form.ai_autopilot_enabled,
         ai_pretrade_analysis: form.ai_pretrade_analysis,
         ict_enabled: form.ict_enabled,
+        ict_confluence: form.ict_confluence,
         auto_pause_in_bear: form.auto_pause_in_bear,
         require_strategy_validation: form.require_strategy_validation,
         strategy_min_return_pct: form.strategy_min_return_pct,
@@ -6290,6 +6291,34 @@ function SettingsPanel({
         apply them for you. It's a deterministic analytical <b>lens</b> — real math,
         no repainting, never a fabricated level — <b>not</b> an auto-trader, and it
         works whether or not an AI key is set.
+      </p>
+      <label
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          marginLeft: 24,
+          opacity: form.ict_enabled ? 1 : 0.5,
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={form.ict_confluence}
+          disabled={!form.ict_enabled}
+          onChange={(e) => setForm({ ...form, ict_confluence: e.target.checked })}
+        />
+        Let the ICT read <b>vote</b> in the decision (confluence)
+      </label>
+      <p className="hint">
+        With this on, the smart-money read doesn't just get drawn — it{' '}
+        <b>votes</b> in the bot's verdict as weighted confluence: market structure
+        (BOS / CHoCH / MSS), premium/discount + the OTE band, and a fresh liquidity
+        sweep are scored <b>alongside</b> the classic signals (trend, RSI, MACD…).
+        It only ever adds real, closed-bar levels — it <b>never</b> overrides a
+        capital-preservation veto and never invents a level, and because the
+        higher-timeframe confirmation re-runs the same brain you get an honest
+        HTF→LTF confluence for free. Off = ICT stays a pure lens (drawn/narrated
+        only). Requires the ICT read above.
       </p>
       <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <input

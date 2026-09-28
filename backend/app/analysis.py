@@ -132,6 +132,7 @@ class MarketAnalyzer:
         overext_rsi: float = 78.0,
         shock_atr_mult: float = 3.0,
         weak_volume_ratio: float = 0.6,
+        ict_confluence: bool = True,
     ) -> None:
         # Score above +threshold => buy, below -threshold => sell, else hold.
         self.buy_threshold = buy_threshold
@@ -150,11 +151,17 @@ class MarketAnalyzer:
         # A trend/breakout bar on less than this fraction of average volume is
         # weakly backed — keep the trade allowed but discount its confidence.
         self.weak_volume_ratio = weak_volume_ratio
+        # When on, a real ICT/smart-money read (computed on the same closed bars)
+        # contributes weighted confluence factors to the verdict. Never overrides
+        # the capital-preservation vetoes; never invents a level. See _ict_factors.
+        self.ict_confluence = ict_confluence
 
     def min_bars(self) -> int:
         return MIN_BARS
 
-    def analyze(self, candles: pd.DataFrame, symbol: str = "") -> MarketAnalysis:
+    def analyze(
+        self, candles: pd.DataFrame, symbol: str = "", *, ict=None
+    ) -> MarketAnalysis:
         price = float(candles["close"].iloc[-1]) if len(candles) else 0.0
         if len(candles) < MIN_BARS:
             return MarketAnalysis(
@@ -275,6 +282,13 @@ class MarketAnalyzer:
                        + (" — thin, discounting" if weak_volume else ""))
             )
 
+        # 8) ICT / smart-money confluence (optional). Structure (BOS/CHoCH/MSS),
+        #    premium/discount + OTE, and a FRESH liquidity sweep vote alongside the
+        #    classic signals — real levels computed on these closed bars, never a
+        #    fabricated one. Passed in by analyze_live; absent in a plain analyze().
+        if ict is not None and self.ict_confluence:
+            factors.extend(self._ict_factors(ict, len(candles)))
+
         # ---- combine ----
         score = 0.0
         total_weight = 0.0
@@ -342,9 +356,66 @@ class MarketAnalyzer:
             summary=summary,
         )
 
+    def _ict_factors(self, ict, n_bars: int) -> list[Factor]:
+        """Turn a computed ICT read into weighted confluence factors.
+
+        ICT is smart-money *structure*: where structure broke (BOS/CHoCH/MSS),
+        whether price sits at a premium or a discount (+ the OTE band), and
+        whether a fresh liquidity sweep just ran stops. Each becomes ONE factor
+        that votes alongside the classic indicators. Every value is read straight
+        off the closed-bar IctAnalysis — nothing is recomputed or invented here,
+        so it can't repaint and can't fabricate a level. A thin/mixed ICT read
+        simply adds little weight, letting the classic signals decide.
+        """
+        out: list[Factor] = []
+        if ict is None:
+            return out
+        # 1) Market structure — the most recent confirmed break.
+        events = getattr(ict, "events", None) or []
+        if events:
+            ev = events[-1]
+            mss = bool(getattr(ev, "displacement", False) and ev.kind == "CHoCH")
+            weight = 0.35 if mss else (0.28 if ev.kind == "CHoCH" else 0.22)
+            try:
+                if (n_bars - 1 - int(ev.index)) > 15:
+                    weight *= 0.5  # a stale break carries less conviction
+            except Exception:
+                pass
+            sig = "buy" if ev.direction == "bull" else "sell"
+            tag = "MSS" if mss else ev.kind
+            out.append(Factor("ict-structure", sig, round(weight, 3),
+                              f"{ev.direction} {tag} (close through {ev.level:g})"))
+        elif getattr(ict, "trend", "none") in ("bull", "bear"):
+            sig = "buy" if ict.trend == "bull" else "sell"
+            out.append(Factor("ict-structure", sig, 0.12, f"structure trend {ict.trend}"))
+        # 2) Premium / discount (+ OTE) — where in the dealing range price is.
+        dr = getattr(ict, "dealing_range", None)
+        if dr is not None:
+            if dr.zone in ("discount", "premium"):
+                sig = "buy" if dr.zone == "discount" else "sell"
+                w = 0.22 if dr.in_ote else 0.12
+                out.append(Factor("ict-zone", sig, w,
+                                  dr.zone + (" + OTE" if dr.in_ote else "")
+                                  + (" (favours longs)" if sig == "buy" else " (favours shorts)")))
+            else:
+                out.append(Factor("ict-zone", "hold", 0.0, "near equilibrium (no premium/discount edge)"))
+        # 3) A FRESH liquidity sweep (stop-hunt) implies a snap the other way.
+        sweeps = getattr(ict, "sweeps", None) or []
+        if sweeps:
+            sw = sweeps[-1]
+            try:
+                fresh = (n_bars - 1 - int(sw.index)) <= 5
+            except Exception:
+                fresh = False
+            if fresh:
+                sig = "buy" if sw.reaction == "bull" else "sell"
+                out.append(Factor("ict-sweep", sig, 0.15,
+                                  f"{sw.side} sweep at {sw.level:g} — {sw.reaction}ish reaction"))
+        return out
+
     def analyze_live(
-        self, candles: pd.DataFrame, symbol: str = ""
-    ) -> tuple[MarketAnalysis, pd.DataFrame]:
+        self, candles: pd.DataFrame, symbol: str = "", *, ict=None
+    ) -> tuple[MarketAnalysis, pd.DataFrame, object]:
         """Analyse a LIVE feed honestly: decide on CLOSED bars only.
 
         A live OHLCV feed's most recent candle is still FORMING — its
@@ -356,18 +427,37 @@ class MarketAnalyzer:
         result as ``price`` — the verdict, score and ATR are computed purely on
         closed data while the UI still shows the CURRENT price.
 
-        Returns ``(analysis, closed_candles)`` so a caller can run a saved
-        strategy on the exact same closed-bar frame the verdict used.
+        When ICT confluence is on, a real ICT read is computed on the SAME
+        closed frame and votes in the verdict (see _ict_factors); it is returned
+        too so a caller (the API) can draw/narrate it without a second compute.
+
+        Returns ``(analysis, closed_candles, ict)`` — ``ict`` is None when
+        confluence is off or the read failed. The closed frame lets a caller run
+        a saved strategy on the exact bars the verdict used.
         """
         n = len(candles)
         live_price = float(candles["close"].iloc[-1]) if n else 0.0
         # Drop the still-forming last bar when there is one to spare; keep the
         # frame intact at the ragged edge so a short history still analyses.
         closed = candles.iloc[:-1] if n >= 2 else candles
-        analysis = self.analyze(closed, symbol)
+        # Compute ICT once (best-effort) only when it will actually vote — a read
+        # failure must never break the deterministic verdict. price=None so the
+        # premium/discount zone is measured against the last CLOSED price, not the
+        # still-forming live tick: otherwise the ict-zone vote could flip intrabar
+        # as price crosses equilibrium, reintroducing exactly the repaint we drop
+        # the forming bar to avoid. The live price is for DISPLAY only (stamped
+        # below); the whole verdict — ICT included — stays a function of closed bars.
+        if ict is None and self.ict_confluence:
+            try:
+                from .ict import analyze_ict
+
+                ict = analyze_ict(closed, symbol, price=None)
+            except Exception:
+                ict = None
+        analysis = self.analyze(closed, symbol, ict=ict)
         if live_price > 0:
             analysis.price = live_price  # display the CURRENT price; verdict is closed-bar
-        return analysis, closed
+        return analysis, closed, ict
 
 
     @staticmethod

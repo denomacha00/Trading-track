@@ -304,6 +304,17 @@ def test_ict_enabled_exposed_and_toggles(client):
     assert client.get("/api/settings").json()["ict_enabled"] is False
 
 
+def test_ict_confluence_exposed_and_toggles(client):
+    # ICT confluence (letting the smart-money read VOTE in the brain) is exposed,
+    # defaults ON, and round-trips through the API allowlist like the lens toggle.
+    body = client.get("/api/settings").json()
+    assert body["ict_confluence"] is True
+    off = client.patch("/api/settings", json={"ict_confluence": False})
+    assert off.status_code == 200
+    assert off.json()["ict_confluence"] is False
+    assert client.get("/api/settings").json()["ict_confluence"] is False
+
+
 def test_trailing_stop_validation(client):
     assert client.patch("/api/settings", json={"trailing_stop_pct": 1.5}).status_code == 200
     assert client.patch("/api/settings", json={"trailing_stop_pct": 500}).status_code == 422

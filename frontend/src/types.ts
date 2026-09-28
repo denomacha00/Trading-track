@@ -257,6 +257,12 @@ export interface Settings {
   // same closed bars, and the chart can draw it. It is an analytical LENS only —
   // it never sizes, places, or vetoes a trade. On by default.
   ict_enabled: boolean
+  // When on (and ict_enabled), the ICT read also VOTES in the deterministic
+  // brain as weighted confluence (structure / premium-discount+OTE / fresh
+  // sweep) alongside the classic signals — never overriding a risk veto, never
+  // inventing a level, computed on closed bars so it can't repaint. Off = ICT is
+  // a pure lens (drawn / narrated only). On by default.
+  ict_confluence: boolean
   // ---- Autopilot safety / pause-resume (safe defaults for non-traders) ----
   // Stand aside for NEW longs while price is in a bear regime; resume in a bull.
   // On by default — capital preservation is the safe stance.

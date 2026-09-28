@@ -165,13 +165,15 @@ def _analysis_for(engine, symbol: str, timeframe: str = "1h", limit: int = 200):
     # min_signal_confidence, not a module-global default. analyze_live decides
     # on CLOSED bars only (dropping the still-forming candle) so the verdict
     # cannot repaint, and stamps the live price back on for display.
-    analysis, closed = engine.analyzer.analyze_live(df, symbol.upper())
-    # The ICT read runs on the SAME closed frame (no repaint) and reuses the
-    # live price the analyzer stamped on, so premium/discount is measured against
-    # where price actually is. Best-effort: a read failure must never break the
-    # deterministic verdict — degrade to no ICT rather than 500.
-    ict = None
-    if getattr(engine.settings, "ict_enabled", True):
+    analysis, closed, ict = engine.analyzer.analyze_live(df, symbol.upper())
+    # When ICT confluence is on, analyze_live already computed the read on this
+    # exact closed frame (it VOTED in the verdict) — reuse it for the display lens
+    # so we don't compute twice. If confluence is off but the lens is still
+    # enabled, compute it here on the SAME closed frame, reusing the live price
+    # the analyzer stamped on so premium/discount is measured against where price
+    # actually is. Best-effort: a read failure must never break the deterministic
+    # verdict — degrade to no ICT rather than 500.
+    if ict is None and getattr(engine.settings, "ict_enabled", True):
         try:
             ict = analyze_ict(closed, symbol=symbol.upper(), price=analysis.price)
         except Exception:
@@ -1191,6 +1193,7 @@ def _settings_out(engine, user: User, db: Session | None = None) -> SettingsOut:
         ai_monitor_enabled=getattr(s, "ai_monitor_enabled", False),
         ai_autopilot_enabled=getattr(s, "ai_autopilot_enabled", False),
         ict_enabled=getattr(s, "ict_enabled", True),
+        ict_confluence=getattr(s, "ict_confluence", True),
         ai_enabled=bool(s.ai_api_key or getattr(s, "ai_fallback_api_key", "")),
         ai_model=s.ai_model,
         ai_style=engine.ai._style() if (s.ai_api_key or getattr(s, "ai_fallback_api_key", "")) else "",
@@ -1978,6 +1981,10 @@ _AI_SETTINGS_BOOL = {
     # ICT/smart-money lens is read-only (no money behaviour), so it's safe for the
     # AI to toggle and is deliberately NOT in _AI_RISK_SETTINGS below.
     "ict_enabled",
+    # ICT confluence just changes how the deterministic brain WEIGHS real computed
+    # levels — it never overrides a capital-preservation veto or invents a level,
+    # so it's proposable and non-risk like the lens toggle above.
+    "ict_confluence",
 }
 _AI_SETTINGS_STR = {"auto_symbols", "auto_timeframe", "auto_confirm_timeframe"}
 

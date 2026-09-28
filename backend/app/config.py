@@ -288,10 +288,21 @@ class Settings(BaseSettings):
     # breaker/rejection blocks, BPR, volume imbalances, EQH/EQL liquidity pools,
     # draw-on-liquidity, premium/discount dealing range + OTE, and PDH/PDL/PWH/PWL.
     # It is surfaced to the API (`/api/analyze` -> `ict`), drawn on the chart, and
-    # handed to the AI so it reads ICT on the REAL data instead of refusing. This
-    # is a read-only lens: it never sizes, places, or vetoes a trade on its own, so
-    # it's safe to leave on. Turn it off to hide the ICT layer everywhere.
+    # handed to the AI so it reads ICT on the REAL data instead of refusing. Turn
+    # it off to hide the ICT layer everywhere (and, since confluence needs the read,
+    # to switch ICT voting off with it).
     ict_enabled: bool = Field(default=True)
+
+    # ICT CONFLUENCE: let the smart-money read actually VOTE in the deterministic
+    # brain instead of only being drawn/narrated. When on (and ict_enabled), the
+    # analyzer adds weighted factors for market structure (BOS/CHoCH/MSS), premium/
+    # discount + OTE, and a fresh liquidity sweep — they vote ALONGSIDE the classic
+    # indicators (regime/trend/RSI/MACD), never overriding the capital-preservation
+    # vetoes and never inventing a level (every factor is a real computed ICT event
+    # on CLOSED bars). Because the higher-timeframe confirm re-runs the same brain,
+    # this gives an honest HTF->LTF confluence with no extra config. Off = ICT is a
+    # pure lens again (drawn/narrated only). Requires ict_enabled.
+    ict_confluence: bool = Field(default=True)
 
     # Background MONITOR cadence (seconds between ticks): how often the engine
     # re-checks open positions (stops/targets/profit-lock), evaluates alerts, and
