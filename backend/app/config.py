@@ -304,6 +304,16 @@ class Settings(BaseSettings):
     # pure lens again (drawn/narrated only). Requires ict_enabled.
     ict_confluence: bool = Field(default=True)
 
+    # ---- FUNDAMENTALS / MACRO / SENTIMENT FEED (real external data) --------
+    # When on, the AI assistant and the Fundamentals panel pull LIVE public data:
+    # crypto Fear & Greed, global market cap + BTC/ETH dominance, per-coin
+    # mcap/volume/supply/ATH/returns, and derivatives funding/OI/long-short -- so
+    # the assistant can genuinely ANALYSE fundamentals instead of disclaiming that
+    # it only has technicals. No API key, no user data leaves the box; a dead
+    # source is reported honestly and left null, never fabricated. Off = the AI
+    # sees technical/structural context only.
+    fundamentals_enabled: bool = Field(default=True)
+
     # ---- CAPITAL / MONEY MANAGER (autonomous sizing discipline) ----------
     # A beginner-safe money manager that sits ON TOP of the risk manager and
     # governs how the AUTOPILOT deploys capital. It can only ever deploy the SAME

@@ -21,7 +21,7 @@ import { Admin } from './Admin'
 import { useSocket } from './useSocket'
 import { useTheme, type Theme } from './theme'
 import { ThemeToggle } from './ThemeToggle'
-import type { AiHealth, Alert, AutoConfirmation, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, IctAnalysis, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
+import type { AiHealth, Alert, AutoConfirmation, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, Fundamentals, IctAnalysis, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -136,7 +136,7 @@ export default function App() {
   return <Dashboard me={me} onLogout={logout} onMeChanged={setMe} theme={theme} onToggleTheme={toggleTheme} />
 }
 
-type TabKey = 'trades' | 'performance' | 'history' | 'signals' | 'assistant' | 'news' | 'analyze' | 'train' | 'backtest' | 'settings' | 'admin'
+type TabKey = 'trades' | 'performance' | 'history' | 'signals' | 'assistant' | 'news' | 'fundamentals' | 'analyze' | 'train' | 'backtest' | 'settings' | 'admin'
 
 // Left-drawer navigation. `admin: true` items only render for admins. The same
 // keys drive the in-panel tab strip, so the two stay in sync off one `tab`.
@@ -147,6 +147,7 @@ const NAV: { key: TabKey; label: string; icon: string; admin?: boolean }[] = [
   { key: 'signals', label: 'Signals', icon: '📡' },
   { key: 'assistant', label: 'AI Assistant', icon: '🤖' },
   { key: 'news', label: 'News', icon: '📰' },
+  { key: 'fundamentals', label: 'Fundamentals', icon: '🌐' },
   { key: 'analyze', label: 'Analyze', icon: '🔍' },
   { key: 'train', label: 'Train', icon: '🧠' },
   { key: 'backtest', label: 'Backtest', icon: '↺' },
@@ -162,6 +163,7 @@ const NAV_LABEL: Record<TabKey, string> = {
   signals: 'Signals',
   assistant: 'AI Assistant',
   news: 'News',
+  fundamentals: 'Fundamentals',
   analyze: 'Analyze',
   train: 'Train',
   backtest: 'Backtest',
@@ -180,6 +182,9 @@ const NAV_ALIAS: Record<string, TabKey> = {
   signals: 'signals', signal: 'signals',
   assistant: 'assistant', ai: 'assistant', chat: 'assistant',
   news: 'news', headlines: 'news', feed: 'news', feeds: 'news',
+  fundamentals: 'fundamentals', fundamental: 'fundamentals', macro: 'fundamentals',
+  sentiment: 'fundamentals', funding: 'fundamentals', dominance: 'fundamentals',
+  'fear greed': 'fundamentals', feargreed: 'fundamentals', onchain: 'fundamentals',
   analyze: 'analyze', analysis: 'analyze', analyse: 'analyze',
   train: 'train', training: 'train',
   backtest: 'backtest', backtesting: 'backtest',
@@ -1859,6 +1864,12 @@ function Dashboard({
                   News
                 </span>
                 <span
+                  className={`tab ${tab === 'fundamentals' ? 'active' : ''}`}
+                  onClick={() => setTab('fundamentals')}
+                >
+                  Fundamentals
+                </span>
+                <span
                   className={`tab ${tab === 'analyze' ? 'active' : ''}`}
                   onClick={() => setTab('analyze')}
                 >
@@ -1942,6 +1953,9 @@ function Dashboard({
                 />
               )}
               {tab === 'news' && <NewsPanel onError={showPanelError} />}
+              {tab === 'fundamentals' && (
+                <FundamentalsPanel symbol={symbol} onError={showPanelError} />
+              )}
               {tab === 'analyze' && (
                 <AnalyzePanel
                   symbol={symbol}
@@ -4266,6 +4280,10 @@ function AssistantPanel({
   const [busy, setBusy] = useState(false)
   const [useSymbol, setUseSymbol] = useState(true)
   const [useNews, setUseNews] = useState(false)
+  // On by default: the operator explicitly wants the AI to ANALYSE live
+  // fundamentals (Fear & Greed, dominance, funding/OI, per-coin returns) and act
+  // on them, not disclaim them. Server still gates on `fundamentals_enabled`.
+  const [useFundamentals, setUseFundamentals] = useState(true)
   const [listening, setListening] = useState(false)
   // Which message currently shows a "Copied ✓" tick. Held by object REFERENCE (not
   // index) so a live-monitor push that reindexes the transcript can't move the tick
@@ -4336,6 +4354,7 @@ function AssistantPanel({
         symbol: useSymbol ? symbol : undefined,
         timeframe: useSymbol ? timeframe : undefined,
         include_news: useNews,
+        include_fundamentals: useFundamentals,
         history,
         image: img ? { data: img.data, media_type: img.mediaType } : undefined,
       })
@@ -4784,6 +4803,14 @@ function AssistantPanel({
               />
               Attach live news
             </label>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={useFundamentals}
+                onChange={(e) => setUseFundamentals(e.target.checked)}
+              />
+              Analyse live fundamentals
+            </label>
             {ttsSupported && (
               <label className="check">
                 <input
@@ -4973,6 +5000,213 @@ function NewsPanelImpl({ onError }: { onError: (msg: string) => void }) {
     </div>
   )
 }
+
+// A live, honest read-out of REAL fundamentals for the active pair: crypto
+// sentiment, the global market, per-coin fundamentals + trailing returns, and
+// derivatives. Every value comes from public data via /api/fundamentals; a null
+// section renders as "unavailable" / "—" and is never fabricated to a zero. This
+// is the same read the AI assistant analyses when "Analyse live fundamentals" is on.
+const FundamentalsPanel = memo(FundamentalsPanelImpl)
+function FundamentalsPanelImpl({
+  symbol,
+  onError,
+}: {
+  symbol: string
+  onError: (msg: string) => void
+}) {
+  const [data, setData] = useState<Fundamentals | null>(null)
+  const [errors, setErrors] = useState<string[]>([])
+  const [loading, setLoading] = useState(false)
+  const [fetchedAt, setFetchedAt] = useState<number | null>(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await api.fundamentals(symbol)
+      setData(res.snapshot)
+      setErrors(res.errors)
+      setFetchedAt(Date.now())
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }, [symbol, onError])
+
+  // Load on mount + whenever the pair changes, then refresh on a slow cadence
+  // (the backend caches each source, so this stays near-live without hammering).
+  useEffect(() => {
+    load()
+    const id = setInterval(load, 120000)
+    return () => clearInterval(id)
+  }, [load])
+
+  // ---- honest formatters: null / non-finite stays "—", never a fake 0 ----
+  const fmtUsd = (v: number | null | undefined): string => {
+    if (v == null || !Number.isFinite(v)) return '—'
+    const a = Math.abs(v)
+    if (a >= 1e12) return `$${(v / 1e12).toFixed(2)}T`
+    if (a >= 1e9) return `$${(v / 1e9).toFixed(2)}B`
+    if (a >= 1e6) return `$${(v / 1e6).toFixed(2)}M`
+    if (a >= 1e3) return `$${(v / 1e3).toFixed(2)}K`
+    return `$${v.toFixed(2)}`
+  }
+  const fmtNum = (v: number | null | undefined, dp = 2): string =>
+    v == null || !Number.isFinite(v)
+      ? '—'
+      : v.toLocaleString(undefined, { maximumFractionDigits: dp })
+  const pct = (v: number | null | undefined) => {
+    if (v == null || !Number.isFinite(v)) return <span className="muted">—</span>
+    const cls = v > 0 ? 'fund-pos' : v < 0 ? 'fund-neg' : 'muted'
+    return <span className={cls}>{v > 0 ? '+' : ''}{v.toFixed(2)}%</span>
+  }
+
+  const fg = data?.fear_greed ?? null
+  const gm = data?.global_market ?? null
+  const coin = data?.coin ?? null
+  const d = data?.derivatives ?? null
+  const fundingNote =
+    d?.funding_rate_pct == null
+      ? ''
+      : d.funding_rate_pct > 0.02
+      ? ' (longs crowded)'
+      : d.funding_rate_pct < -0.02
+      ? ' (shorts crowded)'
+      : ' (near flat)'
+  const nothing = !fg && !gm && !coin && !d
+
+  return (
+    <div className="news-panel fund-panel">
+      <div className="news-head">
+        <span>🌐 Fundamentals — {data?.asset ?? symbol}</span>
+        <span className="news-updated muted">
+          {fetchedAt
+            ? `updated ${new Date(fetchedAt).toLocaleTimeString([], {
+                hour: '2-digit',
+                minute: '2-digit',
+              })}`
+            : ''}
+        </span>
+        <button
+          type="button"
+          className="btn ghost sm"
+          onClick={load}
+          disabled={loading}
+          title="Refresh fundamentals"
+        >
+          {loading ? '…' : '↻'}
+        </button>
+      </div>
+      <p className="hint tiny news-sub">
+        REAL live public data — crypto sentiment, the global market, per-coin
+        fundamentals and derivatives. A “—” means that source was unreachable,
+        never a fabricated number. The AI analyses this same read.
+      </p>
+      {nothing && !loading ? (
+        <div className="empty sm">
+          {errors.length
+            ? 'Fundamentals sources are unreachable right now. Nothing is fabricated — this is empty because the real public data could not be fetched.'
+            : 'No fundamentals available yet.'}
+        </div>
+      ) : (
+        <div className="fund-grid">
+          <div className="fund-card">
+            <div className="fund-card-h">Sentiment · Fear &amp; Greed</div>
+            {fg ? (
+              <>
+                <div className="fund-big">
+                  {fg.value}
+                  <span className="fund-big-sub">/100</span>
+                  <span className="fund-tag">{fg.classification}</span>
+                </div>
+                {fg.delta != null && (
+                  <div className="fund-row">
+                    <span>vs yesterday</span>
+                    <span className={fg.delta > 0 ? 'fund-pos' : fg.delta < 0 ? 'fund-neg' : 'muted'}>
+                      {fg.delta > 0 ? '+' : ''}{fg.delta} pts
+                    </span>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="muted tiny">unavailable</div>
+            )}
+          </div>
+
+          <div className="fund-card">
+            <div className="fund-card-h">Global crypto market</div>
+            {gm ? (
+              <>
+                <div className="fund-row"><span>Total market cap</span><b>{fmtUsd(gm.total_market_cap_usd)}</b></div>
+                <div className="fund-row"><span>24h volume</span><b>{fmtUsd(gm.total_volume_usd)}</b></div>
+                <div className="fund-row"><span>BTC dominance</span><b>{fmtNum(gm.btc_dominance_pct, 1)}%</b></div>
+                <div className="fund-row"><span>ETH dominance</span><b>{fmtNum(gm.eth_dominance_pct, 1)}%</b></div>
+                <div className="fund-row"><span>Mcap 24h</span>{pct(gm.market_cap_change_24h_pct)}</div>
+              </>
+            ) : (
+              <div className="muted tiny">unavailable</div>
+            )}
+          </div>
+          <div className="fund-card">
+            <div className="fund-card-h">
+              {coin?.name ?? data?.asset ?? symbol} fundamentals
+            </div>
+            {coin ? (
+              <>
+                <div className="fund-row"><span>Rank</span><b>{coin.market_cap_rank != null ? `#${coin.market_cap_rank}` : '—'}</b></div>
+                <div className="fund-row"><span>Market cap</span><b>{fmtUsd(coin.market_cap_usd)}</b></div>
+                <div className="fund-row"><span>24h volume</span><b>{fmtUsd(coin.volume_24h_usd)}</b></div>
+                <div className="fund-row"><span>Circulating</span><b>{fmtNum(coin.circulating_supply, 0)}</b></div>
+                <div className="fund-row"><span>Max supply</span><b>{coin.max_supply == null ? '∞ / —' : fmtNum(coin.max_supply, 0)}</b></div>
+                <div className="fund-row"><span>All-time high</span><b>{fmtUsd(coin.ath_usd)}</b></div>
+                <div className="fund-row"><span>From ATH</span>{pct(coin.ath_change_pct)}</div>
+              </>
+            ) : (
+              <div className="muted tiny">
+                unavailable{data?.asset ? ` — no market-data mapping for ${data.asset}` : ''}
+              </div>
+            )}
+          </div>
+
+          <div className="fund-card">
+            <div className="fund-card-h">Trailing returns</div>
+            {coin ? (
+              <>
+                <div className="fund-row"><span>24h</span>{pct(coin.change_24h_pct)}</div>
+                <div className="fund-row"><span>7d</span>{pct(coin.change_7d_pct)}</div>
+                <div className="fund-row"><span>30d</span>{pct(coin.change_30d_pct)}</div>
+                <div className="fund-row"><span>1y</span>{pct(coin.change_1y_pct)}</div>
+              </>
+            ) : (
+              <div className="muted tiny">unavailable</div>
+            )}
+          </div>
+          <div className="fund-card">
+            <div className="fund-card-h">Derivatives (perps)</div>
+            {d ? (
+              <>
+                <div className="fund-row">
+                  <span>Funding rate</span>
+                  <span>{pct(d.funding_rate_pct)}<span className="muted tiny">{fundingNote}</span></span>
+                </div>
+                <div className="fund-row"><span>Mark price</span><b>{fmtUsd(d.mark_price)}</b></div>
+                <div className="fund-row"><span>Open interest</span><b>{fmtUsd(d.open_interest_usd)}</b></div>
+                <div className="fund-row"><span>Long/short</span><b>{fmtNum(d.long_short_ratio, 2)}</b></div>
+              </>
+            ) : (
+              <div className="muted tiny">unavailable</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {errors.length > 0 && !nothing && (
+        <p className="hint tiny">Some sources are unreachable: {errors.join(', ')}.</p>
+      )}
+    </div>
+  )
+}
+
 
 // A compact, honest read-out of the computed ICT analysis (mirrors what the chart
 // draws). Every number is the analyzer's real output; empty sections are simply
@@ -5963,6 +6197,7 @@ function SettingsPanel({
         ai_pretrade_analysis: form.ai_pretrade_analysis,
         ict_enabled: form.ict_enabled,
         ict_confluence: form.ict_confluence,
+        fundamentals_enabled: form.fundamentals_enabled,
         capital_manager_enabled: form.capital_manager_enabled,
         capital_run_budget_quote: form.capital_run_budget_quote,
         capital_per_trade_pct: form.capital_per_trade_pct,
@@ -6326,6 +6561,24 @@ function SettingsPanel({
         higher-timeframe confirmation re-runs the same brain you get an honest
         HTF→LTF confluence for free. Off = ICT stays a pure lens (drawn/narrated
         only). Requires the ICT read above.
+      </p>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={form.fundamentals_enabled}
+          onChange={(e) => setForm({ ...form, fundamentals_enabled: e.target.checked })}
+        />
+        Fundamentals / macro / sentiment feed (real live data)
+      </label>
+      <p className="hint">
+        When on, the assistant and the <b>Fundamentals</b> tab pull <b>live public
+        data</b> — crypto Fear &amp; Greed, the global market cap + BTC/ETH
+        dominance, per-coin market cap / volume / supply / all-time-high / trailing
+        returns, and derivatives funding / open interest / long-short — so the AI
+        genuinely <b>analyses</b> fundamentals instead of saying it only has
+        technicals. No API key and no account data leaves the box; a source that's
+        down is shown as unavailable and named, <b>never</b> a fabricated number.
+        Off = the AI sees technical/structural context only.
       </p>
       <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <input

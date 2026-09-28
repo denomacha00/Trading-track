@@ -2214,6 +2214,52 @@ pre.code {
 .news-meta { font-size: 11px; margin-top: 3px; }
 .empty.sm { padding: 12px; font-size: 12px; text-align: left; }
 
+/* Fundamentals panel: a responsive grid of honest data cards (sentiment, global
+   market, per-coin fundamentals, trailing returns, derivatives). */
+.fund-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.fund-card {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.fund-card-h {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-bottom: 8px;
+}
+.fund-big { font-size: 26px; font-weight: 700; display: flex; align-items: baseline; gap: 8px; }
+.fund-big-sub { font-size: 13px; font-weight: 400; color: var(--muted); }
+.fund-tag {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.fund-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+.fund-row:last-child { border-bottom: none; }
+.fund-row > span:first-child { color: var(--muted); }
+.fund-pos { color: var(--green); font-weight: 600; }
+.fund-neg { color: var(--red); font-weight: 600; }
+
+
 @media (prefers-reduced-motion: reduce) {
   .btn.mic.rec, .conf-fill, .toggle, .toggle .knob { animation: none; transition: none; }
 }

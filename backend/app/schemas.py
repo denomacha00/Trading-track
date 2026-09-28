@@ -257,6 +257,7 @@ class SettingsOut(BaseModel):
     ai_autopilot_enabled: bool = False
     ict_enabled: bool = True
     ict_confluence: bool = True
+    fundamentals_enabled: bool = True
     # Capital / money manager (autopilot sizing discipline).
     capital_manager_enabled: bool = True
     capital_run_budget_quote: float = 0.0
@@ -310,6 +311,7 @@ class SettingsUpdate(BaseModel):
     ai_autopilot_enabled: Optional[bool] = None
     ict_enabled: Optional[bool] = None
     ict_confluence: Optional[bool] = None
+    fundamentals_enabled: Optional[bool] = None
     # Capital / money manager (autopilot sizing discipline).
     capital_manager_enabled: Optional[bool] = None
     capital_run_budget_quote: Optional[float] = Field(default=None, ge=0, le=1_000_000)

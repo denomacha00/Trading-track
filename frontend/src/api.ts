@@ -10,6 +10,7 @@ import type {
   ConfirmationResolveResult,
   ExchangeAccess,
   ExecutionResult,
+  Fundamentals,
   LicenseKeyCreated,
   LicenseKeyRow,
   MarketAnalysis,
@@ -257,6 +258,9 @@ export const api = {
     symbol?: string
     timeframe?: string
     include_news?: boolean
+    // Attach LIVE fundamentals/macro/sentiment for `symbol` so the AI analyses
+    // them (default on server-side when a symbol is present + the feed is on).
+    include_fundamentals?: boolean
     history?: { role: 'user' | 'assistant'; content: string }[]
     // An optional attached image the AI reads (vision). `data` is raw base64 (no
     // data: prefix); `media_type` is the real MIME (always image/jpeg here — the
@@ -277,6 +281,15 @@ export const api = {
   // unreachable, never fabricated news.
   news: (limit = 8) =>
     req<{ items: NewsItem[]; errors: string[] }>(`/api/news?limit=${limit}`),
+  // Live, REAL fundamentals for a symbol: crypto Fear & Greed, global market +
+  // BTC/ETH dominance, per-coin mcap/volume/supply/ATH/returns, and derivatives
+  // funding/OI/long-short. `snapshot` sections are null (and named in `errors`)
+  // when a source was unreachable — never fabricated. `summary` is the same
+  // honest read the AI assistant is fed.
+  fundamentals: (symbol = 'BTC/USDT') =>
+    req<{ snapshot: Fundamentals | null; errors: string[]; summary: string }>(
+      `/api/fundamentals?symbol=${encodeURIComponent(symbol)}`,
+    ),
   exchangeAccess: () => req<ExchangeAccess>('/api/exchange/access'),
   // Real tradable spot pairs from the configured exchange (ccxt load_markets),
   // so the pair selector reflects what ACTUALLY exists on Binance rather than a

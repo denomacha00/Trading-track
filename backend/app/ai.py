@@ -863,6 +863,7 @@ class AICommentator:
         ict: Any = None,
         bot_context: str | None = None,
         news: list[dict] | None = None,
+        fundamentals: dict | None = None,
         history: Any = None,
         image: dict[str, str] | None = None,
     ) -> str:
@@ -892,6 +893,15 @@ class AICommentator:
         ict_block = self._ict_block(ict)
         if ict_block:
             blocks.append(ict_block)
+        # Real fundamentals/macro/sentiment (public live data). Numeric facts, not
+        # third-party prose, so they're grounded context the assistant should
+        # ANALYSE -- the block header itself tells the model not to disclaim.
+        if fundamentals:
+            from app.fundamentals import summarize_fundamentals
+
+            fund_block = summarize_fundamentals(fundamentals)
+            if fund_block:
+                blocks.append(fund_block)
         blocks.append(self._risk_block())
         if news:
             lines = []

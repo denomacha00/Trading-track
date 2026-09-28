@@ -125,6 +125,51 @@ export interface NewsItem {
   published: string
 }
 
+// A live, REAL fundamentals snapshot for one symbol. Every section is
+// independent and NULLABLE: a section is null (and named in `errors`) when its
+// public source was unreachable — never fabricated to a zero. Numbers are as the
+// sources report them (USD, %, ratios); `as_of` is the fetch time (ISO).
+export interface Fundamentals {
+  symbol: string
+  asset: string
+  fear_greed: {
+    value: number
+    classification: string
+    prev: number | null
+    delta: number | null
+  } | null
+  global_market: {
+    total_market_cap_usd: number | null
+    total_volume_usd: number | null
+    btc_dominance_pct: number | null
+    eth_dominance_pct: number | null
+    market_cap_change_24h_pct: number | null
+  } | null
+  coin: {
+    name: string | null
+    market_cap_usd: number | null
+    market_cap_rank: number | null
+    volume_24h_usd: number | null
+    circulating_supply: number | null
+    max_supply: number | null
+    ath_usd: number | null
+    ath_change_pct: number | null
+    change_24h_pct: number | null
+    change_7d_pct: number | null
+    change_30d_pct: number | null
+    change_1y_pct: number | null
+  } | null
+  derivatives: {
+    funding_rate_pct: number | null
+    mark_price: number | null
+    next_funding_time: number | null
+    open_interest_base: number | null
+    open_interest_usd: number | null
+    long_short_ratio: number | null
+  } | null
+  as_of: string
+}
+
 // A single turn in the AI assistant conversation (browser-local history).
 export interface ChatTurn {
   role: 'you' | 'ai'
@@ -263,6 +308,12 @@ export interface Settings {
   // inventing a level, computed on closed bars so it can't repaint. Off = ICT is
   // a pure lens (drawn / narrated only). On by default.
   ict_confluence: boolean
+  // When on, the assistant + Fundamentals panel pull LIVE public fundamentals
+  // (crypto Fear & Greed, global mcap + BTC/ETH dominance, per-coin
+  // mcap/volume/supply/ATH/returns, derivatives funding/OI/long-short) so the AI
+  // genuinely ANALYSES fundamentals instead of disclaiming it only has
+  // technicals. Real data, no key; a dead source is null + reported, never faked.
+  fundamentals_enabled: boolean
   // ---- Capital / money manager (disciplined autopilot sizing) ----
   // When on, autonomous BUYS are sized by the money manager (on TOP of the risk
   // manager, never above it): a per-run budget is deployed a slice at a time with

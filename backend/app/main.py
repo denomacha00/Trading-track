@@ -103,6 +103,7 @@ from app.usermgr import get_manager
 from app.state import load_monitor_interval, purge_user_state, save_monitor_interval
 from app.learn import PARAM_GRIDS, train
 from app.news import fetch_market_news
+from app.fundamentals import fetch_fundamentals, summarize_fundamentals
 from app.performance import compute_performance
 from app.strategies import STRATEGY_REGISTRY, build_strategy
 from app.tasks import monitor_loop
@@ -1194,6 +1195,7 @@ def _settings_out(engine, user: User, db: Session | None = None) -> SettingsOut:
         ai_autopilot_enabled=getattr(s, "ai_autopilot_enabled", False),
         ict_enabled=getattr(s, "ict_enabled", True),
         ict_confluence=getattr(s, "ict_confluence", True),
+        fundamentals_enabled=getattr(s, "fundamentals_enabled", True),
         capital_manager_enabled=getattr(s, "capital_manager_enabled", True),
         capital_run_budget_quote=getattr(s, "capital_run_budget_quote", 0.0),
         capital_per_trade_pct=getattr(s, "capital_per_trade_pct", 25.0),
@@ -1632,6 +1634,29 @@ def ai_ask(
     return {"answer": answer, "ai_enabled": engine.ai.available}
 
 
+@app.get("/api/fundamentals")
+def market_fundamentals(
+    symbol: str = "BTC/USDT",
+    user: User = Depends(require_licensed_user),
+):
+    """Live, REAL fundamentals for a symbol: crypto Fear & Greed, global market +
+    BTC/ETH dominance, per-coin mcap/volume/supply/ATH/trailing returns, and
+    derivatives funding/open-interest/long-short. No API key, no user data sent; a
+    dead source is reported in ``errors`` and its section is null -- never faked."""
+    if not getattr(get_settings(), "fundamentals_enabled", True):
+        return {
+            "snapshot": None,
+            "errors": ["fundamentals feed is disabled in Settings"],
+            "summary": "",
+        }
+    snapshot, errors = fetch_fundamentals(symbol.upper())
+    return {
+        "snapshot": snapshot,
+        "errors": errors,
+        "summary": summarize_fundamentals(snapshot),
+    }
+
+
 @app.get("/api/news")
 def market_news(
     limit: int = 8,
@@ -1992,6 +2017,9 @@ _AI_SETTINGS_BOOL = {
     # levels — it never overrides a capital-preservation veto or invents a level,
     # so it's proposable and non-risk like the lens toggle above.
     "ict_confluence",
+    # Fundamentals/macro/sentiment feed is read-only market DATA (no money
+    # behaviour), so it's safe for the AI to toggle like the ICT lens.
+    "fundamentals_enabled",
 }
 _AI_SETTINGS_STR = {"auto_symbols", "auto_timeframe", "auto_confirm_timeframe"}
 
@@ -2376,6 +2404,20 @@ def ai_chat(
             news = []
         used_news = bool(news)
 
+    # Live fundamentals/macro/sentiment for the chat symbol so the assistant can
+    # ANALYSE fundamentals instead of disclaiming. Real public data, cached; a
+    # failure just yields no block. Default on when a symbol is present + enabled.
+    fundamentals = None
+    if (
+        symbol
+        and payload.get("include_fundamentals", True)
+        and getattr(get_settings(), "fundamentals_enabled", True)
+    ):
+        try:
+            fundamentals, _ferr = fetch_fundamentals(str(symbol))
+        except Exception:
+            fundamentals = None
+
     # Prior conversation turns from the browser so the assistant can follow a
     # multi-turn task instead of answering each question cold. Untrusted input:
     # slice to a sane bound here (ai.chat sanitises roles/content and keeps only
@@ -2389,6 +2431,7 @@ def ai_chat(
         ict=ict,
         bot_context=bot_context,
         news=news or None,
+        fundamentals=fundamentals,
         history=history,
         image=image,
     )
