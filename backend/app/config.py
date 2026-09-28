@@ -351,6 +351,14 @@ class Settings(BaseSettings):
     # off the exchange — trade-only keys — so it reserves profit and reminds you to
     # withdraw it yourself.)
     capital_profit_reserve_pct: float = Field(default=0.0)
+    # EXACT stake per autopilot trade in quote terms (e.g. 10 = "trade with $10 each
+    # time"). 0 = off -> size by the percentage/risk sizer above. When set >0 the
+    # autopilot deploys this much per entry instead of a % of free cash, skipping the
+    # percentage AND the win/loss resize (a fixed stake stays fixed). It is still
+    # capped by free budget and by every RiskManager limit, so it can only ever
+    # deploy this much OR LESS — never more. If free budget can't cover it, the bot
+    # deploys what's free (down to the dust floor) or holds; it never fabricates cash.
+    capital_fixed_trade_quote: float = Field(default=0.0)
 
     # Background MONITOR cadence (seconds between ticks): how often the engine
     # re-checks open positions (stops/targets/profit-lock), evaluates alerts, and

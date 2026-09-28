@@ -7,6 +7,7 @@ Honest scope: every number here is fetched LIVE from a public, no-key data sourc
   * Per-coin mcap / volume / supply / ATH / trailing returns .. CoinGecko /coins/markets
   * Derivatives positioning (funding, open interest, long/short) .. Binance USD-M futures
   * On-chain network stats (tx/24h, mempool, fees, hashrate, holders) .. Blockchair /stats
+  * Spot BTC/ETH ETF net flows (institutional demand) .. CoinGlass (free API key, opt-in)
 
 If a source is unreachable we record it in ``errors`` and leave that section
 None -- we NEVER fabricate a value. Results are cached per-source so the AI and
@@ -17,6 +18,7 @@ from __future__ import annotations
 import datetime as dt
 import json as _json
 import logging
+import os
 import time
 from typing import Any
 
@@ -83,10 +85,19 @@ def _clean(s: Any) -> str:
     return t.replace("[[", "").replace("]]", "").strip()
 
 
-def _get_json(url: str, *, params: dict | None = None, timeout: float = 8.0) -> Any:
+def _get_json(
+    url: str,
+    *,
+    params: dict | None = None,
+    headers: dict | None = None,
+    timeout: float = 8.0,
+) -> Any:
     """GET JSON with a hard size cap and a short timeout. Raises on any failure;
     callers catch and degrade gracefully (they never fabricate on failure)."""
-    with httpx.Client(timeout=timeout, headers={"User-Agent": _UA}) as client:
+    hdrs = {"User-Agent": _UA}
+    if headers:
+        hdrs.update(headers)
+    with httpx.Client(timeout=timeout, headers=hdrs) as client:
         with client.stream("GET", url, params=params, follow_redirects=True) as resp:
             resp.raise_for_status()
             total = 0
@@ -259,6 +270,122 @@ def _on_chain(chain: str) -> dict | None:
         "largest_tx_usd_24h": _num(largest.get("value_usd")),
         "dominance_pct": _num(data.get("market_dominance_percentage")),
     }
+
+
+# --- Spot crypto ETF net flows (institutional demand) --------------------------
+# REAL daily net creation/redemption flows for US-listed spot BTC / ETH ETFs
+# (IBIT, FBTC, GBTC, ETHA ...). There is NO reliable keyless public feed for this
+# (Farside is Cloudflare-blocked to servers; CoinGlass / SoSoValue / NewHedge all
+# gate behind a token), so this section is OPT-IN: the operator drops a free
+# NewHedge api token in ETF_FLOW_API_TOKEN (get one at https://newhedge.io -- free,
+# non-commercial) and we pull the real series. With no token the section is an
+# HONEST GAP (None + an errors note saying how to switch it on) -- a flow number
+# is NEVER fabricated. ETF_FLOW_BASE_URL lets an operator point at a different
+# provider that speaks the same [[ts_ms, usd], ...] shape.
+# --- Spot crypto ETF net flows (institutional demand) --------------------------
+# REAL daily net creation/redemption flows for US-listed spot BTC / ETH ETFs
+# (IBIT, FBTC, GBTC, ETHA ...). There is NO reliable keyless public feed for this
+# (Farside is Cloudflare-blocked to servers; every tracker gates flows behind a
+# key). So this is opt-in: drop a CoinGlass API key -- their FREE "Hobbyist" plan
+# already includes ETF flow-history -- in COINGLASS_API_KEY (the older
+# ETF_FLOW_API_TOKEN name is still accepted) and we pull the real series: the daily
+# total AND the per-fund breakdown, straight from CoinGlass. With no key the
+# section is an HONEST GAP (None + an errors note saying how to switch it on) -- a
+# flow number is NEVER fabricated. Get a key at https://www.coinglass.com/signup .
+# ETF_FLOW_BASE_URL can override the API host (e.g. a proxy) but the path/shape are
+# CoinGlass's `/api/etf/{asset}/flow-history`.
+_ETF_FLOW_BASE = (os.getenv("ETF_FLOW_BASE_URL") or "https://open-api-v4.coinglass.com").rstrip("/")
+_ETF_FLOW_TOKEN = (
+    os.getenv("COINGLASS_API_KEY") or os.getenv("ETF_FLOW_API_TOKEN") or ""
+).strip()
+
+# Only assets with a live US spot ETF appear -- any other asset has no ETF section
+# (an honest gap, no error). The value is CoinGlass's asset path segment.
+_ETF_FLOW_ASSETS: dict[str, str] = {"BTC": "bitcoin", "ETH": "ethereum"}
+
+
+def _etf_series(asset_path: str) -> list[dict[str, Any]]:
+    """CoinGlass ETF flow-history for one asset -> daily records, oldest->newest.
+
+    Each record: ``{"ts": <ms>, "flow": <usd total>, "funds": {TICKER: usd, ...}}``.
+    The one call carries both the headline net flow and the per-fund legs, so there
+    are no fragile per-fund round-trips. Raises on transport failure; the caller
+    degrades to an honest gap (never a fabricated number).
+    """
+    url = f"{_ETF_FLOW_BASE}/api/etf/{asset_path}/flow-history"
+    data = _get_json(url, headers={"CG-API-KEY": _ETF_FLOW_TOKEN})
+    rows = data.get("data") if isinstance(data, dict) else data
+    out: list[dict[str, Any]] = []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            ts, flow = _num(row.get("timestamp")), _num(row.get("flow_usd"))
+            if ts is None or flow is None:
+                continue
+            funds: dict[str, float] = {}
+            legs = row.get("etf_flows")
+            if isinstance(legs, list):
+                for leg in legs:
+                    if not isinstance(leg, dict):
+                        continue
+                    tkr, val = leg.get("etf_ticker"), _num(leg.get("flow_usd"))
+                    if tkr and val is not None:
+                        funds[str(tkr).upper()] = val
+            out.append({"ts": int(ts), "flow": flow, "funds": funds})
+    out.sort(key=lambda r: r["ts"])
+    return out
+
+
+def _etf_flows(asset: str) -> dict | None:
+    """REAL US spot-ETF net flows for BTC / ETH. Latest-day net flow, prior day,
+    day-over-day delta, 5-day net, an inflow/outflow streak, and the latest-day
+    per-fund breakdown (IBIT / FBTC / GBTC ...). None when the provider gives
+    nothing -- never fabricated. Raises if no key is configured (caller degrades)."""
+    if not _ETF_FLOW_TOKEN:
+        raise RuntimeError("ETF flow key not configured (COINGLASS_API_KEY)")
+    asset_path = _ETF_FLOW_ASSETS.get(asset)
+    if not asset_path:
+        return None  # no US spot ETF for this asset -> honest gap, no error
+    series = _etf_series(asset_path)
+    if not series:
+        return None
+    latest = series[-1]
+    net = latest["flow"]
+    prev = series[-2]["flow"] if len(series) > 1 else None
+    last5 = [r["flow"] for r in series[-5:]]
+    sign = 1 if net > 0 else -1 if net < 0 else 0
+    streak = 0
+    if sign:
+        for r in reversed(series):
+            if (r["flow"] > 0 and sign > 0) or (r["flow"] < 0 and sign < 0):
+                streak += 1
+            else:
+                break
+    # Latest-day per-fund, biggest absolute mover first (tidy summary + panel).
+    funds = {
+        t: v
+        for t, v in sorted(
+            (latest.get("funds") or {}).items(), key=lambda kv: abs(kv[1]), reverse=True
+        )
+    }
+    return {
+        "asset": asset,
+        "as_of_ms": latest["ts"],
+        "as_of_date": dt.datetime.fromtimestamp(
+            latest["ts"] / 1000, dt.timezone.utc
+        ).strftime("%Y-%m-%d"),
+        "net_flow_usd": net,
+        "prev_net_flow_usd": prev,
+        "delta_usd": (net - prev) if prev is not None else None,
+        "sum_5d_usd": sum(last5) if last5 else None,
+        "streak_days": streak,
+        "streak_dir": "inflow" if sign > 0 else "outflow" if sign < 0 else "flat",
+        "funds": funds or None,
+        "source": "CoinGlass",
+    }
+
+
 def fetch_fundamentals(symbol: str, *, ttl_scale: float = 1.0) -> tuple[dict, list[str]]:
     """Return (snapshot, errors) of REAL fundamentals for ``symbol``.
 
@@ -302,6 +429,21 @@ def fetch_fundamentals(symbol: str, *, ttl_scale: float = 1.0) -> tuple[dict, li
             f"onchain:{chain}", 600.0, lambda: _on_chain(chain), f"{asset} on-chain"
         )
 
+    etf = None
+    if asset in _ETF_FLOW_ASSETS:
+        if _ETF_FLOW_TOKEN:
+            # Flows update roughly once a business day -> a long cache is plenty.
+            etf = _try(
+                f"etf:{asset}", 1800.0, lambda: _etf_flows(asset), f"{asset} ETF flows"
+            )
+        else:
+            # Not a failure -- an opt-in feature that's simply off. Tell the operator
+            # exactly how to switch it on; never fake a flow to fill the gap.
+            errors.append(
+                "ETF flows off -- set COINGLASS_API_KEY (free key from "
+                "coinglass.com/signup) to pull real spot-ETF net flows"
+            )
+
     snapshot = {
         "symbol": (symbol or "").upper(),
         "asset": asset,
@@ -310,6 +452,7 @@ def fetch_fundamentals(symbol: str, *, ttl_scale: float = 1.0) -> tuple[dict, li
         "coin": coin,
         "derivatives": deriv,
         "on_chain": onchain,
+        "etf_flows": etf,
         "as_of": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     return snapshot, errors
@@ -433,6 +576,33 @@ def summarize_fundamentals(snapshot: dict | None) -> str:
             parts.append(f"{_fmt_count(oc['nodes'])} reachable nodes")
         if parts:
             lines.append(f"- On-chain ({oc.get('chain')}): " + ", ".join(parts))
+
+    etf = snapshot.get("etf_flows")
+    if etf:
+        net = etf.get("net_flow_usd")
+        dirw = "inflow" if (net or 0) > 0 else "outflow" if (net or 0) < 0 else "flat"
+        net_s = _fmt_usd(abs(net)) if net is not None else "?"
+        seg = (
+            f"- Spot ETF flows ({etf.get('asset')}, {etf.get('as_of_date')}): "
+            f"net {net_s} {dirw}"
+        )
+        d = etf.get("delta_usd")
+        if d is not None:
+            seg += f" ({'+' if d >= 0 else '-'}{_fmt_usd(abs(d))} vs prior day)"
+        s5 = etf.get("sum_5d_usd")
+        if s5 is not None:
+            seg += f", 5-day {_fmt_usd(abs(s5))} {'in' if s5 >= 0 else 'out'}"
+        st = etf.get("streak_days")
+        if st and st > 1:
+            seg += f", {st}-day {etf.get('streak_dir')} streak"
+        funds = etf.get("funds") or {}
+        if funds:
+            top = ", ".join(
+                f"{k} {'+' if v >= 0 else '-'}{_fmt_usd(abs(v))}" for k, v in funds.items()
+            )
+            seg += f" [{top}]"
+        seg += f" (src {etf.get('source')})"
+        lines.append(seg)
 
     if not lines:
         return ""

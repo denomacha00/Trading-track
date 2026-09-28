@@ -182,6 +182,50 @@ def test_manual_position_does_not_consume_auto_budget(db):
     assert mm.deployed_quote(db) == pytest.approx(0.0)
 
 
+# ---- fixed per-trade stake ("trade with $10 each time") -------------------
+
+
+def test_fixed_stake_deploys_exact_quote(db):
+    # capital_fixed_trade_quote=10 -> deploy exactly $10 (0.1 units @ $100), even
+    # though the 25% free-cash slice would be far larger.
+    mm = _mm(_settings(capital_fixed_trade_quote=10.0))
+    qty = mm.plan_amount(db, equity=1_000.0, price=100.0, risk_based_qty=5.0)
+    assert qty == pytest.approx(0.10)  # $10 / $100
+
+
+def test_fixed_stake_ignores_percentage_and_resize(db):
+    # A winning streak (multiplier 1.30) must NOT inflate a FIXED stake — fixed
+    # means fixed. Two recent wins would push a % slice up; the $10 stays $10.
+    _closed_auto(db, pnl=5.0, when=_NOW - dt.timedelta(minutes=20))
+    _closed_auto(db, pnl=5.0, when=_NOW - dt.timedelta(minutes=10))
+    mm = _mm(_settings(capital_fixed_trade_quote=10.0, capital_per_trade_pct=90.0))
+    qty = mm.plan_amount(db, equity=1_000.0, price=100.0, risk_based_qty=5.0)
+    assert qty == pytest.approx(0.10)  # exactly $10, not resized, not 90%
+
+
+def test_fixed_stake_capped_by_free_budget(db):
+    # Only $8 free this run but the fixed stake is $10 -> deploy what's free ($8),
+    # never fabricating the missing $2.
+    mm = _mm(_settings(capital_run_budget_quote=8.0, capital_fixed_trade_quote=10.0))
+    qty = mm.plan_amount(db, equity=1_000.0, price=100.0, risk_based_qty=5.0)
+    assert qty == pytest.approx(0.08)  # $8 / $100
+
+
+def test_fixed_stake_holds_when_below_floor(db):
+    # Only $3 free, below both the $10 stake and the $5 dust floor -> HOLD (0).
+    mm = _mm(_settings(capital_run_budget_quote=3.0, capital_fixed_trade_quote=10.0))
+    assert mm.plan_amount(db, equity=1_000.0, price=100.0, risk_based_qty=5.0) == 0.0
+
+
+def test_fixed_stake_still_bounded_by_risk_ceiling(db):
+    # The risk-based size is the hard ceiling even for a fixed stake: a $10 stake
+    # (0.10 units) is trimmed to the 0.05-unit risk cap -> the money manager can
+    # only ever deploy the SAME or LESS than risk allows.
+    mm = _mm(_settings(capital_fixed_trade_quote=10.0))
+    qty = mm.plan_amount(db, equity=1_000.0, price=100.0, risk_based_qty=0.05)
+    assert qty == pytest.approx(0.05)
+
+
 # ---- outcome-based re-sizing ---------------------------------------------
 
 
@@ -248,6 +292,19 @@ def test_auto_entry_holds_when_budget_exhausted(db):
     assert not ok
     assert trade is None
     assert "budget" in msg.lower()
+
+
+def test_auto_entry_fixed_stake_opens_that_size(db):
+    # capital_fixed_trade_quote=10 -> the autopilot opens a ~$10 position, letting
+    # the beginner literally "trade with $10 each time" (still risk-capped).
+    eng = _engine(capital_fixed_trade_quote=10.0)
+    ok, msg, trade = eng.execute_signal(
+        db, action="buy", symbol="BTC/USDT", amount=None,
+        stop_loss=98.0, take_profit=None, source="auto",
+    )
+    assert ok, msg
+    assert trade is not None
+    assert trade.amount * trade.entry_price == pytest.approx(10.0, abs=0.5)
 
 
 def test_manual_entry_ignores_money_manager(db):

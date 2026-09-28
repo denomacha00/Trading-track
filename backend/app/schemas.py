@@ -266,6 +266,7 @@ class SettingsOut(BaseModel):
     capital_resize_on_outcome: bool = True
     capital_max_hold_minutes: float = 0.0
     capital_profit_reserve_pct: float = 0.0
+    capital_fixed_trade_quote: float = 0.0
     ai_enabled: bool
     ai_model: str = ""
     ai_style: str = ""
@@ -320,6 +321,7 @@ class SettingsUpdate(BaseModel):
     capital_resize_on_outcome: Optional[bool] = None
     capital_max_hold_minutes: Optional[float] = Field(default=None, ge=0, le=100_000)
     capital_profit_reserve_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    capital_fixed_trade_quote: Optional[float] = Field(default=None, ge=0, le=1_000_000)
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=100)
     max_total_exposure_pct: Optional[float] = Field(default=None, ge=0, le=1000)
     max_position_pct: Optional[float] = Field(default=None, ge=0, le=100)

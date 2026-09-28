@@ -81,6 +81,11 @@ class MoneyManager:
         pct = float(getattr(self.settings, "capital_profit_reserve_pct", 0.0) or 0.0)
         return min(max(pct, 0.0), 100.0)
 
+    @property
+    def fixed_trade_quote(self) -> float:
+        """Exact per-trade stake in quote terms (0 = off -> size by percentage)."""
+        return max(float(getattr(self.settings, "capital_fixed_trade_quote", 0.0) or 0.0), 0.0)
+
     # ---- real book reads ------------------------------------------------
     def _scope_auto_open(self, stmt):
         stmt = stmt.where(
@@ -167,13 +172,25 @@ class MoneyManager:
         if price <= 0 or risk_based_qty <= 0:
             return 0.0
         avail = self.available_budget(db, equity)
-        if avail < self.min_trade_quote:
-            return 0.0  # not enough free run-budget for a sane trade -> hold
-        slice_quote = avail * (self.per_trade_pct / 100.0)
-        if self.resize:
-            slice_quote *= self.outcome_multiplier(db)
-        # Keep the slice within [min_trade_quote, avail]: never a dust order, and
-        # never more than what's actually free this run.
-        slice_quote = max(self.min_trade_quote, min(slice_quote, avail))
+        fixed = self.fixed_trade_quote
+        if fixed > 0:
+            # EXACT stake mode: deploy `fixed` quote per trade (no percentage, no
+            # outcome resize — a fixed stake stays fixed). Still capped by free
+            # budget and (below) by the risk-based size, so it only ever deploys
+            # this much OR LESS. If free budget can't even cover the dust floor,
+            # hold; otherwise deploy the fixed stake or whatever's free, whichever
+            # is smaller — never fabricating cash we don't have.
+            if avail < min(fixed, self.min_trade_quote):
+                return 0.0
+            slice_quote = min(fixed, avail)
+        else:
+            if avail < self.min_trade_quote:
+                return 0.0  # not enough free run-budget for a sane trade -> hold
+            slice_quote = avail * (self.per_trade_pct / 100.0)
+            if self.resize:
+                slice_quote *= self.outcome_multiplier(db)
+            # Keep the slice within [min_trade_quote, avail]: never a dust order, and
+            # never more than what's actually free this run.
+            slice_quote = max(self.min_trade_quote, min(slice_quote, avail))
         budget_qty = slice_quote / price
         return max(min(risk_based_qty, budget_qty), 0.0)

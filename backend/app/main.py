@@ -1204,6 +1204,7 @@ def _settings_out(engine, user: User, db: Session | None = None) -> SettingsOut:
         capital_resize_on_outcome=getattr(s, "capital_resize_on_outcome", True),
         capital_max_hold_minutes=getattr(s, "capital_max_hold_minutes", 0.0),
         capital_profit_reserve_pct=getattr(s, "capital_profit_reserve_pct", 0.0),
+        capital_fixed_trade_quote=getattr(s, "capital_fixed_trade_quote", 0.0),
         ai_enabled=bool(s.ai_api_key or getattr(s, "ai_fallback_api_key", "")),
         ai_model=s.ai_model,
         ai_style=engine.ai._style() if (s.ai_api_key or getattr(s, "ai_fallback_api_key", "")) else "",

@@ -5289,6 +5289,10 @@ function FundamentalsPanelImpl({
   const coin = data?.coin ?? null
   const d = data?.derivatives ?? null
   const oc = data?.on_chain ?? null
+  const etf = data?.etf_flows ?? null
+  // Only BTC/ETH have live US spot ETFs — for them we always show the card (with a
+  // "how to switch it on" note when unconfigured); other assets simply omit it.
+  const hasEtfMarket = ['BTC', 'ETH'].includes((data?.asset ?? '').toUpperCase())
   const fundingNote =
     d?.funding_rate_pct == null
       ? ''
@@ -5297,7 +5301,7 @@ function FundamentalsPanelImpl({
       : d.funding_rate_pct < -0.02
       ? ' (shorts crowded)'
       : ' (near flat)'
-  const nothing = !fg && !gm && !coin && !d && !oc
+  const nothing = !fg && !gm && !coin && !d && !oc && !etf
 
   // Raw hashes/second -> EH/s / PH/s / TH/s … (honest "—" when null / PoS).
   const fmtHash = (v: number | null | undefined): string => {
@@ -5314,6 +5318,13 @@ function FundamentalsPanelImpl({
     if (a >= 1e6) return `${(v / 1e6).toFixed(2)}M`
     if (a >= 1e3) return `${(v / 1e3).toFixed(2)}K`
     return v.toLocaleString(undefined, { maximumFractionDigits: 0 })
+  }
+  // Signed money flow: green +$ inflow, red −$ outflow, "—" when null (never faked).
+  const flowUsd = (v: number | null | undefined) => {
+    if (v == null || !Number.isFinite(v)) return <span className="muted">—</span>
+    const cls = v > 0 ? 'fund-pos' : v < 0 ? 'fund-neg' : 'muted'
+    const sign = v > 0 ? '+' : v < 0 ? '−' : ''
+    return <span className={cls}>{sign}{fmtUsd(Math.abs(v))}</span>
   }
 
   return (
@@ -5451,12 +5462,53 @@ function FundamentalsPanelImpl({
               <div className="fund-row"><span>Reachable nodes</span><b>{fmtCount(oc.nodes)}</b></div>
             </div>
           )}
+          {(etf || hasEtfMarket) && (
+            <div className="fund-card">
+              <div className="fund-card-h">
+                Spot ETF flows{etf?.as_of_date ? ` · ${etf.as_of_date}` : ''}
+              </div>
+              {etf ? (
+                <>
+                  <div className="fund-row">
+                    <span>Net flow (day)</span>
+                    <span>{flowUsd(etf.net_flow_usd)}<span className="muted tiny"> {etf.streak_dir}</span></span>
+                  </div>
+                  <div className="fund-row"><span>vs prior day</span>{flowUsd(etf.delta_usd)}</div>
+                  <div className="fund-row"><span>5-day net</span>{flowUsd(etf.sum_5d_usd)}</div>
+                  {etf.streak_days > 1 && (
+                    <div className="fund-row">
+                      <span>Streak</span>
+                      <b className={etf.streak_dir === 'inflow' ? 'fund-pos' : etf.streak_dir === 'outflow' ? 'fund-neg' : ''}>
+                        {etf.streak_days}-day {etf.streak_dir}
+                      </b>
+                    </div>
+                  )}
+                  {etf.funds &&
+                    Object.entries(etf.funds).map(([k, v]) => (
+                      <div className="fund-row" key={k}><span>{k}</span>{flowUsd(v)}</div>
+                    ))}
+                  <div className="hint tiny" style={{ marginTop: 4 }}>Real net creations/redemptions · src {etf.source}</div>
+                </>
+              ) : (
+                <div className="muted tiny">
+                  Off — set <code>COINGLASS_API_KEY</code> (free key from{' '}
+                  <a href="https://www.coinglass.com/signup" target="_blank" rel="noreferrer">coinglass.com</a>) to pull
+                  real spot-{data?.asset} ETF net flows. Never faked — a gap stays blank.
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
-      {errors.length > 0 && !nothing && (
-        <p className="hint tiny">Some sources are unreachable: {errors.join(', ')}.</p>
-      )}
+      {(() => {
+        // The "ETF flows off" hint is a config note, not an unreachable source —
+        // the ETF card already surfaces it, so keep it out of this line.
+        const shown = errors.filter((e) => !e.startsWith('ETF flows off'))
+        return shown.length > 0 && !nothing ? (
+          <p className="hint tiny">Some sources are unreachable: {shown.join(', ')}.</p>
+        ) : null
+      })()}
     </div>
   )
 }
@@ -6459,6 +6511,7 @@ function SettingsPanel({
         capital_resize_on_outcome: form.capital_resize_on_outcome,
         capital_max_hold_minutes: form.capital_max_hold_minutes,
         capital_profit_reserve_pct: form.capital_profit_reserve_pct,
+        capital_fixed_trade_quote: form.capital_fixed_trade_quote,
         auto_pause_in_bear: form.auto_pause_in_bear,
         require_strategy_validation: form.require_strategy_validation,
         strategy_min_return_pct: form.strategy_min_return_pct,
@@ -6971,6 +7024,25 @@ function SettingsPanel({
       </p>
       {form.capital_manager_enabled && (
         <>
+          <div className="field" style={{ maxWidth: 280 }}>
+            <label>Fixed $ per trade (0 = size by %)</label>
+            <NumField
+              className="input"
+              value={form.capital_fixed_trade_quote}
+              onChange={setNum('capital_fixed_trade_quote')}
+              inputMode="decimal"
+            />
+          </div>
+          {(form.capital_fixed_trade_quote ?? 0) > 0 && (
+            <p className="hint">
+              <b>Fixed stake on.</b> The autopilot stakes exactly $
+              {form.capital_fixed_trade_quote} of quote on each entry — type{' '}
+              <b>10</b> to "trade with $10 each time". It <b>ignores</b> the “Deploy
+              per entry %” and outcome re-sizing below (a fixed stake stays fixed),
+              yet is still capped by your free budget and the risk-based size, so it
+              only ever deploys <b>that much or less</b> — never cash you don't have.
+            </p>
+          )}
           <div className="row">
             <div className="field">
               <label>Run budget (USDT, 0 = use free equity)</label>

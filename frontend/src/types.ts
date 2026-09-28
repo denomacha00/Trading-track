@@ -184,6 +184,22 @@ export interface Fundamentals {
     largest_tx_usd_24h: number | null
     dominance_pct: number | null
   } | null
+  // Real US spot BTC/ETH ETF net flows (institutional demand). null when the
+  // asset has no US spot ETF, or the operator hasn't set ETF_FLOW_API_TOKEN.
+  // Never fabricated — a gap stays null.
+  etf_flows: {
+    asset: string
+    as_of_ms: number
+    as_of_date: string
+    net_flow_usd: number | null
+    prev_net_flow_usd: number | null
+    delta_usd: number | null
+    sum_5d_usd: number | null
+    streak_days: number
+    streak_dir: 'inflow' | 'outflow' | 'flat'
+    funds: Record<string, number> | null
+    source: string
+  } | null
   as_of: string
 }
 
@@ -389,6 +405,11 @@ export interface Settings {
   // booked gains aren't immediately re-risked. 0 = off. (The bot can't move money
   // off your exchange — withdrawals are always yours to make there.)
   capital_profit_reserve_pct: number
+  // EXACT stake per autopilot trade in quote (USDT), e.g. type 10 to "trade with
+  // $10 each time". 0 = off (size by % instead). Skips the % slice AND outcome
+  // resize — a fixed stake stays fixed — yet is still capped by free budget and
+  // the risk-based size, so it only ever deploys this much OR LESS. Never fakes cash.
+  capital_fixed_trade_quote: number
   // ---- Autopilot safety / pause-resume (safe defaults for non-traders) ----
   // Stand aside for NEW longs while price is in a bear regime; resume in a bull.
   // On by default — capital preservation is the safe stance.

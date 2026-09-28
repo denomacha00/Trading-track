@@ -14,7 +14,7 @@ import pytest
 from app import fundamentals
 
 
-def _fake_get_json(url, *, params=None, timeout=8.0):
+def _fake_get_json(url, *, params=None, headers=None, timeout=8.0):
     if "alternative.me" in url:
         return {"data": [
             {"value": "62", "value_classification": "Greed"},
@@ -58,6 +58,22 @@ def _fake_get_json(url, *, params=None, timeout=8.0):
             "largest_transaction_24h": {"hash": "abc", "value_usd": 125000000},
             "market_dominance_percentage": 54.0,
         }}
+    if "/api/etf/bitcoin/flow-history" in url:
+        # CoinGlass shape: {"code":"0","data":[{timestamp, flow_usd, price_usd,
+        # etf_flows:[{etf_ticker, flow_usd}]}, ...]} (order varies; fetcher sorts).
+        # Per-fund legs on the latest day sum to the daily total, as in reality.
+        return {"code": "0", "msg": "success", "data": [
+            {"timestamp": 1706000000000, "flow_usd": -50000000.0, "price_usd": 42000.0,
+             "etf_flows": []},
+            {"timestamp": 1706086400000, "flow_usd": 120000000.0, "price_usd": 43000.0,
+             "etf_flows": []},
+            {"timestamp": 1706172800000, "flow_usd": 250000000.0, "price_usd": 44000.0,
+             "etf_flows": [
+                 {"etf_ticker": "IBIT", "flow_usd": 300000000.0},
+                 {"etf_ticker": "FBTC", "flow_usd": 80000000.0},
+                 {"etf_ticker": "GBTC", "flow_usd": -130000000.0},
+             ]},
+        ]}
     raise AssertionError(f"unexpected url {url}")
 
 
@@ -68,6 +84,7 @@ def _clear_cache():
     fundamentals._CACHE.clear()
 def test_full_snapshot_all_sources(monkeypatch):
     monkeypatch.setattr(fundamentals, "_get_json", _fake_get_json)
+    monkeypatch.setattr(fundamentals, "_ETF_FLOW_TOKEN", "test-token")
     snap, errors = fundamentals.fetch_fundamentals("BTC/USDT")
     assert errors == []
     assert snap["asset"] == "BTC"
@@ -89,6 +106,84 @@ def test_full_snapshot_all_sources(monkeypatch):
     assert oc["holding_addresses"] == pytest.approx(52000000)
     assert oc["largest_tx_usd_24h"] == pytest.approx(125000000)
     assert oc["nodes"] == pytest.approx(20000)
+    etf = snap["etf_flows"]
+    assert etf is not None and etf["asset"] == "BTC"
+    assert etf["net_flow_usd"] == pytest.approx(250000000.0)
+    assert etf["prev_net_flow_usd"] == pytest.approx(120000000.0)
+    assert etf["delta_usd"] == pytest.approx(130000000.0)
+    assert etf["sum_5d_usd"] == pytest.approx(320000000.0)
+    assert etf["streak_days"] == 2 and etf["streak_dir"] == "inflow"
+    assert etf["funds"] == {
+        "IBIT": pytest.approx(3e8), "FBTC": pytest.approx(8e7), "GBTC": pytest.approx(-1.3e8),
+    }
+    assert etf["source"] == "CoinGlass"
+
+
+def test_etf_flows_off_without_token(monkeypatch):
+    # No token configured -> the section is an HONEST GAP (None) with a note telling
+    # the operator how to switch it on. It is NOT counted as a source failure.
+    monkeypatch.setattr(fundamentals, "_get_json", _fake_get_json)
+    monkeypatch.setattr(fundamentals, "_ETF_FLOW_TOKEN", "")
+    snap, errors = fundamentals.fetch_fundamentals("BTC/USDT")
+    assert snap["etf_flows"] is None
+    assert any("ETF flows off" in e and "COINGLASS_API_KEY" in e for e in errors)
+
+
+def test_etf_flows_absent_for_non_etf_asset(monkeypatch):
+    # SOL has no US spot ETF -> no ETF section AND no "off" note, even with a token.
+    monkeypatch.setattr(fundamentals, "_get_json", _fake_get_json)
+    monkeypatch.setattr(fundamentals, "_ETF_FLOW_TOKEN", "test-token")
+    snap, errors = fundamentals.fetch_fundamentals("SOL/USDT")
+    assert snap["etf_flows"] is None
+    assert not any("ETF" in e for e in errors)
+
+
+def test_etf_flows_source_failure_is_none_plus_error(monkeypatch):
+    def fake(url, *, params=None, headers=None, timeout=8.0):
+        if "/api/etf/" in url or "coinglass" in url:
+            raise httpx.ConnectError("boom")
+        return _fake_get_json(url, params=params, headers=headers, timeout=timeout)
+    monkeypatch.setattr(fundamentals, "_get_json", fake)
+    monkeypatch.setattr(fundamentals, "_ETF_FLOW_TOKEN", "test-token")
+    snap, errors = fundamentals.fetch_fundamentals("BTC/USDT")
+    assert snap["etf_flows"] is None
+    assert any("ETF flows" in e for e in errors)
+    assert snap["coin"] is not None  # other sections intact
+
+
+def test_etf_flows_survives_one_bad_fund_leg(monkeypatch):
+    # A single malformed fund leg in the payload (missing ticker / non-numeric flow)
+    # must NOT sink the section -- the total + the well-formed funds still come
+    # through (best-effort, like the derivatives legs).
+    def fake(url, *, params=None, headers=None, timeout=8.0):
+        if "/api/etf/bitcoin/flow-history" in url:
+            return {"code": "0", "data": [
+                {"timestamp": 1706086400000, "flow_usd": 120000000.0, "etf_flows": []},
+                {"timestamp": 1706172800000, "flow_usd": 250000000.0, "etf_flows": [
+                    {"etf_ticker": "IBIT", "flow_usd": 300000000.0},
+                    {"etf_ticker": "FBTC", "flow_usd": 80000000.0},
+                    {"etf_ticker": None, "flow_usd": -130000000.0},   # bad: no ticker
+                    {"etf_ticker": "GBTC", "flow_usd": "n/a"},         # bad: non-numeric
+                ]},
+            ]}
+        return _fake_get_json(url, params=params, headers=headers, timeout=timeout)
+    monkeypatch.setattr(fundamentals, "_get_json", fake)
+    monkeypatch.setattr(fundamentals, "_ETF_FLOW_TOKEN", "test-token")
+    snap, errors = fundamentals.fetch_fundamentals("BTC/USDT")
+    etf = snap["etf_flows"]
+    assert etf is not None and etf["net_flow_usd"] == pytest.approx(250000000.0)
+    assert etf["funds"] == {"IBIT": pytest.approx(3e8), "FBTC": pytest.approx(8e7)}
+    assert not any("ETF flows" in e for e in errors)  # partial != failure
+
+
+def test_etf_flows_reach_the_ai_summary(monkeypatch):
+    monkeypatch.setattr(fundamentals, "_get_json", _fake_get_json)
+    monkeypatch.setattr(fundamentals, "_ETF_FLOW_TOKEN", "test-token")
+    snap, _ = fundamentals.fetch_fundamentals("BTC/USDT")
+    text = fundamentals.summarize_fundamentals(snap)
+    assert "Spot ETF flows (BTC" in text
+    assert "inflow" in text
+    assert "IBIT" in text
 
 
 def test_dead_source_is_none_plus_error(monkeypatch):
