@@ -2,6 +2,8 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProper
 import { api, setToken, getToken, setAuthFailureHandler } from './api'
 import { PriceChart, TF_SECONDS } from './PriceChart'
 import { TradingViewChart } from './TradingViewChart'
+import { useReplay, ReplayBar } from './ReplayControls'
+import { replaySlice } from './replay'
 import { DEFAULT_INDICATORS, type IndicatorPrefs } from './indicators'
 import {
   ICT_OVERLAY_GROUPS,
@@ -285,6 +287,11 @@ function Dashboard({
   useEffect(() => {
     localStorage.setItem('tt.chartZoomLock', chartZoomLock ? 'on' : 'off')
   }, [chartZoomLock])
+  // Bar replay (TradingView-style): step through history one candle at a time.
+  // The hook owns the cursor + playback; we slice our own candle array at render
+  // so PriceChart needs no replay knowledge — it just receives a window of bars
+  // and (with the live bar frozen off) recomputes every indicator from them.
+  const replay = useReplay(candles.length)
   // Which price-overlay indicators are switched on, loaded from localStorage so
   // the choice sticks (like a saved TradingView layout). All real math on the
   // bot chart's own candles.
@@ -1716,23 +1723,26 @@ function Dashboard({
               {chartView === 'tv' ? (
                 <TradingViewChart symbol={symbol} timeframe={timeframe} theme={theme} />
               ) : candles.length ? (
-                <PriceChart
-                  candles={candles}
-                  theme={theme}
-                  last={livePrice}
-                  liveBar={streamingLive ? stream.candle : null}
-                  fitKey={`${symbol}:${timeframe}`}
-                  symbol={symbol}
-                  timeframe={timeframe}
-                  priceLines={chartPriceLines}
-                  indicators={indicators}
-                  ict={ictRead}
-                  ictOverlays={ictOverlays}
-                  markers={showTradeMarkers ? chartMarkers : []}
-                  clearSignal={chartClearSignal}
-                  fullscreen={chartMax}
-                  zoomLock={chartZoomLock}
-                />
+                <>
+                  <ReplayBar replay={replay} />
+                  <PriceChart
+                    candles={replay.active ? replaySlice(candles, replay.cursor) : candles}
+                    theme={theme}
+                    last={replay.active ? null : livePrice}
+                    liveBar={replay.active ? null : streamingLive ? stream.candle : null}
+                    fitKey={replay.active ? `replay:${symbol}:${timeframe}` : `${symbol}:${timeframe}`}
+                    symbol={symbol}
+                    timeframe={timeframe}
+                    priceLines={chartPriceLines}
+                    indicators={indicators}
+                    ict={ictRead}
+                    ictOverlays={ictOverlays}
+                    markers={showTradeMarkers ? chartMarkers : []}
+                    clearSignal={chartClearSignal}
+                    fullscreen={chartMax}
+                    zoomLock={chartZoomLock}
+                  />
+                </>
               ) : (
                 <div className="empty">
                   No candle data. Check the backend / Binance connection.
