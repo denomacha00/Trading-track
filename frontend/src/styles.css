@@ -846,6 +846,14 @@ th.mono {
   background: var(--accent);
   color: #fff;
 }
+/* Full-screen zoom lock: sits just after the size controls. Its "locked" (active)
+   state is the safe default on phones — pinch zooms the chart, not the whole app. */
+.chart-zoom-lock {
+  margin-left: 6px;
+}
+.chart-zoom-lock .cvt-btn {
+  white-space: nowrap;
+}
 
 /* "Watch the bot think" banner: a transient, VIEW-ONLY overlay shown while the
    chart is briefly driven to match a real autonomous decision (its symbol, the
@@ -1491,6 +1499,13 @@ pre.code {
     font-size: 20px;
     line-height: 1;
     min-width: 52px;
+    min-height: 44px;
+    font-weight: 700;
+  }
+  /* The full-screen zoom lock is a finger target too, and keeps its label so the
+     user can read what "locked" means rather than guessing at an icon. */
+  .chart-view-toggle[aria-label="Zoom"] .cvt-btn {
+    font-size: 14px;
     min-height: 44px;
     font-weight: 700;
   }

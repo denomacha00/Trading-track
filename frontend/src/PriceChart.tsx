@@ -219,6 +219,8 @@ export function PriceChart({
   clearSignal,
   ict,
   ictOverlays,
+  fullscreen,
+  zoomLock,
 }: {
   candles: Candle[]
   theme: Theme
@@ -261,6 +263,16 @@ export function PriceChart({
   ict?: IctAnalysis | null
   // Which ICT overlays to draw. Undefined = the module defaults.
   ictOverlays?: IctOverlayPrefs
+  // True while the chart is the full-screen overlay. On a phone this governs who
+  // gets touch gestures: locked (the default) sends pinch/drag to the CHART so
+  // pinching zooms the candles instead of the whole page; unlocked hands pinch
+  // back to the browser so the user can zoom the entire app. Ignored on desktop
+  // (the mouse wheel always zooms the chart) — it only shapes `touch-action`.
+  fullscreen?: boolean
+  // In full screen, true = chart owns the zoom (page can't pinch-zoom), false =
+  // page owns the zoom. Undefined is treated as locked. No effect when not
+  // full-screen, where the page scrolls/zooms exactly as before.
+  zoomLock?: boolean
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -1347,15 +1359,35 @@ export function PriceChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [candles, indKey, theme])
 
-  // While a drawing tool is active, freeze pan/zoom so clicks place cleanly and
-  // show a crosshair cursor; the cursor tool restores normal chart navigation.
+  // Route pan/zoom between the chart, the page, and drawing.
+  //
+  // The GRAPH ITSELF STAYS ZOOMABLE AT ALL TIMES — the lock never takes chart
+  // zoom away. Chart nav (wheel/drag/pinch scroll+scale) is on whenever we're not
+  // mid-drawing; a drawing tool alone freezes it so a click/drag places the shape
+  // cleanly (crosshair cursor) instead of sliding the chart.
+  //
+  // The lock decides one thing only: who a two-finger PINCH that lands on the
+  // chart belongs to, and it matters solely in full screen on a touch screen.
+  //   • Locked (the default): `touch-action: none` → the chart owns the pinch, so
+  //     pinching the candles zooms the GRAPH and never the surrounding chat/app.
+  //     This is the reported phone bug — pinching the graph used to zoom the whole
+  //     chat. Locked fixes it while the graph stays fully zoomable.
+  //   • Unlocked: `touch-action: pinch-zoom` → the browser owns the pinch, so a
+  //     pinch (including over the chart) zooms the whole chat/app, for when the
+  //     user deliberately wants that. The graph is still zoomable by wheel/drag.
+  // Inline (not full screen) is left untouched ('') so the page scrolls on a phone
+  // exactly as it did before.
   useEffect(() => {
     const chart = chartRef.current
     if (!chart) return
     const drawing = tool !== 'cursor'
     chart.applyOptions({ handleScroll: !drawing, handleScale: !drawing })
-    if (containerRef.current) containerRef.current.style.cursor = drawing ? 'crosshair' : ''
-  }, [tool])
+    const el = containerRef.current
+    if (el) {
+      el.style.cursor = drawing ? 'crosshair' : ''
+      el.style.touchAction = !fullscreen ? '' : zoomLock === false ? 'pinch-zoom' : 'none'
+    }
+  }, [tool, fullscreen, zoomLock])
 
   // Load this symbol/timeframe's saved drawings whenever either changes (and on
   // mount). skipSaveRef stops the next save effect from immediately rewriting

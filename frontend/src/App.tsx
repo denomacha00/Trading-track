@@ -275,6 +275,16 @@ function Dashboard({
   // to just its header so the panels below come into view). Mutually exclusive.
   const [chartMax, setChartMax] = useState(false)
   const [chartMin, setChartMin] = useState(false)
+  // Full-screen touch behaviour: locked (default) sends a pinch/drag to the CHART
+  // so zooming the candles no longer zooms the whole app on a phone; unticking it
+  // hands pinch back to the browser to zoom the entire page. Persisted so the
+  // choice sticks. Only takes effect while the chart is full-screen.
+  const [chartZoomLock, setChartZoomLock] = useState(
+    () => localStorage.getItem('tt.chartZoomLock') !== 'off',
+  )
+  useEffect(() => {
+    localStorage.setItem('tt.chartZoomLock', chartZoomLock ? 'on' : 'off')
+  }, [chartZoomLock])
   // Which price-overlay indicators are switched on, loaded from localStorage so
   // the choice sticks (like a saved TradingView layout). All real math on the
   // bot chart's own candles.
@@ -1610,6 +1620,28 @@ function Dashboard({
                     {chartMax ? '✕' : '⛶'}
                   </button>
                 </div>
+                {/* Full-screen only. The GRAPH always stays zoomable — this only
+                    decides where a two-finger pinch goes. On by default: a pinch
+                    zooms the graph and leaves the chat/app alone (the phone bug was
+                    pinching the graph zooming the whole chat). Untick it to let a
+                    pinch zoom the whole app instead. Desktop is unaffected. */}
+                {chartMax && (
+                  <div className="chart-view-toggle chart-zoom-lock" role="group" aria-label="Zoom">
+                    <button
+                      type="button"
+                      className={`cvt-btn${chartZoomLock ? ' active' : ''}`}
+                      aria-pressed={chartZoomLock}
+                      onClick={() => setChartZoomLock((v) => !v)}
+                      title={
+                        chartZoomLock
+                          ? 'Pinch zooms the graph — the chat stays put. Tap to let a pinch zoom the whole app instead (the graph still zooms).'
+                          : 'Pinch zooms the whole app. Tap to send pinch back to the graph so it stays put on the chat.'
+                      }
+                    >
+                      {chartZoomLock ? '🔒 Pinch: graph' : '🔓 Pinch: app'}
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
             <div className="panel-body">
@@ -1668,6 +1700,8 @@ function Dashboard({
                   ictOverlays={ictOverlays}
                   markers={showTradeMarkers ? chartMarkers : []}
                   clearSignal={chartClearSignal}
+                  fullscreen={chartMax}
+                  zoomLock={chartZoomLock}
                 />
               ) : (
                 <div className="empty">
