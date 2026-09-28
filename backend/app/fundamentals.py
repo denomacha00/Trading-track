@@ -6,6 +6,7 @@ Honest scope: every number here is fetched LIVE from a public, no-key data sourc
   * Global crypto market + BTC/ETH dominance .. CoinGecko /global
   * Per-coin mcap / volume / supply / ATH / trailing returns .. CoinGecko /coins/markets
   * Derivatives positioning (funding, open interest, long/short) .. Binance USD-M futures
+  * On-chain network stats (tx/24h, mempool, fees, hashrate, holders) .. Blockchair /stats
 
 If a source is unreachable we record it in ``errors`` and leave that section
 None -- we NEVER fabricate a value. Results are cached per-source so the AI and
@@ -215,6 +216,49 @@ def _derivatives(fut_symbol: str) -> dict | None:
     if not any(v is not None for v in out.values()):
         raise RuntimeError("no derivatives data (all legs failed)")
     return out
+
+
+# Blockchair chain slugs for the assets we can read REAL on-chain stats for.
+# Only chains Blockchair's keyless /stats endpoint actually serves; any other
+# asset simply has no on-chain section (an honest gap, never faked).
+_BLOCKCHAIR_CHAINS: dict[str, str] = {
+    "BTC": "bitcoin", "ETH": "ethereum", "LTC": "litecoin",
+    "BCH": "bitcoin-cash", "DOGE": "dogecoin", "DASH": "dash",
+    "ZEC": "zcash", "XLM": "stellar", "ADA": "cardano",
+    "XRP": "ripple", "XMR": "monero", "BSV": "bitcoin-sv",
+    "GRS": "groestlcoin",
+}
+
+
+def _on_chain(chain: str) -> dict | None:
+    """REAL on-chain network stats from Blockchair (keyless): 24h transactions,
+    mempool backlog, average/median fee (USD), PoW hashrate + difficulty, holding
+    addresses (adoption), reachable node count (decentralisation), block height,
+    and the largest transfer in the last 24h (whale flow). Every field is
+    best-effort -- a missing one is None (an honest gap), never fabricated. A
+    non-positive hashrate (PoS chains report 0) is dropped rather than shown as a
+    misleading zero."""
+    data = (_get_json(f"https://api.blockchair.com/{chain}/stats") or {}).get("data") or {}
+    if not data:
+        return None
+    hashrate = _num(data.get("hashrate_24h"))
+    if hashrate is not None and hashrate <= 0:
+        hashrate = None  # PoS / not applicable -> honest gap, not a fake 0
+    largest = data.get("largest_transaction_24h") or {}
+    return {
+        "chain": chain,
+        "tx_count_24h": _num(data.get("transactions_24h")),
+        "mempool_tx": _num(data.get("mempool_transactions")),
+        "avg_fee_usd_24h": _num(data.get("average_transaction_fee_usd_24h")),
+        "median_fee_usd_24h": _num(data.get("median_transaction_fee_usd_24h")),
+        "hashrate_24h": hashrate,
+        "difficulty": _num(data.get("difficulty")),
+        "holding_addresses": _num(data.get("hodling_addresses")),
+        "nodes": _num(data.get("nodes")),
+        "block_height": _num(data.get("best_block_height") or data.get("blocks")),
+        "largest_tx_usd_24h": _num(largest.get("value_usd")),
+        "dominance_pct": _num(data.get("market_dominance_percentage")),
+    }
 def fetch_fundamentals(symbol: str, *, ttl_scale: float = 1.0) -> tuple[dict, list[str]]:
     """Return (snapshot, errors) of REAL fundamentals for ``symbol``.
 
@@ -251,6 +295,13 @@ def fetch_fundamentals(symbol: str, *, ttl_scale: float = 1.0) -> tuple[dict, li
             f"deriv:{fut}", 150.0, lambda: _derivatives(fut), f"{asset} derivatives"
         )
 
+    onchain = None
+    chain = _BLOCKCHAIR_CHAINS.get(asset)
+    if chain:
+        onchain = _try(
+            f"onchain:{chain}", 600.0, lambda: _on_chain(chain), f"{asset} on-chain"
+        )
+
     snapshot = {
         "symbol": (symbol or "").upper(),
         "asset": asset,
@@ -258,6 +309,7 @@ def fetch_fundamentals(symbol: str, *, ttl_scale: float = 1.0) -> tuple[dict, li
         "global_market": glob,
         "coin": coin,
         "derivatives": deriv,
+        "on_chain": onchain,
         "as_of": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     return snapshot, errors
@@ -275,6 +327,28 @@ def _fmt_pct(v: float | None, *, sign: bool = True) -> str:
     if v is None:
         return "?"
     return f"{v:+.2f}%" if sign else f"{v:.2f}%"
+
+
+def _fmt_count(v: float | None) -> str:
+    """Large integer counts (transactions, addresses, nodes) -> 1.23M / 4.5K."""
+    if v is None:
+        return "?"
+    a = abs(v)
+    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if a >= div:
+            return f"{v / div:.2f}{unit}"
+    return f"{v:,.0f}"
+
+
+def _fmt_hashrate(v: float | None) -> str:
+    """Raw hashes/second -> EH/s / PH/s / TH/s ... (honest '?' when unknown)."""
+    if v is None:
+        return "?"
+    for unit, div in (("EH/s", 1e18), ("PH/s", 1e15), ("TH/s", 1e12),
+                      ("GH/s", 1e9), ("MH/s", 1e6)):
+        if v >= div:
+            return f"{v / div:.2f} {unit}"
+    return f"{v:.0f} H/s"
 
 
 def summarize_fundamentals(snapshot: dict | None) -> str:
@@ -340,12 +414,32 @@ def summarize_fundamentals(snapshot: dict | None) -> str:
             seg += f", long/short {dv.get('long_short_ratio'):.2f}"
         lines.append(seg)
 
+    oc = snapshot.get("on_chain")
+    if oc:
+        parts: list[str] = []
+        if oc.get("tx_count_24h") is not None:
+            parts.append(f"{_fmt_count(oc['tx_count_24h'])} tx/24h")
+        if oc.get("mempool_tx") is not None:
+            parts.append(f"{_fmt_count(oc['mempool_tx'])} in mempool")
+        if oc.get("avg_fee_usd_24h") is not None:
+            parts.append(f"avg fee ${oc['avg_fee_usd_24h']:,.2f}")
+        if oc.get("hashrate_24h") is not None:
+            parts.append(f"hashrate {_fmt_hashrate(oc['hashrate_24h'])}")
+        if oc.get("holding_addresses") is not None:
+            parts.append(f"{_fmt_count(oc['holding_addresses'])} holding addresses")
+        if oc.get("largest_tx_usd_24h") is not None:
+            parts.append(f"largest 24h transfer {_fmt_usd(oc['largest_tx_usd_24h'])}")
+        if oc.get("nodes") is not None:
+            parts.append(f"{_fmt_count(oc['nodes'])} reachable nodes")
+        if parts:
+            lines.append(f"- On-chain ({oc.get('chain')}): " + ", ".join(parts))
+
     if not lines:
         return ""
     header = (
-        "Fundamentals / macro / sentiment (REAL -- live public market data, not "
-        "fabricated; ANALYSE these and factor them into your read, don't claim you "
-        "lack fundamentals):"
+        "Fundamentals / macro / sentiment / on-chain (REAL -- live public market "
+        "and blockchain data, not fabricated; ANALYSE these and factor them into "
+        "your read, don't claim you lack fundamentals):"
     )
     return header + "\n" + "\n".join(lines)
 

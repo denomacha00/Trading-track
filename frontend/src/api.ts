@@ -24,6 +24,7 @@ import type {
   Settings,
   SignalRow,
   StrategyInfo,
+  Technicals,
   Ticker,
   Trade,
   TrainingReport,
@@ -243,6 +244,14 @@ export const api = {
     req<MarketAnalysis>(
       `/api/analyze/${encodeURIComponent(symbol)}?timeframe=${timeframe}&explain=${explain}&assess=${assess}`,
     ),
+  // TradingView-style Technicals gauge: real oscillators + moving averages each
+  // voting Buy/Sell/Neutral, aggregated into rated gauges. Computed live from
+  // real candles; indicators without enough history come back unavailable, never
+  // faked. ~200+ bars are fetched so the full SMA/EMA-200 ladder is present.
+  technicals: (symbol: string, timeframe = '1h') =>
+    req<Technicals>(
+      `/api/technicals/${encodeURIComponent(symbol)}?timeframe=${timeframe}`,
+    ),
   aiAsk: (question: string, symbol?: string, timeframe = '1h') =>
     req<{ answer: string; ai_enabled: boolean }>('/api/ai/ask', {
       method: 'POST',
@@ -261,6 +270,9 @@ export const api = {
     // Attach LIVE fundamentals/macro/sentiment for `symbol` so the AI analyses
     // them (default on server-side when a symbol is present + the feed is on).
     include_fundamentals?: boolean
+    // Attach the LIVE TradingView-style Technicals gauge for `symbol` so the AI
+    // weighs real oscillator/MA ratings (default on server-side with a symbol).
+    include_technicals?: boolean
     history?: { role: 'user' | 'assistant'; content: string }[]
     // An optional attached image the AI reads (vision). `data` is raw base64 (no
     // data: prefix); `media_type` is the real MIME (always image/jpeg here — the

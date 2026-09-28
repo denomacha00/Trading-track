@@ -167,7 +167,55 @@ export interface Fundamentals {
     open_interest_usd: number | null
     long_short_ratio: number | null
   } | null
+  // REAL on-chain network stats (Blockchair, keyless) for chains we can read.
+  // null when the asset isn't an on-chain coin we track or the source was
+  // unreachable — never fabricated. hashrate_24h is null for PoS chains.
+  on_chain: {
+    chain: string
+    tx_count_24h: number | null
+    mempool_tx: number | null
+    avg_fee_usd_24h: number | null
+    median_fee_usd_24h: number | null
+    hashrate_24h: number | null
+    difficulty: number | null
+    holding_addresses: number | null
+    nodes: number | null
+    block_height: number | null
+    largest_tx_usd_24h: number | null
+    dominance_pct: number | null
+  } | null
   as_of: string
+}
+
+// TradingView-style Technicals gauge, computed live from real candles.
+export type TechRating = 'strong_buy' | 'buy' | 'neutral' | 'sell' | 'strong_sell'
+export type TechSignal = 'buy' | 'sell' | 'neutral' | 'n/a'
+
+export interface TechItem {
+  name: string
+  value: number | null
+  signal: TechSignal
+}
+
+export interface TechGauge {
+  rating: TechRating
+  score: number
+  buy: number
+  sell: number
+  neutral: number
+  items: TechItem[]
+}
+
+export interface Technicals {
+  symbol: string
+  timeframe: string
+  price: number | null
+  bars: number
+  // The overall Summary gauge has no item list (it aggregates the two below).
+  summary: Omit<TechGauge, 'items'> & { items?: TechItem[] }
+  oscillators: TechGauge
+  moving_averages: TechGauge
+  note?: string
 }
 
 // A single turn in the AI assistant conversation (browser-local history).

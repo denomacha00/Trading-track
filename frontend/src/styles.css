@@ -2259,6 +2259,104 @@ pre.code {
 .fund-pos { color: var(--green); font-weight: 600; }
 .fund-neg { color: var(--red); font-weight: 600; }
 
+/* Technicals panel: 3 rated gauges (Summary / Oscillators / Moving Averages)
+   over two indicator tables. Buy=green, Sell=red, Neutral/Unavailable=muted —
+   every value is real; a "—"/Unavailable cell means the indicator was dropped
+   from the vote (not enough history), never faked. */
+.tech-tf {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 3px 8px;
+  font-size: 12px;
+}
+.tech-price { font-size: 12px; margin: 2px 0 12px; }
+.tech-gauges {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.tech-gauge {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  text-align: center;
+}
+.tech-gauge-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.tech-gauge-rating { font-size: 20px; font-weight: 700; margin: 6px 0 10px; }
+.tech-meter {
+  display: flex;
+  height: 8px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--border);
+}
+.tech-meter-buy { background: var(--green); }
+.tech-meter-neutral { background: var(--muted); opacity: 0.5; }
+.tech-meter-sell { background: var(--red); }
+.tech-gauge-counts {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  margin-top: 8px;
+}
+.tech-buy { color: var(--green); font-weight: 600; }
+.tech-sell { color: var(--red); font-weight: 600; }
+.tech-neutral { color: var(--muted); }
+/* Rating tint on the gauge card border/heading */
+.tech-gauge.tech-strong-buy, .tech-gauge.tech-buy { border-color: var(--green); }
+.tech-gauge.tech-strong-buy .tech-gauge-rating,
+.tech-gauge.tech-buy .tech-gauge-rating { color: var(--green); }
+.tech-gauge.tech-strong-sell, .tech-gauge.tech-sell { border-color: var(--red); }
+.tech-gauge.tech-strong-sell .tech-gauge-rating,
+.tech-gauge.tech-sell .tech-gauge-rating { color: var(--red); }
+.tech-gauge.tech-neutral .tech-gauge-rating { color: var(--muted); }
+.tech-tables {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+}
+.tech-table-wrap {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.tech-table-h {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.tech-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.tech-table th {
+  text-align: left;
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 600;
+  padding: 6px 14px;
+}
+.tech-table th:nth-child(2), .tech-table td.tech-val { text-align: right; }
+.tech-table th:last-child, .tech-table td:last-child { text-align: right; }
+.tech-table td { padding: 6px 14px; border-top: 1px solid var(--border); }
+.tech-table tbody tr:hover { background: var(--accent-soft); }
+.tech-val { font-variant-numeric: tabular-nums; color: var(--muted); }
+.tech-sig.tech-buy { color: var(--green); }
+.tech-sig.tech-sell { color: var(--red); }
+.tech-sig.tech-neutral, .tech-sig.muted { color: var(--muted); }
+
 
 @media (prefers-reduced-motion: reduce) {
   .btn.mic.rec, .conf-fill, .toggle, .toggle .knob { animation: none; transition: none; }

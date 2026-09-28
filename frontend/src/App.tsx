@@ -21,7 +21,7 @@ import { Admin } from './Admin'
 import { useSocket } from './useSocket'
 import { useTheme, type Theme } from './theme'
 import { ThemeToggle } from './ThemeToggle'
-import type { AiHealth, Alert, AutoConfirmation, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, Fundamentals, IctAnalysis, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
+import type { AiHealth, Alert, AutoConfirmation, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, Fundamentals, IctAnalysis, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, Settings, SignalRow, StrategyInfo, Technicals, TechGauge, TechItem, Ticker, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -136,7 +136,7 @@ export default function App() {
   return <Dashboard me={me} onLogout={logout} onMeChanged={setMe} theme={theme} onToggleTheme={toggleTheme} />
 }
 
-type TabKey = 'trades' | 'performance' | 'history' | 'signals' | 'assistant' | 'news' | 'fundamentals' | 'analyze' | 'train' | 'backtest' | 'settings' | 'admin'
+type TabKey = 'trades' | 'performance' | 'history' | 'signals' | 'assistant' | 'news' | 'fundamentals' | 'analyze' | 'technicals' | 'train' | 'backtest' | 'settings' | 'admin'
 
 // Left-drawer navigation. `admin: true` items only render for admins. The same
 // keys drive the in-panel tab strip, so the two stay in sync off one `tab`.
@@ -149,6 +149,7 @@ const NAV: { key: TabKey; label: string; icon: string; admin?: boolean }[] = [
   { key: 'news', label: 'News', icon: '📰' },
   { key: 'fundamentals', label: 'Fundamentals', icon: '🌐' },
   { key: 'analyze', label: 'Analyze', icon: '🔍' },
+  { key: 'technicals', label: 'Technicals', icon: '📊' },
   { key: 'train', label: 'Train', icon: '🧠' },
   { key: 'backtest', label: 'Backtest', icon: '↺' },
   { key: 'settings', label: 'Settings', icon: '⚙' },
@@ -165,6 +166,7 @@ const NAV_LABEL: Record<TabKey, string> = {
   news: 'News',
   fundamentals: 'Fundamentals',
   analyze: 'Analyze',
+  technicals: 'Technicals',
   train: 'Train',
   backtest: 'Backtest',
   settings: 'Settings',
@@ -186,6 +188,9 @@ const NAV_ALIAS: Record<string, TabKey> = {
   sentiment: 'fundamentals', funding: 'fundamentals', dominance: 'fundamentals',
   'fear greed': 'fundamentals', feargreed: 'fundamentals', onchain: 'fundamentals',
   analyze: 'analyze', analysis: 'analyze', analyse: 'analyze',
+  technicals: 'technicals', technical: 'technicals', oscillators: 'technicals',
+  oscillator: 'technicals', gauge: 'technicals', gauges: 'technicals', rating: 'technicals',
+  ratings: 'technicals', indicators: 'technicals', indicator: 'technicals', 'moving averages': 'technicals',
   train: 'train', training: 'train',
   backtest: 'backtest', backtesting: 'backtest',
   settings: 'settings', setting: 'settings', credentials: 'settings', keys: 'settings',
@@ -1876,6 +1881,12 @@ function Dashboard({
                   Analyze
                 </span>
                 <span
+                  className={`tab ${tab === 'technicals' ? 'active' : ''}`}
+                  onClick={() => setTab('technicals')}
+                >
+                  Technicals
+                </span>
+                <span
                   className={`tab ${tab === 'train' ? 'active' : ''}`}
                   onClick={() => setTab('train')}
                 >
@@ -1958,6 +1969,13 @@ function Dashboard({
               )}
               {tab === 'analyze' && (
                 <AnalyzePanel
+                  symbol={symbol}
+                  timeframe={timeframe}
+                  onError={(m) => showToast('error', m)}
+                />
+              )}
+              {tab === 'technicals' && (
+                <TechnicalsPanel
                   symbol={symbol}
                   timeframe={timeframe}
                   onError={(m) => showToast('error', m)}
@@ -4284,6 +4302,10 @@ function AssistantPanel({
   // fundamentals (Fear & Greed, dominance, funding/OI, per-coin returns) and act
   // on them, not disclaim them. Server still gates on `fundamentals_enabled`.
   const [useFundamentals, setUseFundamentals] = useState(true)
+  // Attach the live TradingView-style Technicals gauge (real oscillators + MAs)
+  // so the AI weighs the same ratings the Technicals tab shows. Server-side it is
+  // on by default whenever a symbol is present; this lets the user opt out.
+  const [useTechnicals, setUseTechnicals] = useState(true)
   const [listening, setListening] = useState(false)
   // Which message currently shows a "Copied ✓" tick. Held by object REFERENCE (not
   // index) so a live-monitor push that reindexes the transcript can't move the tick
@@ -4355,6 +4377,7 @@ function AssistantPanel({
         timeframe: useSymbol ? timeframe : undefined,
         include_news: useNews,
         include_fundamentals: useFundamentals,
+        include_technicals: useTechnicals,
         history,
         image: img ? { data: img.data, media_type: img.mediaType } : undefined,
       })
@@ -4811,6 +4834,14 @@ function AssistantPanel({
               />
               Analyse live fundamentals
             </label>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={useTechnicals}
+                onChange={(e) => setUseTechnicals(e.target.checked)}
+              />
+              Analyse live technicals
+            </label>
             {ttsSupported && (
               <label className="check">
                 <input
@@ -5001,6 +5032,164 @@ function NewsPanelImpl({ onError }: { onError: (msg: string) => void }) {
   )
 }
 
+// A live, honest TradingView-style Technicals gauge for the active pair: 11
+// oscillators + 15 moving averages, each voting Buy/Sell/Neutral, aggregated
+// into rated gauges (Strong Buy … Strong Sell) exactly like TradingView's
+// Technical Ratings. Every value is computed server-side from REAL candles via
+// /api/technicals; an indicator without enough history shows "—" / Unavailable
+// and is dropped from the vote — never faked to zero. Same read the AI analyses
+// when "Analyse live technicals" is on.
+const TechnicalsPanel = memo(TechnicalsPanelImpl)
+function TechnicalsPanelImpl({
+  symbol,
+  timeframe,
+  onError,
+}: {
+  symbol: string
+  timeframe: string
+  onError: (msg: string) => void
+}) {
+  const [tf, setTf] = useState(timeframe)
+  const [data, setData] = useState<Technicals | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [fetchedAt, setFetchedAt] = useState<number | null>(null)
+
+  // Follow the app's active timeframe when the user changes it on the chart.
+  useEffect(() => { setTf(timeframe) }, [timeframe])
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await api.technicals(symbol, tf)
+      setData(res)
+      setFetchedAt(Date.now())
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }, [symbol, tf, onError])
+
+  // Recompute on mount + whenever pair/timeframe changes, then refresh on a
+  // short cadence so the gauge tracks the live candle (backend fetches fresh).
+  useEffect(() => {
+    load()
+    const id = setInterval(load, 30000)
+    return () => clearInterval(id)
+  }, [load])
+  const RATING_LABEL: Record<string, string> = {
+    strong_buy: 'Strong Buy', buy: 'Buy', neutral: 'Neutral',
+    sell: 'Sell', strong_sell: 'Strong Sell',
+  }
+  const ratingCls = (r: string) => `tech-${r.replace('_', '-')}`
+  const fmtVal = (v: number | null): string => {
+    if (v == null || !Number.isFinite(v)) return '—'
+    const a = Math.abs(v)
+    if (a >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 2 })
+    if (a >= 1) return v.toFixed(2)
+    return v.toFixed(4)
+  }
+  const sigCell = (s: string) => {
+    const map: Record<string, [string, string]> = {
+      buy: ['Buy', 'tech-buy'], sell: ['Sell', 'tech-sell'],
+      neutral: ['Neutral', 'tech-neutral'], 'n/a': ['Unavailable', 'muted'],
+    }
+    const [label, cls] = map[s] ?? ['—', 'muted']
+    return <span className={`tech-sig ${cls}`}>{label}</span>
+  }
+  const gauges: { key: string; title: string; g: Omit<TechGauge, 'items'> }[] = data
+    ? [
+        { key: 'summary', title: 'Summary', g: data.summary },
+        { key: 'oscillators', title: 'Oscillators', g: data.oscillators },
+        { key: 'moving_averages', title: 'Moving Averages', g: data.moving_averages },
+      ]
+    : []
+  const hasData = !!data && data.price != null && data.bars > 0
+  return (
+    <div className="news-panel tech-panel">
+      <div className="news-head">
+        <span>📊 Technicals — {symbol}</span>
+        <span className="news-updated muted">
+          {fetchedAt
+            ? `updated ${new Date(fetchedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+            : ''}
+        </span>
+        <select
+          className="tech-tf"
+          value={tf}
+          onChange={(e) => setTf(e.target.value)}
+          title="Timeframe"
+          aria-label="Technicals timeframe"
+        >
+          {TIMEFRAMES.map((t) => (
+            <option key={t} value={t}>{t}</option>
+          ))}
+        </select>
+        <button type="button" className="btn ghost sm" onClick={load} disabled={loading} title="Refresh technicals">
+          {loading ? '…' : '↻'}
+        </button>
+      </div>
+      <p className="hint tiny news-sub">
+        REAL TradingView-style ratings computed live from candles — 11 oscillators
+        and 15 moving averages, each voting Buy/Sell/Neutral. A “—”/“Unavailable”
+        means an indicator lacks enough history and is dropped from the vote, never
+        faked. The AI weighs this same read.
+      </p>
+      {data?.note && <div className="empty sm">{data.note}</div>}
+      {!hasData && !loading && !data?.note ? (
+        <div className="empty sm">No technicals available yet.</div>
+      ) : hasData ? (
+        <>
+          <div className="tech-price muted">
+            {data!.bars} bars · last {fmtVal(data!.price)} · {data!.timeframe}
+          </div>
+          <div className="tech-gauges">
+            {gauges.map(({ key, title, g }) => (
+              <div key={key} className={`tech-gauge ${ratingCls(g.rating)}`}>
+                <div className="tech-gauge-title">{title}</div>
+                <div className="tech-gauge-rating">{RATING_LABEL[g.rating] ?? g.rating}</div>
+                <div className="tech-meter" aria-hidden="true">
+                  <span className="tech-meter-buy" style={{ flex: g.buy || 0.001 }} />
+                  <span className="tech-meter-neutral" style={{ flex: g.neutral || 0.001 }} />
+                  <span className="tech-meter-sell" style={{ flex: g.sell || 0.001 }} />
+                </div>
+                <div className="tech-gauge-counts">
+                  <span className="tech-buy">{g.buy} buy</span>
+                  <span className="tech-neutral">{g.neutral} neutral</span>
+                  <span className="tech-sell">{g.sell} sell</span>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="tech-tables">
+            {(['oscillators', 'moving_averages'] as const).map((grp) => (
+              <div key={grp} className="tech-table-wrap">
+                <div className="tech-table-h">
+                  {grp === 'oscillators' ? 'Oscillators' : 'Moving Averages'}
+                </div>
+                <table className="tech-table">
+                  <thead>
+                    <tr><th>Indicator</th><th>Value</th><th>Signal</th></tr>
+                  </thead>
+                  <tbody>
+                    {data![grp].items.map((it: TechItem) => (
+                      <tr key={it.name}>
+                        <td>{it.name}</td>
+                        <td className="tech-val">{fmtVal(it.value)}</td>
+                        <td>{sigCell(it.signal)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : null}
+    </div>
+  )
+}
+
 // A live, honest read-out of REAL fundamentals for the active pair: crypto
 // sentiment, the global market, per-coin fundamentals + trailing returns, and
 // derivatives. Every value comes from public data via /api/fundamentals; a null
@@ -5065,6 +5254,7 @@ function FundamentalsPanelImpl({
   const gm = data?.global_market ?? null
   const coin = data?.coin ?? null
   const d = data?.derivatives ?? null
+  const oc = data?.on_chain ?? null
   const fundingNote =
     d?.funding_rate_pct == null
       ? ''
@@ -5073,7 +5263,24 @@ function FundamentalsPanelImpl({
       : d.funding_rate_pct < -0.02
       ? ' (shorts crowded)'
       : ' (near flat)'
-  const nothing = !fg && !gm && !coin && !d
+  const nothing = !fg && !gm && !coin && !d && !oc
+
+  // Raw hashes/second -> EH/s / PH/s / TH/s … (honest "—" when null / PoS).
+  const fmtHash = (v: number | null | undefined): string => {
+    if (v == null || !Number.isFinite(v)) return '—'
+    const units: [string, number][] = [['EH/s', 1e18], ['PH/s', 1e15], ['TH/s', 1e12], ['GH/s', 1e9], ['MH/s', 1e6]]
+    for (const [u, div] of units) if (v >= div) return `${(v / div).toFixed(2)} ${u}`
+    return `${v.toFixed(0)} H/s`
+  }
+  // Large integer counts (tx, addresses, nodes) -> 1.23M / 4.5K.
+  const fmtCount = (v: number | null | undefined): string => {
+    if (v == null || !Number.isFinite(v)) return '—'
+    const a = Math.abs(v)
+    if (a >= 1e9) return `${(v / 1e9).toFixed(2)}B`
+    if (a >= 1e6) return `${(v / 1e6).toFixed(2)}M`
+    if (a >= 1e3) return `${(v / 1e3).toFixed(2)}K`
+    return v.toLocaleString(undefined, { maximumFractionDigits: 0 })
+  }
 
   return (
     <div className="news-panel fund-panel">
@@ -5099,8 +5306,9 @@ function FundamentalsPanelImpl({
       </div>
       <p className="hint tiny news-sub">
         REAL live public data — crypto sentiment, the global market, per-coin
-        fundamentals and derivatives. A “—” means that source was unreachable,
-        never a fabricated number. The AI analyses this same read.
+        fundamentals, derivatives and on-chain network stats. A “—” means that
+        source was unreachable, never a fabricated number. The AI analyses this
+        same read.
       </p>
       {nothing && !loading ? (
         <div className="empty sm">
@@ -5197,6 +5405,18 @@ function FundamentalsPanelImpl({
               <div className="muted tiny">unavailable</div>
             )}
           </div>
+          {oc && (
+            <div className="fund-card">
+              <div className="fund-card-h">On-chain · {oc.chain}</div>
+              <div className="fund-row"><span>Transactions 24h</span><b>{fmtCount(oc.tx_count_24h)}</b></div>
+              <div className="fund-row"><span>Mempool backlog</span><b>{fmtCount(oc.mempool_tx)}</b></div>
+              <div className="fund-row"><span>Avg fee (24h)</span><b>{fmtUsd(oc.avg_fee_usd_24h)}</b></div>
+              <div className="fund-row"><span>Hashrate</span><b>{fmtHash(oc.hashrate_24h)}</b></div>
+              <div className="fund-row"><span>Holding addresses</span><b>{fmtCount(oc.holding_addresses)}</b></div>
+              <div className="fund-row"><span>Largest 24h transfer</span><b>{fmtUsd(oc.largest_tx_usd_24h)}</b></div>
+              <div className="fund-row"><span>Reachable nodes</span><b>{fmtCount(oc.nodes)}</b></div>
+            </div>
+          )}
         </div>
       )}
 

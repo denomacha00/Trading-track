@@ -107,6 +107,7 @@ from app.fundamentals import fetch_fundamentals, summarize_fundamentals
 from app.performance import compute_performance
 from app.strategies import STRATEGY_REGISTRY, build_strategy
 from app.tasks import monitor_loop
+from app.technicals import compute_technicals, summarize_technicals
 from app.ws import Broadcaster
 from app.logging_config import configure_logging
 
@@ -1598,6 +1599,38 @@ def analyze(
     return result
 
 
+@app.get("/api/technicals/{symbol:path}")
+def technicals(
+    symbol: str,
+    timeframe: str = "1h",
+    limit: int = 300,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    """TradingView-style Technicals gauge, computed live from REAL candles.
+
+    A basket of oscillators and a ladder of moving averages each cast a
+    Buy/Sell/Neutral vote (standard indicator rules), aggregated into three
+    rated gauges (Oscillators, Moving Averages, Summary). Every number is
+    computed from the fetched candles — an indicator without enough history is
+    reported as unavailable and dropped from the vote, never faked. ~200+ bars
+    are needed for the full ladder (SMA/EMA 200), so we fetch 300 by default.
+    """
+    engine = _engine_for(db, user)
+    try:
+        raw = engine.connector.fetch_ohlcv(
+            symbol.upper(), timeframe, max(60, min(limit, 1000))
+        )
+    except Exception as exc:
+        raise _upstream_error("OHLCV unavailable", exc)
+    if not raw:
+        raise HTTPException(status_code=502, detail="No candle data returned")
+    df = pd.DataFrame(
+        raw, columns=["timestamp", "open", "high", "low", "close", "volume"]
+    )
+    return compute_technicals(df, symbol.upper(), timeframe)
+
+
 @app.post("/api/ai/ask")
 def ai_ask(
     payload: dict,
@@ -2418,6 +2451,25 @@ def ai_chat(
         except Exception:
             fundamentals = None
 
+    # TradingView-style Technicals gauge (oscillators + MAs -> Buy/Sell/Neutral),
+    # computed live from real candles so the assistant reasons about the SAME
+    # ratings the operator sees rather than guessing. Default on when a symbol is
+    # present; a fetch/compute failure just yields no block, never a 500.
+    technicals_block = None
+    if symbol and payload.get("include_technicals", True):
+        try:
+            raw_tech = engine.connector.fetch_ohlcv(str(symbol).upper(), str(timeframe), 300)
+            if raw_tech:
+                df_tech = pd.DataFrame(
+                    raw_tech,
+                    columns=["timestamp", "open", "high", "low", "close", "volume"],
+                )
+                technicals_block = compute_technicals(
+                    df_tech, str(symbol).upper(), str(timeframe)
+                )
+        except Exception:
+            technicals_block = None
+
     # Prior conversation turns from the browser so the assistant can follow a
     # multi-turn task instead of answering each question cold. Untrusted input:
     # slice to a sane bound here (ai.chat sanitises roles/content and keeps only
@@ -2432,6 +2484,7 @@ def ai_chat(
         bot_context=bot_context,
         news=news or None,
         fundamentals=fundamentals,
+        technicals=technicals_block,
         history=history,
         image=image,
     )

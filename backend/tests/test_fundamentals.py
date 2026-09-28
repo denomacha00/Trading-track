@@ -44,6 +44,20 @@ def _fake_get_json(url, *, params=None, timeout=8.0):
         return {"symbol": "BTCUSDT", "openInterest": "50000.0"}
     if "globalLongShortAccountRatio" in url:
         return [{"longShortRatio": "1.25"}]
+    if "blockchair.com" in url:
+        return {"data": {
+            "transactions_24h": 350000,
+            "mempool_transactions": 12000,
+            "average_transaction_fee_usd_24h": 1.75,
+            "median_transaction_fee_usd_24h": 0.90,
+            "hashrate_24h": "650000000000000000000",  # ~650 EH/s
+            "difficulty": 1.1e14,
+            "hodling_addresses": 52000000,
+            "nodes": 20000,
+            "best_block_height": 880000,
+            "largest_transaction_24h": {"hash": "abc", "value_usd": 125000000},
+            "market_dominance_percentage": 54.0,
+        }}
     raise AssertionError(f"unexpected url {url}")
 
 
@@ -68,6 +82,13 @@ def test_full_snapshot_all_sources(monkeypatch):
     assert d["mark_price"] == pytest.approx(100000.0)
     assert d["open_interest_usd"] == pytest.approx(50000.0 * 100000.0)
     assert d["long_short_ratio"] == pytest.approx(1.25)
+    oc = snap["on_chain"]
+    assert oc is not None and oc["chain"] == "bitcoin"
+    assert oc["tx_count_24h"] == pytest.approx(350000)
+    assert oc["hashrate_24h"] == pytest.approx(6.5e20)
+    assert oc["holding_addresses"] == pytest.approx(52000000)
+    assert oc["largest_tx_usd_24h"] == pytest.approx(125000000)
+    assert oc["nodes"] == pytest.approx(20000)
 
 
 def test_dead_source_is_none_plus_error(monkeypatch):
@@ -134,6 +155,50 @@ def test_stablecoin_skips_derivatives(monkeypatch):
     assert not any("derivatives" in e for e in errors)
 
 
+def test_onchain_present_for_supported_chain(monkeypatch):
+    monkeypatch.setattr(fundamentals, "_get_json", _fake_get_json)
+    snap, errors = fundamentals.fetch_fundamentals("ETH/USDT")
+    oc = snap["on_chain"]
+    assert oc is not None and oc["chain"] == "ethereum"
+    assert not any("on-chain" in e for e in errors)
+
+
+def test_onchain_absent_for_unsupported_chain(monkeypatch):
+    # SOL has a CoinGecko id (coin section populates) but no Blockchair /stats
+    # chain -> on_chain is an honest None with NO error recorded (never faked).
+    monkeypatch.setattr(fundamentals, "_get_json", _fake_get_json)
+    snap, errors = fundamentals.fetch_fundamentals("SOL/USDT")
+    assert snap["coin"] is not None  # coin still populates
+    assert snap["on_chain"] is None
+    assert not any("on-chain" in e for e in errors)
+
+
+def test_onchain_pos_zero_hashrate_dropped(monkeypatch):
+    # A PoS chain reports hashrate 0; we must NOT show a misleading 0 -> None.
+    def fake(url, *, params=None, timeout=8.0):
+        if "blockchair.com" in url:
+            return {"data": {"transactions_24h": 100, "hashrate_24h": "0",
+                             "hodling_addresses": 5}}
+        return _fake_get_json(url, params=params, timeout=timeout)
+    monkeypatch.setattr(fundamentals, "_get_json", fake)
+    snap, _ = fundamentals.fetch_fundamentals("BTC/USDT")
+    oc = snap["on_chain"]
+    assert oc["hashrate_24h"] is None  # dropped, not 0
+    assert oc["tx_count_24h"] == pytest.approx(100)
+
+
+def test_onchain_dead_source_is_none_plus_error(monkeypatch):
+    def fake(url, *, params=None, timeout=8.0):
+        if "blockchair.com" in url:
+            raise httpx.ConnectError("boom")
+        return _fake_get_json(url, params=params, timeout=timeout)
+    monkeypatch.setattr(fundamentals, "_get_json", fake)
+    snap, errors = fundamentals.fetch_fundamentals("BTC/USDT")
+    assert snap["on_chain"] is None
+    assert any("on-chain" in e for e in errors)
+    assert snap["coin"] is not None  # other sections intact
+
+
 def test_cache_avoids_refetch(monkeypatch):
     calls = {"n": 0}
 
@@ -158,6 +223,9 @@ def test_summarize_is_honest_and_nonempty(monkeypatch):
     assert "BTC dominance" in text
     assert "from ATH" in text
     assert "funding" in text.lower()
+    assert "On-chain (bitcoin)" in text  # real blockchain stats reach the AI
+    assert "tx/24h" in text
+    assert "hashrate" in text
     assert "don't claim you" in text  # the anti-disclaimer instruction is present
 
 

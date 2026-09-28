@@ -864,6 +864,7 @@ class AICommentator:
         bot_context: str | None = None,
         news: list[dict] | None = None,
         fundamentals: dict | None = None,
+        technicals: dict | None = None,
         history: Any = None,
         image: dict[str, str] | None = None,
     ) -> str:
@@ -902,6 +903,15 @@ class AICommentator:
             fund_block = summarize_fundamentals(fundamentals)
             if fund_block:
                 blocks.append(fund_block)
+        # TradingView-style Technicals gauge (oscillators + MAs), computed live
+        # from real candles. Deterministic numeric ratings — the assistant should
+        # cite and weigh them, not disclaim them.
+        if technicals:
+            from app.technicals import summarize_technicals
+
+            tech_block = summarize_technicals(technicals)
+            if tech_block:
+                blocks.append(tech_block)
         blocks.append(self._risk_block())
         if news:
             lines = []
