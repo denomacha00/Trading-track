@@ -2537,3 +2537,61 @@ pre.code {
   }
   .chat-fab.open { display: none; }
 }
+
+/* ---- Confirm-before-live approval panel -------------------------------
+   Shown only when the bot has decided a LIVE entry on its own and is waiting
+   for the operator's yes/no. Amber-accented so "real money, not placed yet"
+   reads at a glance; disappears entirely when there's nothing to approve. */
+.panel.autoconfirm {
+  border-color: color-mix(in srgb, var(--warn) 55%, var(--border));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 20%, transparent);
+}
+.panel.autoconfirm .panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--warn);
+}
+.autoconfirm-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.autoconfirm-row:first-of-type { border-top: none; }
+.autoconfirm-info { min-width: 0; flex: 1 1 220px; }
+.autoconfirm-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.autoconfirm-meta {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.autoconfirm-note { margin-top: 4px; font-style: italic; }
+.autoconfirm-actions {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.autoconfirm-actions .btn { min-width: 84px; }
+.pill {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: var(--accent-ink);
+}
+.pill-buy { background: var(--green); }
+.pill-sell { background: var(--red); }
+.warn-text { color: var(--warn); font-weight: 600; }

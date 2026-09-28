@@ -21,7 +21,7 @@ import { Admin } from './Admin'
 import { useSocket } from './useSocket'
 import { useTheme, type Theme } from './theme'
 import { ThemeToggle } from './ThemeToggle'
-import type { AiHealth, Alert, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, IctAnalysis, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
+import type { AiHealth, Alert, AutoConfirmation, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, IctAnalysis, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -596,6 +596,14 @@ function Dashboard({
   // backend, driving the chart markers and the alerts panel. Never fabricated.
   const [alerts, setAlerts] = useState<Alert[]>([])
 
+  // LIVE entries the bot decided on its own and is holding for the operator's
+  // yes/no (confirm-before-live gate). Real proposals from the backend — approving
+  // re-runs the order FRESH; nothing is placed until you say yes. Empty unless the
+  // bot is running live-auto with the gate on and a setup just fired.
+  const [autoConfirms, setAutoConfirms] = useState<AutoConfirmation[]>([])
+  // Ids currently being approved/rejected, so the buttons disable + can't double-fire.
+  const [confirmBusy, setConfirmBusy] = useState<Record<number, boolean>>({})
+
   const showToast = useCallback((kind: 'ok' | 'error', text: string) => {
     setToast({ kind, text })
     // Mirror every toast into the persistent notifications feed so it survives
@@ -687,6 +695,64 @@ function Dashboard({
     }
   }, [])
 
+  // Pending confirm-before-live proposals — refetched when one is queued/resolved
+  // over the socket, after an approve/reject, and on a slow poll as a safety net.
+  const refreshAutoConfirms = useCallback(async () => {
+    try {
+      setAutoConfirms(await api.autoConfirmations())
+    } catch {
+      /* ignore */
+    }
+  }, [])
+
+  // Approve a queued live entry: the backend re-runs the order FRESH (re-priced,
+  // re-sized, re-risk-checked) — a stale snapshot never fires. The toast is the
+  // REAL outcome (it can still be rejected by risk/balance/spread at fire time).
+  const approveConfirm = useCallback(
+    async (id: number) => {
+      if (confirmBusy[id]) return
+      setConfirmBusy((b) => ({ ...b, [id]: true }))
+      try {
+        const res = await api.approveConfirmation(id)
+        showToast(res.ok ? 'ok' : 'error', res.message)
+        await refreshAutoConfirms()
+        if (res.ok) refreshTrades()
+      } catch (e) {
+        showToast('error', e instanceof Error ? e.message : 'Approve failed')
+      } finally {
+        setConfirmBusy((b) => {
+          const next = { ...b }
+          delete next[id]
+          return next
+        })
+      }
+    },
+    [confirmBusy, showToast, refreshAutoConfirms, refreshTrades],
+  )
+
+  // Reject a queued live entry: nothing is placed and the bot backs off before
+  // re-proposing the same symbol (so it can't nag every tick).
+  const rejectConfirm = useCallback(
+    async (id: number) => {
+      if (confirmBusy[id]) return
+      setConfirmBusy((b) => ({ ...b, [id]: true }))
+      try {
+        const res = await api.rejectConfirmation(id)
+        showToast(res.ok ? 'ok' : 'error', res.message)
+        await refreshAutoConfirms()
+      } catch (e) {
+        showToast('error', e instanceof Error ? e.message : 'Reject failed')
+      } finally {
+        setConfirmBusy((b) => {
+          const next = { ...b }
+          delete next[id]
+          return next
+        })
+      }
+    },
+    [confirmBusy, showToast, refreshAutoConfirms],
+  )
+
   // Settings load is its own callback so the Settings panel can retry it after
   // a failed fetch instead of being stuck on "Loading…" forever (the fetch
   // failing is distinct from it still being in flight).
@@ -763,6 +829,25 @@ function Dashboard({
         showToast('ok', `Pre-trade check — ${d.symbol}`)
         speak(d.text)
       }
+      if (m.event === 'auto_confirm_pending') {
+        // The bot wants to open a LIVE position and is asking first. Pull the fresh
+        // pending list so the approve/reject panel lights up, and call it out loudly
+        // (toast + voice + transcript) so an operator watching the market all night
+        // doesn't miss it. Nothing is placed until they approve.
+        const d = m.data
+        refreshAutoConfirms()
+        const conf = d.confidence != null ? ` (${Math.round(d.confidence * 100)}% conf)` : ''
+        const line = `Bot wants to BUY ${d.symbol} @ ~${fmt(d.ref_price)}${conf} — approve it to place, or it expires.`
+        setTurns((t) => [...t, { role: 'ai', text: line, live: true, ts: Date.now() } as ChatMsg].slice(-200))
+        showToast('error', line)
+        speak(`The bot wants to buy ${d.symbol}. Approve it to place the trade.`)
+      }
+      if (m.event === 'auto_confirm_resolved') {
+        // A queued entry was approved / rejected / expired — refresh the panel (and
+        // trades, since an approval may have opened a real position).
+        refreshAutoConfirms()
+        refreshTrades()
+      }
     },
   })
 
@@ -836,7 +921,8 @@ function Dashboard({
     refreshTrades()
     refreshSignals()
     refreshAlerts()
-  }, [loadSettings, refreshAccess, loadAiHealth, refreshTrades, refreshSignals, refreshAlerts, applyStatus])
+    refreshAutoConfirms()
+  }, [loadSettings, refreshAccess, loadAiHealth, refreshTrades, refreshSignals, refreshAlerts, refreshAutoConfirms, applyStatus])
 
   // Pull the REAL tradable pairs from the exchange once, so the symbol picker
   // reflects what actually exists on Binance instead of a hardcoded guess. If
@@ -874,6 +960,15 @@ function Dashboard({
     const id = setInterval(refreshAlerts, 30000)
     return () => clearInterval(id)
   }, [refreshAlerts])
+
+  // Safety-net poll for pending confirm-before-live proposals. They're pushed over
+  // the socket (auto_confirm_pending / _resolved), but a dropped socket could miss
+  // one — and a proposal EXPIRES server-side, so a periodic pull keeps the panel
+  // honest (an expired row disappears) even if the tab was idle. Cheap GET.
+  useEffect(() => {
+    const id = setInterval(refreshAutoConfirms, 20000)
+    return () => clearInterval(id)
+  }, [refreshAutoConfirms])
 
   // Real horizontal levels to MARK on the chart for the CURRENT symbol: each
   // ARMED price alert, plus every OPEN position's entry / stop-loss / take-profit.
@@ -1577,6 +1672,13 @@ function Dashboard({
             exchange={access?.exchange}
             liveBook={streamingLive ? stream.book : null}
             streaming={streamingLive}
+          />
+
+          <AutoConfirmPanel
+            items={autoConfirms}
+            busy={confirmBusy}
+            onApprove={approveConfirm}
+            onReject={rejectConfirm}
           />
 
           <AlertsPanel
@@ -2698,6 +2800,111 @@ function OrderBook({
             </div>
           </div>
         )}
+      </div>
+    </section>
+  )
+}
+
+// A queued LIVE entry the bot decided on its own, awaiting the operator's yes/no
+// (confirm-before-live gate). Formats how long a proposal stays approvable.
+function fmtExpiry(expiresAt: string | null, now: number): string {
+  if (!expiresAt) return ''
+  const ms = new Date(expiresAt).getTime() - now
+  if (!Number.isFinite(ms)) return ''
+  if (ms <= 0) return 'expiring…'
+  const totalSec = Math.round(ms / 1000)
+  const m = Math.floor(totalSec / 60)
+  const s = totalSec % 60
+  return m > 0 ? `expires in ${m}m ${s}s` : `expires in ${s}s`
+}
+
+// The confirm-before-live approval panel: when the bot decides a LIVE entry on
+// its own and the gate is on, it QUEUES the order and pings the operator instead
+// of placing it ("it can trade real market but it will confirm when given
+// permission"). Each row shows the REAL proposal (symbol, size + reference price
+// at proposal time, stop, confidence, timeframe, note) and a live expiry
+// countdown. Approving re-runs the order FRESH server-side (re-priced, re-sized,
+// re-risk-checked) — a stale snapshot never fires; rejecting places nothing.
+// Renders nothing when there's no pending proposal, so it stays out of the way.
+function AutoConfirmPanel({
+  items,
+  busy,
+  onApprove,
+  onReject,
+}: {
+  items: AutoConfirmation[]
+  busy: Record<number, boolean>
+  onApprove: (id: number) => void
+  onReject: (id: number) => void
+}) {
+  // Tick every second while there are proposals, so the expiry countdown is live
+  // (the list itself only refetches on socket events / the 20s safety poll).
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (items.length === 0) return
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [items.length])
+
+  if (items.length === 0) return null
+
+  return (
+    <section className="panel autoconfirm">
+      <div className="panel-head">
+        <span>⚠️ Approve live trade{items.length > 1 ? `s (${items.length})` : ''}</span>
+        <span className="hint">bot-decided · real money · not placed yet</span>
+      </div>
+      <div className="panel-body">
+        <p className="hint" style={{ marginTop: 0 }}>
+          The bot wants to open {items.length > 1 ? 'these LIVE positions' : 'this LIVE position'} on
+          its own. Nothing is placed until you approve. On approval it re-checks the
+          price, size and risk against the market <b>right now</b> — so a stale idea
+          never fires. You can turn this off in Settings to let it trade alone.
+        </p>
+        {items.map((c) => {
+          const isBusy = !!busy[c.id]
+          const exp = fmtExpiry(c.expires_at, now)
+          const expiring = c.expires_at != null && new Date(c.expires_at).getTime() - now < 60000
+          return (
+            <div key={c.id} className="autoconfirm-row">
+              <div className="autoconfirm-info">
+                <div className="autoconfirm-title">
+                  <span className={`pill ${c.side === 'buy' ? 'pill-buy' : 'pill-sell'}`}>
+                    {c.side.toUpperCase()}
+                  </span>
+                  <b>{c.symbol}</b>
+                  <span className="hint">
+                    {c.amount > 0 ? `${c.amount} @ ~${fmtPx(c.ref_price)}` : `@ ~${fmtPx(c.ref_price)}`}
+                  </span>
+                </div>
+                <div className="autoconfirm-meta hint">
+                  {c.confidence != null && <span>conf {Math.round(c.confidence * 100)}%</span>}
+                  {c.timeframe && <span>· {c.timeframe}</span>}
+                  {c.stop_loss != null && <span>· stop {fmtPx(c.stop_loss)}</span>}
+                  {c.take_profit != null && <span>· target {fmtPx(c.take_profit)}</span>}
+                  {exp && <span className={expiring ? 'warn-text' : ''}>· {exp}</span>}
+                </div>
+                {c.note && <div className="autoconfirm-note hint">{c.note}</div>}
+              </div>
+              <div className="autoconfirm-actions">
+                <button
+                  className="btn buy"
+                  disabled={isBusy}
+                  onClick={() => onApprove(c.id)}
+                >
+                  {isBusy ? '…' : 'Approve'}
+                </button>
+                <button
+                  className="btn ghost"
+                  disabled={isBusy}
+                  onClick={() => onReject(c.id)}
+                >
+                  Reject
+                </button>
+              </div>
+            </div>
+          )
+        })}
       </div>
     </section>
   )
@@ -5747,6 +5954,8 @@ function SettingsPanel({
         auto_symbols: form.auto_symbols,
         auto_timeframe: form.auto_timeframe,
         auto_confirm_timeframe: form.auto_confirm_timeframe,
+        auto_live_confirm: form.auto_live_confirm,
+        auto_confirm_ttl_minutes: form.auto_confirm_ttl_minutes,
         use_saved_strategy: form.use_saved_strategy,
         ai_trade_confirm: form.ai_trade_confirm,
         ai_monitor_enabled: form.ai_monitor_enabled,
@@ -5997,6 +6206,36 @@ function SettingsPanel({
         symbol and only opens a long (or exits one) when confidence clears the
         threshold. Higher confidence = fewer, higher-conviction trades.{' '}
         {form.ai_enabled ? `✅ AI commentary is configured${form.ai_model ? ` (${form.ai_model}${form.ai_style ? `, ${form.ai_style}` : ''})` : ''}.` : 'AI commentary is off (set AI_API_KEY to enable).'}
+      </p>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={form.auto_live_confirm}
+          onChange={(e) => setForm({ ...form, auto_live_confirm: e.target.checked })}
+        />
+        Confirm before every LIVE auto-trade (ask me before spending real money)
+      </label>
+      <div className="row">
+        <div className="field">
+          <label>Approval window (minutes)</label>
+          <NumField
+            className="input"
+            value={form.auto_confirm_ttl_minutes}
+            onChange={setNum('auto_confirm_ttl_minutes')}
+            inputMode="decimal"
+          />
+        </div>
+      </div>
+      <p className="hint">
+        On by default. When on, a trade the bot decides <b>on its own</b> on a
+        <b> live</b> account isn't placed straight away — it's queued and you're
+        pinged (here, and on Telegram if notifications are on) to <b>Approve</b> or
+        <b> Reject</b> it. Approving re-checks the price, size and risk against the
+        market right then, so a stale idea never fires; if you don't answer within
+        the approval window it expires. This never touches paper trades, your own
+        manual orders, or an <b>exit</b> (a protective stop/close always fires at
+        once). Turn it <b>off</b> to let the bot trade the night alone — its
+        stop-loss still protects every position.
       </p>
       <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <input

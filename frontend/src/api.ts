@@ -5,7 +5,9 @@ import type {
   Candle,
   AiHealth,
   Alert,
+  AutoConfirmation,
   CloseAllResult,
+  ConfirmationResolveResult,
   ExchangeAccess,
   ExecutionResult,
   LicenseKeyCreated,
@@ -305,4 +307,19 @@ export const api = {
   }) => req<Alert>('/api/alerts', { method: 'POST', body: JSON.stringify(body) }),
   deleteAlert: (id: number) =>
     req<{ deleted: number }>(`/api/alerts/${id}`, { method: 'DELETE' }),
+
+  // ---- confirm-before-live (autonomous entries awaiting your yes/no) ----
+  // The bot may decide a LIVE entry on its own; when the gate is on it QUEUES it
+  // and pings you instead of placing. These list/approve/reject those proposals.
+  // Approving re-runs the order FRESH (re-priced, re-sized, re-risk-checked) so a
+  // stale snapshot never fires; rejecting drops it. Newest first.
+  autoConfirmations: () => req<AutoConfirmation[]>('/api/auto/confirmations'),
+  approveConfirmation: (id: number) =>
+    req<ConfirmationResolveResult>(`/api/auto/confirmations/${id}/approve`, {
+      method: 'POST',
+    }),
+  rejectConfirmation: (id: number) =>
+    req<ConfirmationResolveResult>(`/api/auto/confirmations/${id}/reject`, {
+      method: 'POST',
+    }),
 }

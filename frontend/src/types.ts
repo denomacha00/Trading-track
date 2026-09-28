@@ -44,8 +44,39 @@ export interface BotStatus {
   // the bot is stopped); `entries_pause_reason` is the plain-language why.
   entries_paused?: boolean
   entries_pause_reason?: string | null
+  // Confirm-before-live gate + how many autonomous LIVE entries are waiting for
+  // the operator's yes/no right now. Optional so older payloads still parse.
+  auto_live_confirm?: boolean
+  pending_confirmations?: number
   // Per-symbol regime snapshots, keyed by SYMBOL. Empty until analysed.
   regimes?: Record<string, RegimeSnapshot>
+}
+
+// A LIVE entry the bot proposed on its own and is holding for the operator's
+// yes/no (mirrors the backend AutoConfirmationOut). `amount`/`ref_price` are the
+// snapshot AT PROPOSAL TIME — shown for context; the real fill is re-priced and
+// re-sized when approved. Nothing here is fabricated.
+export interface AutoConfirmation {
+  id: number
+  symbol: string
+  side: string
+  amount: number
+  ref_price: number
+  stop_loss: number | null
+  take_profit: number | null
+  confidence: number | null
+  timeframe: string | null
+  note: string | null
+  status: string
+  created_at: string | null
+  expires_at: string | null
+}
+
+// Outcome of approving/rejecting a queued live entry.
+export interface ConfirmationResolveResult {
+  ok: boolean
+  message: string
+  trade_id: number | null
 }
 
 export interface Trade {
@@ -186,6 +217,15 @@ export interface Settings {
   auto_symbols: string
   auto_timeframe: string
   auto_confirm_timeframe: string
+  // Confirm-before-LIVE: when on, an autonomous (bot-decided) BUY on a REAL-money
+  // account is QUEUED and you're pinged to approve it — it is NOT placed until you
+  // say yes ("it can trade real market but it will confirm when given permission").
+  // Never gates paper, exits/closes, or your own manual orders. Turn OFF to let it
+  // trade alone. On by default. `auto_confirm_ttl_minutes` is how long a queued
+  // proposal stays approvable before it expires (so a late yes can't fire into a
+  // moved market).
+  auto_live_confirm: boolean
+  auto_confirm_ttl_minutes: number
   // When on, the bot trades a symbol with the strategy you trained and SAVED for
   // it (instead of the built-in analyzer brain). Capital-preservation gates still
   // override its BUY in a bear regime; its SELL/exit is always honoured.
@@ -687,6 +727,41 @@ export type WsMessage =
   | { event: 'pretrade_analysis'; data: { symbol: string; text: string; confidence: number } }
   | { event: 'reconcile_closed'; data: { symbol: string; db_amount: number; exchange_amount: number; pnl: number } }
   | { event: 'reconcile_adjusted'; data: { symbol: string; db_amount: number; exchange_amount: number } }
+  // The bot decided a LIVE entry on its own and is holding it for your yes/no
+  // (confirm-before-live gate). `data` carries the proposal snapshot so the UI can
+  // show it immediately; the real fill is re-priced/re-sized on approval. Routed
+  // per-user by `user_id`.
+  | {
+      event: 'auto_confirm_pending'
+      user_id?: number
+      data: {
+        id: number
+        symbol: string
+        side: string
+        amount: number
+        ref_price: number
+        stop_loss: number | null
+        confidence: number | null
+        timeframe: string | null
+        note: string | null
+        expires_at: string
+      }
+    }
+  // A queued live entry was resolved (approved / rejected / expired), so the UI
+  // should refresh its pending list. `ok`/`trade_id`/`message` are present on an
+  // approval outcome. Routed per-user by `user_id`.
+  | {
+      event: 'auto_confirm_resolved'
+      user_id?: number
+      data: {
+        id: number
+        symbol: string
+        status: 'approved' | 'rejected' | 'expired'
+        ok?: boolean
+        trade_id?: number | null
+        message?: string
+      }
+    }
   | {
       event: 'signal'
       data: {
