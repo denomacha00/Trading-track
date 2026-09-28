@@ -304,6 +304,44 @@ class Settings(BaseSettings):
     # pure lens again (drawn/narrated only). Requires ict_enabled.
     ict_confluence: bool = Field(default=True)
 
+    # ---- CAPITAL / MONEY MANAGER (autonomous sizing discipline) ----------
+    # A beginner-safe money manager that sits ON TOP of the risk manager and
+    # governs how the AUTOPILOT deploys capital. It can only ever deploy the SAME
+    # or LESS than the risk manager's risk-based size (never more), so turning it
+    # on is always at least as safe as leaving it off. See app/money_manager.py.
+    # Master switch. ON by default: with no run budget set (below = 0) it behaves
+    # like the plain risk-based sizer, only trimming size after a losing streak —
+    # strictly safer. Set a run budget to unlock partial-deploy / reserve.
+    capital_manager_enabled: bool = Field(default=True)
+    # Total quote (e.g. USDT) the autopilot may put to work THIS run. 0 = no
+    # explicit budget: deploy from free cash as usual (risk-capped). Set e.g. 20
+    # to say "trade with $20 tonight" — the bot then feeds it in a slice at a time
+    # and always holds the rest in reserve.
+    capital_run_budget_quote: float = Field(default=0.0)
+    # Fraction of what's STILL FREE this run to commit to a single trade (partial
+    # deploy). 25% => first trade uses a quarter, holding three-quarters back; the
+    # next uses a quarter of what's left, and so on — capital is fed in, never
+    # dumped. Bounded above by the risk-based size, so it only ever reserves more.
+    capital_per_trade_pct: float = Field(default=25.0)
+    # Don't place an autopilot trade smaller than this in quote terms (avoids dust
+    # orders the exchange would reject). If less than this remains free, the bot
+    # HOLDS rather than open a sub-minimum position.
+    capital_min_trade_quote: float = Field(default=5.0)
+    # Grow the per-trade slice a little after a winning streak and cut it (faster)
+    # after losses, within hard [0.5x, 1.5x] bounds. Discipline: a cold run trades
+    # smaller automatically. Uses REAL closed-trade P&L only.
+    capital_resize_on_outcome: bool = Field(default=True)
+    # Per-trade max hold (minutes) for AUTOPILOT trades: a position still open
+    # after this long is closed at market ("time-stop"), freeing capital rather
+    # than letting a trade drift for hours. 0 = off (no time-based exit). Applies
+    # only to source="auto" trades; manual trades are never time-stopped.
+    capital_max_hold_minutes: float = Field(default=0.0)
+    # Hold this % of the day's realised profit OUT of the redeployable budget, so
+    # booked gains aren't immediately re-risked. 0 = off. (The bot can't move money
+    # off the exchange — trade-only keys — so it reserves profit and reminds you to
+    # withdraw it yourself.)
+    capital_profit_reserve_pct: float = Field(default=0.0)
+
     # Background MONITOR cadence (seconds between ticks): how often the engine
     # re-checks open positions (stops/targets/profit-lock), evaluates alerts, and
     # runs autonomous analysis. Lower = more responsive but more exchange calls;

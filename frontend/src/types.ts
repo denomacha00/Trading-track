@@ -263,6 +263,33 @@ export interface Settings {
   // inventing a level, computed on closed bars so it can't repaint. Off = ICT is
   // a pure lens (drawn / narrated only). On by default.
   ict_confluence: boolean
+  // ---- Capital / money manager (disciplined autopilot sizing) ----
+  // When on, autonomous BUYS are sized by the money manager (on TOP of the risk
+  // manager, never above it): a per-run budget is deployed a slice at a time with
+  // the rest held in reserve, the slice re-sizes on recent outcomes, a cut of the
+  // day's profit is held back, and an optional max-hold time-stop closes an aged
+  // auto trade. It can only ever deploy the SAME or LESS than the risk-based size,
+  // so turning it on is always at least as safe as off. On by default; with the
+  // budget at 0 it just tracks the risk-based size (trimming after a losing run).
+  capital_manager_enabled: boolean
+  // Max quote (e.g. USDT) the autopilot may put to work this run. 0 = no fixed
+  // budget: it sizes from free equity instead (still risk-capped).
+  capital_run_budget_quote: number
+  // Slice of the still-free budget to deploy on ONE entry (holds the rest back).
+  capital_per_trade_pct: number
+  // Never place an auto entry smaller than this (quote); below it the bot HOLDS
+  // rather than send a dust order.
+  capital_min_trade_quote: number
+  // Grow the slice a little after a winning run, cut it (faster) after losses.
+  capital_resize_on_outcome: boolean
+  // Close an AUTO position once it has been open this many minutes (the "trade for
+  // 4 min or 1 hr" time-box). 0 = off (positions run to stop/target only). Never
+  // touches your manual trades. Protective SL/TP still win a tie.
+  capital_max_hold_minutes: number
+  // Hold this % of the day's REALISED profit OUT of the redeployable budget so
+  // booked gains aren't immediately re-risked. 0 = off. (The bot can't move money
+  // off your exchange — withdrawals are always yours to make there.)
+  capital_profit_reserve_pct: number
   // ---- Autopilot safety / pause-resume (safe defaults for non-traders) ----
   // Stand aside for NEW longs while price is in a bear regime; resume in a bull.
   // On by default — capital preservation is the safe stance.

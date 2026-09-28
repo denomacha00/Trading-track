@@ -23,6 +23,7 @@ from app.analysis import MarketAnalyzer
 from app.ai import AICommentator
 from app.models import AutoConfirmation, SignalLog, Trade, TradeStatus, _as_utc
 from app.risk import RiskManager
+from app.money_manager import MoneyManager
 from app.notifier import Notifier
 from app.strategies import build_strategy
 from app.state import (
@@ -52,6 +53,10 @@ class TradingEngine:
         self.connector = connector
         self.user_id = user_id
         self.risk = RiskManager(settings, user_id=user_id)
+        # Money manager: disciplined capital deployment for the autopilot. Sits on
+        # top of the risk manager and can only ever deploy the same or less (see
+        # app/money_manager.py). Reads settings live via update().
+        self.money = MoneyManager(settings, user_id=user_id, risk=self.risk)
         self.analyzer = MarketAnalyzer(
             min_confidence=settings.min_signal_confidence,
             ict_confluence=bool(getattr(settings, "ict_enabled", True))
@@ -157,6 +162,7 @@ class TradingEngine:
                 if hasattr(self.settings, key):
                     setattr(self.settings, key, value)
             self.risk.update(self.settings)
+            self.money.update(self.settings)
             self.connector.reload(self.settings)
             self.analyzer.min_confidence = self.settings.min_signal_confidence
             self.analyzer.ict_confluence = bool(
@@ -279,6 +285,7 @@ class TradingEngine:
     def apply_settings(self, settings: Settings, db: Session | None = None) -> None:
         self.settings = settings
         self.risk.update(settings)
+        self.money.update(settings)
         self.connector.reload(settings)
         self.analyzer.min_confidence = settings.min_signal_confidence
         self.analyzer.ict_confluence = bool(
@@ -1091,6 +1098,44 @@ class TradingEngine:
                     "now (price feed unavailable) — holding new entries until it "
                     "recovers."
                 ), None
+            # ---- CAPITAL / MONEY MANAGER (autopilot sizing) ---------------
+            # For an AUTOPILOT entry with no explicit size, let the money manager
+            # decide how much of the run budget to actually deploy (partial deploy
+            # + held reserve + outcome re-sizing). It can only ever deploy the SAME
+            # or LESS than the risk manager's own risk-based size: we first ask the
+            # risk manager for that already-capped size (a probe with amount=None,
+            # which clamps to every cap), then hand it to the money manager as the
+            # ceiling. The authoritative risk.check below re-validates the reduced
+            # amount. Never touches manual/webhook orders or exits. See money_manager.py.
+            if (
+                amount is None
+                and action == "buy"
+                and source == "auto"
+                and self.money.enabled
+            ):
+                probe = self.risk.check(
+                    db,
+                    equity=equity,
+                    price=ref_price,
+                    requested_amount=None,
+                    is_opening=True,
+                    stop_price=stop_loss,
+                    day_unrealized=day_unrealized,
+                    equity_for_limits=equity_for_limits,
+                    unattended=True,
+                )
+                if not probe.allowed:
+                    return False, f"Rejected by risk manager: {probe.reason}", None
+                planned = self.money.plan_amount(
+                    db, equity=equity, price=ref_price, risk_based_qty=probe.amount
+                )
+                if planned <= 0:
+                    return False, (
+                        "Capital manager: this run's budget is fully deployed — "
+                        "holding new entries until a position closes or profit is "
+                        "booked. Raise the run budget or per-trade % to deploy more."
+                    ), None
+                amount = planned
             decision = self.risk.check(
                 db,
                 equity=equity,
@@ -2281,6 +2326,57 @@ class TradingEngine:
             return self._cap_fill_at_level(trade.side, hit, observed, trade.take_profit)
         return observed
 
+    def _capital_time_stop_due(self, trade: Trade) -> bool:
+        """True if this AUTOPILOT trade has been open past the money manager's
+        per-trade max-hold (capital_max_hold_minutes). Manual trades and a 0/off
+        setting are never time-stopped; a missing timestamp is treated as not due.
+        """
+        if not getattr(self.settings, "capital_manager_enabled", True):
+            return False
+        if trade.source != "auto":
+            return False
+        mins = float(getattr(self.settings, "capital_max_hold_minutes", 0.0) or 0.0)
+        if mins <= 0:
+            return False
+        opened = _as_utc(trade.opened_at)
+        if opened is None:
+            return False
+        age_min = (_utcnow() - opened).total_seconds() / 60.0
+        return age_min >= mins
+
+    def _maybe_profit_reserve_note(self, db: Session) -> None:
+        """Once a day, when a profit reserve is active and the day is green, tell
+        the operator how much profit is being held back from redeployment and to
+        withdraw it themselves (the bot can't move money off the exchange). Best-
+        effort and deduped per day; never raises into the monitor loop.
+        """
+        try:
+            pct = float(getattr(self.settings, "capital_profit_reserve_pct", 0.0) or 0.0)
+            if pct <= 0:
+                return
+            today = _utcnow().date()
+            if getattr(self, "_profit_note_day", None) == today:
+                return
+            profit = self.risk.day_realized_pnl(db)
+            if profit <= 0:
+                return
+            self._profit_note_day = today
+            reserved = profit * pct / 100.0
+            mode = "paper" if not self.settings.is_live else "live"
+            self._emit(
+                "profit_reserve",
+                {"profit": round(profit, 2), "reserved": round(reserved, 2),
+                 "pct": pct, "mode": mode},
+            )
+            self._notify(
+                f"💰 Up {profit:.2f} today ({mode}). Holding {reserved:.2f} "
+                f"({pct:g}%) of that profit in reserve — the autopilot won't "
+                f"re-risk it. To bank it, withdraw on your exchange: the bot "
+                f"can't move your funds (trade-only keys)."
+            )
+        except Exception:  # a notification must never break monitoring
+            pass
+
     # ---- monitoring (stop-loss / take-profit) ------------------------
 
     def check_open_positions(self, db: Session) -> list[tuple[Trade, str]]:
@@ -2337,11 +2433,19 @@ class TradingEngine:
                     hit = "take-profit"
             if hit is None and self._should_take_profit_on_reversal(db, trade, price):
                 hit = "reversal"
+            # Money-manager per-trade max-hold: close an AUTOPILOT position that has
+            # been open past capital_max_hold_minutes, freeing the capital. Only
+            # after SL/TP/reversal so a protective exit always wins the tie.
+            if hit is None and self._capital_time_stop_due(trade):
+                hit = "time-stop"
             if hit:
-                reason = (
-                    "banked profit on confirmed reversal"
-                    if hit == "reversal" else f"{hit} triggered"
-                )
+                if hit == "reversal":
+                    reason = "banked profit on confirmed reversal"
+                elif hit == "time-stop":
+                    mins = float(getattr(self.settings, "capital_max_hold_minutes", 0) or 0)
+                    reason = f"max hold time reached ({mins:g} min)"
+                else:
+                    reason = f"{hit} triggered"
                 # Paper books at the level (capped on overshoot) so a gap past the
                 # stop/target can't fabricate a better- or worse-than-real fill;
                 # live passes None so the REAL exchange fill governs.
@@ -2357,6 +2461,9 @@ class TradingEngine:
                 self._reversal_flags.pop(trade.id, None)
                 if ok:
                     closed.append((trade, hit))
+        # A close just booked P&L: maybe remind the operator about held profit.
+        if closed:
+            self._maybe_profit_reserve_note(db)
         return closed
 
     def _move_exchange_stop(self, trade: Trade, new_stop: float) -> None:

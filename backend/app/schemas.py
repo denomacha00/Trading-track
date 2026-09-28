@@ -257,6 +257,14 @@ class SettingsOut(BaseModel):
     ai_autopilot_enabled: bool = False
     ict_enabled: bool = True
     ict_confluence: bool = True
+    # Capital / money manager (autopilot sizing discipline).
+    capital_manager_enabled: bool = True
+    capital_run_budget_quote: float = 0.0
+    capital_per_trade_pct: float = 25.0
+    capital_min_trade_quote: float = 5.0
+    capital_resize_on_outcome: bool = True
+    capital_max_hold_minutes: float = 0.0
+    capital_profit_reserve_pct: float = 0.0
     ai_enabled: bool
     ai_model: str = ""
     ai_style: str = ""
@@ -302,6 +310,14 @@ class SettingsUpdate(BaseModel):
     ai_autopilot_enabled: Optional[bool] = None
     ict_enabled: Optional[bool] = None
     ict_confluence: Optional[bool] = None
+    # Capital / money manager (autopilot sizing discipline).
+    capital_manager_enabled: Optional[bool] = None
+    capital_run_budget_quote: Optional[float] = Field(default=None, ge=0, le=1_000_000)
+    capital_per_trade_pct: Optional[float] = Field(default=None, gt=0, le=100)
+    capital_min_trade_quote: Optional[float] = Field(default=None, ge=0, le=1_000_000)
+    capital_resize_on_outcome: Optional[bool] = None
+    capital_max_hold_minutes: Optional[float] = Field(default=None, ge=0, le=100_000)
+    capital_profit_reserve_pct: Optional[float] = Field(default=None, ge=0, le=100)
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=100)
     max_total_exposure_pct: Optional[float] = Field(default=None, ge=0, le=1000)
     max_position_pct: Optional[float] = Field(default=None, ge=0, le=100)

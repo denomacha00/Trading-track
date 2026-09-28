@@ -5963,6 +5963,13 @@ function SettingsPanel({
         ai_pretrade_analysis: form.ai_pretrade_analysis,
         ict_enabled: form.ict_enabled,
         ict_confluence: form.ict_confluence,
+        capital_manager_enabled: form.capital_manager_enabled,
+        capital_run_budget_quote: form.capital_run_budget_quote,
+        capital_per_trade_pct: form.capital_per_trade_pct,
+        capital_min_trade_quote: form.capital_min_trade_quote,
+        capital_resize_on_outcome: form.capital_resize_on_outcome,
+        capital_max_hold_minutes: form.capital_max_hold_minutes,
+        capital_profit_reserve_pct: form.capital_profit_reserve_pct,
         auto_pause_in_bear: form.auto_pause_in_bear,
         require_strategy_validation: form.require_strategy_validation,
         strategy_min_return_pct: form.strategy_min_return_pct,
@@ -6432,6 +6439,100 @@ function SettingsPanel({
         action, never a claim.{' '}
         {form.ai_enabled ? '' : 'Add an AI key (Credentials) to enable this.'}
       </p>
+
+      <div className="panel-head" style={{ paddingLeft: 0, borderBottom: 'none' }}>
+        Capital manager (disciplined autopilot sizing)
+      </div>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={form.capital_manager_enabled}
+          onChange={(e) =>
+            setForm({ ...form, capital_manager_enabled: e.target.checked })
+          }
+        />
+        Let the bot manage the money (budget, staged deploys, reserve)
+      </label>
+      <p className="hint">
+        Sits <b>on top of</b> the risk manager, never above it — it can only ever
+        deploy the <b>same or less</b> than the risk-based size, so turning it on is
+        always at least as safe as off. Give it a <b>run budget</b> and it feeds the
+        money in a slice at a time (holding the rest back), trades{' '}
+        <b>smaller after losses</b>, and can hold part of the day's profit in
+        reserve. With the budget at <b>0</b> it simply tracks the risk-based size.
+        Only governs the <b>autopilot</b> — your manual orders are never resized.
+      </p>
+      {form.capital_manager_enabled && (
+        <>
+          <div className="row">
+            <div className="field">
+              <label>Run budget (USDT, 0 = use free equity)</label>
+              <NumField
+                className="input"
+                value={form.capital_run_budget_quote}
+                onChange={setNum('capital_run_budget_quote')}
+                inputMode="decimal"
+              />
+            </div>
+            <div className="field">
+              <label>Deploy per entry %</label>
+              <NumField
+                className="input"
+                value={form.capital_per_trade_pct}
+                onChange={setNum('capital_per_trade_pct')}
+                inputMode="decimal"
+              />
+            </div>
+          </div>
+          <div className="row">
+            <div className="field">
+              <label>Min trade size (USDT)</label>
+              <NumField
+                className="input"
+                value={form.capital_min_trade_quote}
+                onChange={setNum('capital_min_trade_quote')}
+                inputMode="decimal"
+              />
+            </div>
+            <div className="field">
+              <label>Max hold (minutes, 0 = off)</label>
+              <NumField
+                className="input"
+                value={form.capital_max_hold_minutes}
+                onChange={setNum('capital_max_hold_minutes')}
+                inputMode="numeric"
+              />
+            </div>
+          </div>
+          <div className="field" style={{ maxWidth: 280 }}>
+            <label>Profit reserve % (held out of the budget)</label>
+            <NumField
+              className="input"
+              value={form.capital_profit_reserve_pct}
+              onChange={setNum('capital_profit_reserve_pct')}
+              inputMode="decimal"
+            />
+          </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <input
+              type="checkbox"
+              checked={form.capital_resize_on_outcome}
+              onChange={(e) =>
+                setForm({ ...form, capital_resize_on_outcome: e.target.checked })
+              }
+            />
+            Re-size on recent outcomes (grow after wins, shrink faster after losses)
+          </label>
+          <p className="hint">
+            <b>Max hold</b> is your "trade for 4 min or 1 hr" time-box: an auto
+            position is closed once it's been open that long (your stop/target still
+            win a tie; manual trades are never touched). <b>Profit reserve</b> keeps
+            that share of the day's <b>realised</b> profit out of what can be
+            re-deployed — the bot can't move money off your exchange, so any actual
+            withdrawal is always yours to make there.
+          </p>
+        </>
+      )}
 
       <div className="panel-head" style={{ paddingLeft: 0, borderBottom: 'none' }}>
         Capital preservation &amp; profit-taking (hands-off safety)
