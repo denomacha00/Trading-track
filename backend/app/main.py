@@ -1560,7 +1560,9 @@ def ohlcv(
 ):
     engine = _engine_for(db, user)
     try:
-        raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, max(1, min(limit, 1000)))
+        # Up to 5000 bars: the chart's deep-history ("year+") depth picker. The
+        # connector stitches several capped exchange calls for anything > 1000.
+        raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, max(1, min(limit, 5000)))
     except Exception as exc:
         raise _upstream_error("OHLCV unavailable", exc)
     return [

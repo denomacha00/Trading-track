@@ -29,6 +29,13 @@ import type { AiHealth, Alert, AutoConfirmation, BotStatus, BacktestResult, Cand
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d', '1w']
 
+// Chart history depth (bars) the user can request — TradingView-paid "extended
+// history" parity. The backend stitches several capped exchange calls for the
+// deeper picks, so 5000 real bars is a year+ on the higher timeframes. Bigger
+// depths poll less often (see the candle loader) to stay light on the venue.
+const HISTORY_DEPTHS = [200, 500, 1000, 2000, 5000]
+const HISTORY_DEPTH_DEFAULT = 200
+
 // WS events that mean the trades table on screen is now stale and must be
 // refetched: a position opened/closed, a resting order placed/cancelled, the
 // exchange reconciled a position (closed or resized it out from under us), or a
@@ -258,6 +265,13 @@ function Dashboard({
   const [trades, setTrades] = useState<Trade[]>([])
   const [signals, setSignals] = useState<SignalRow[]>([])
   const [candles, setCandles] = useState<Candle[]>([])
+  // How many bars of history to load for the chart (TradingView-paid extended
+  // history). Remembered across sessions; validated against the allowed depths
+  // so a stale/hand-edited value can never request an off-menu limit.
+  const [chartBars, setChartBars] = useState<number>(() => {
+    const saved = Number(localStorage.getItem('tt.chartBars'))
+    return HISTORY_DEPTHS.includes(saved) ? saved : HISTORY_DEPTH_DEFAULT
+  })
   // Compare-symbol overlay (TradingView "Compare"): a second instrument drawn on
   // the chart's left scale for correlation. Null = off. The choice is remembered.
   const [compareSymbol, setCompareSymbol] = useState<string | null>(
@@ -1122,15 +1136,17 @@ function Dashboard({
     [trades, symbol, timeframe],
   )
 
-  // Load candles when symbol/timeframe changes, and poll periodically. The
-  // poll is fairly frequent so a new closed bar shows up quickly; the live
-  // ticker (below) keeps the forming bar moving in between reloads.
+  // Load candles when symbol/timeframe/history-depth changes, and poll
+  // periodically. The poll is fairly frequent so a new closed bar shows up
+  // quickly; the live ticker (below) keeps the forming bar moving in between
+  // reloads. Deep-history depths poll less often — re-stitching thousands of
+  // bars every 10s would hammer the venue for no visible gain.
   useEffect(() => {
     let alive = true
     setCandles([]) // drop the previous market's bars immediately on a switch
     const load = (isInitial: boolean) =>
       api
-        .ohlcv(symbol, timeframe, 200)
+        .ohlcv(symbol, timeframe, chartBars)
         .then((c) => alive && setCandles(c))
         .catch(() => {
           // Only blank the chart if the very first fetch for this market
@@ -1139,12 +1155,13 @@ function Dashboard({
           if (alive && isInitial) setCandles([])
         })
     load(true)
-    const id = setInterval(() => load(false), 10000)
+    const pollMs = chartBars > 1000 ? 60000 : 10000
+    const id = setInterval(() => load(false), pollMs)
     return () => {
       alive = false
       clearInterval(id)
     }
-  }, [symbol, timeframe])
+  }, [symbol, timeframe, chartBars])
 
   // Remember the compare choice, and never let it point at the main symbol.
   useEffect(() => {
@@ -1166,9 +1183,13 @@ function Dashboard({
     }
     let alive = true
     setCompareCandles([])
+    // Span up to the main chart's depth so the overlay isn't cut short when the
+    // user loads deep history, but cap at a single call (1000) — the comparison
+    // line doesn't need thousands of stitched bars, and this keeps it light.
+    const compareBars = Math.min(chartBars, 1000)
     const load = () =>
       api
-        .ohlcv(compareSymbol, timeframe, 200)
+        .ohlcv(compareSymbol, timeframe, compareBars)
         .then((c) => alive && setCompareCandles(c))
         .catch(() => {
           // Keep the last good overlay on a transient poll hiccup; a failed first
@@ -1180,7 +1201,7 @@ function Dashboard({
       alive = false
       clearInterval(id)
     }
-  }, [compareSymbol, symbol, timeframe])
+  }, [compareSymbol, symbol, timeframe, chartBars])
 
   // Live price feed: poll the ticker fast so the chart's newest bar and the
   // header last-price move in near-real-time, like an exchange chart. Reset on
@@ -1682,6 +1703,23 @@ function Dashboard({
                     <option key={t}>{t}</option>
                   ))}
                 </select>
+                <select
+                  className="select"
+                  value={chartBars}
+                  title="How much price history to load. Deeper history (TradingView-paid parity) loads real older bars — pick a higher timeframe for years of data."
+                  aria-label="Chart history depth"
+                  onChange={(e) => {
+                    const n = Number(e.target.value)
+                    setChartBars(n)
+                    localStorage.setItem('tt.chartBars', String(n))
+                  }}
+                >
+                  {HISTORY_DEPTHS.map((n) => (
+                    <option key={n} value={n}>
+                      {n >= 1000 ? `${n / 1000}k bars` : `${n} bars`}
+                    </option>
+                  ))}
+                </select>
                 {chartView === 'bot' && (
                   <IndicatorsMenu value={indicators} onChange={setIndicators} />
                 )}
@@ -1862,7 +1900,7 @@ function Dashboard({
                     theme={theme}
                     last={replay.active ? null : livePrice}
                     liveBar={replay.active ? null : streamingLive ? stream.candle : null}
-                    fitKey={replay.active ? `replay:${symbol}:${timeframe}` : `${symbol}:${timeframe}`}
+                    fitKey={replay.active ? `replay:${symbol}:${timeframe}` : `${symbol}:${timeframe}:${chartBars}`}
                     symbol={symbol}
                     timeframe={timeframe}
                     priceLines={chartPriceLines}

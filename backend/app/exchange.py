@@ -68,6 +68,33 @@ def _with_retry(fn: Callable[[], T], *, attempts: int = 3, base_delay: float = 0
     raise last_exc
 
 
+# Most venues (Binance included) cap a single klines/OHLCV call at ~1000 bars.
+# To show a YEAR+ of history (TradingView-paid parity) we stitch several capped
+# calls together by walking `since` forward — see BinanceConnector.fetch_ohlcv.
+_MAX_SINGLE_CALL = 1000
+
+# Real bar durations, in milliseconds, for the timeframes the app offers. Used
+# only to step `since` when stitching deep history. A timeframe that isn't
+# listed falls back to a single (most-recent) call rather than guessing a
+# duration — we never invent a bar spacing.
+_TIMEFRAME_MS: dict[str, int] = {
+    "1m": 60_000,
+    "3m": 180_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h": 3_600_000,
+    "2h": 7_200_000,
+    "4h": 14_400_000,
+    "6h": 21_600_000,
+    "8h": 28_800_000,
+    "12h": 43_200_000,
+    "1d": 86_400_000,
+    "3d": 259_200_000,
+    "1w": 604_800_000,
+}
+
+
 class BinanceConnector:
     """Wraps ccxt.binance with testnet support and defensive error handling."""
 
@@ -377,9 +404,50 @@ class BinanceConnector:
     def fetch_ohlcv(
         self, symbol: str, timeframe: str = "1h", limit: int = 200
     ) -> list[list[float]]:
-        return self._fetch_public(
-            lambda c: c.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        )
+        """Recent candles for `symbol`, newest last.
+
+        For `limit` <= 1000 this is one public call. For deeper requests (the
+        chart's "year+ history" depth picker) we STITCH several capped calls by
+        stepping `since` forward, so the user can scroll back far further than a
+        single exchange call allows — TradingView-paid history parity. Every row
+        returned is real exchange data: gaps are left as gaps (never padded) and
+        we stop as soon as the venue stops handing back new, forward-moving bars.
+        """
+        n = max(1, int(limit))
+        if n <= _MAX_SINGLE_CALL:
+            return self._fetch_public(
+                lambda c: c.fetch_ohlcv(symbol, timeframe=timeframe, limit=n)
+            )
+        tf_ms = _TIMEFRAME_MS.get(timeframe)
+        if not tf_ms:
+            # Unknown bar size — don't guess a spacing; serve the most recent page.
+            return self._fetch_public(
+                lambda c: c.fetch_ohlcv(
+                    symbol, timeframe=timeframe, limit=_MAX_SINGLE_CALL
+                )
+            )
+        # Page forward from ~`n` bars ago in <=1000-bar chunks and concatenate.
+        since = int(time.time() * 1000) - n * tf_ms
+        out: list[list[float]] = []
+        while len(out) < n:
+            page = self._fetch_public(
+                lambda c, s=since: c.fetch_ohlcv(
+                    symbol, timeframe=timeframe, since=s, limit=_MAX_SINGLE_CALL
+                )
+            )
+            if not page:
+                break
+            for row in page:
+                # Guard against a venue re-returning the boundary bar.
+                if not out or row[0] > out[-1][0]:
+                    out.append(row)
+            last_ts = page[-1][0]
+            if last_ts <= since:  # no forward progress -> stop (never loop forever)
+                break
+            since = last_ts + tf_ms
+            if len(page) < _MAX_SINGLE_CALL:  # venue returned its final page
+                break
+        return out[-n:] if len(out) > n else out
 
     def fetch_order_book(self, symbol: str, limit: int = 20) -> dict[str, Any]:
         """Live order book: the market's real resting bids and asks.
