@@ -50,6 +50,7 @@ import {
   sanitizeAlertPrice,
   type AlertHandle,
 } from './alertDrag'
+import { shouldLoadOlder } from './lazyHistory'
 
 // Candlestick price chart powered by TradingView's lightweight-charts library.
 //
@@ -277,6 +278,8 @@ export function PriceChart({
   fullscreen,
   zoomLock,
   compare,
+  onLoadOlder,
+  loadingOlder,
 }: {
   candles: Candle[]
   theme: Theme
@@ -344,6 +347,14 @@ export function PriceChart({
   // shape/timing), time-aligned to the main bars upstream. `pct` is that symbol's
   // move over the shown window, for the legend. Null = no overlay. Real data only.
   compare?: { label: string; color?: string; data: { time: number; value: number }[]; pct?: number | null } | null
+  // Lazy "load older history on pan" (TradingView infinite-scroll parity). The
+  // chart calls onLoadOlder when the user pans near the oldest loaded bar; the
+  // parent fetches one older window and prepends it (see App's loadOlder +
+  // lazyHistory.mergeOlder). `loadingOlder` is true while that fetch is in
+  // flight, so the chart doesn't spam the callback on every pan frame. Both
+  // undefined = the feature is off (e.g. during bar replay), an honest no-op.
+  onLoadOlder?: () => void
+  loadingOlder?: boolean
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -408,6 +419,16 @@ export function PriceChart({
   // rest; the guard stops the programmatic echo from looping back.
   const allChartsRef = useRef<Set<IChartApi>>(new Set())
   const syncingRef = useRef(false)
+  // Lazy older-history load (see the onLoadOlder prop). The mount effect's
+  // once-bound range handler reads the latest candles/timeframe/callback through
+  // these refs; prevOldestRef remembers the previous oldest bar time so the
+  // candle effect can tell a lazy PREPEND (older bars arrived) from a routine
+  // tail refresh and hold the user's scroll position steady across it.
+  const candlesRef = useRef<Candle[]>(candles)
+  const timeframeRef = useRef<string>(timeframe ?? '')
+  const onLoadOlderRef = useRef<typeof onLoadOlder>(onLoadOlder)
+  const loadingOlderRef = useRef<boolean>(!!loadingOlder)
+  const prevOldestRef = useRef<number | null>(null)
 
   // --- Drawing-tools state --------------------------------------------------
   // React state drives the toolbar; matching refs give the canvas renderer and
@@ -467,6 +488,25 @@ export function PriceChart({
       }
     }
     syncingRef.current = false
+  }
+
+  // Ask the parent for an older window once the user has panned near the oldest
+  // loaded bar. Reads the live visible time range (its left edge is clamped to
+  // the oldest bar even when panned into the whitespace past it, so the trigger
+  // still fires there) and delegates the decision to the pure shouldLoadOlder.
+  // Guarded so it never fires without a callback, mid-load, or during a sync echo.
+  const maybeLoadOlder = () => {
+    const chart = chartRef.current
+    const cb = onLoadOlderRef.current
+    if (!chart || !cb || loadingOlderRef.current || syncingRef.current) return
+    let fromSec: number | null = null
+    try {
+      const vr = chart.timeScale().getVisibleRange()
+      fromSec = vr ? (vr.from as number) : null
+    } catch {
+      return
+    }
+    if (shouldLoadOlder(candlesRef.current, fromSec, timeframeRef.current)) cb()
   }
 
   // Tear one oscillator pane down: unsubscribe its sync, drop it from the synced
@@ -585,7 +625,10 @@ export function PriceChart({
     // Register price as the anchor of the synced group and keep the sub-panes'
     // time axes locked to whatever range the user drags price to.
     allChartsRef.current.add(chart)
-    const onMainRange = (r: LogicalRange | null) => syncRange(chart, r)
+    const onMainRange = (r: LogicalRange | null) => {
+      syncRange(chart, r)
+      maybeLoadOlder()
+    }
     chart.timeScale().subscribeVisibleLogicalRangeChange(onMainRange)
 
     // Paint the Volume Profile (VPVR) up the right edge: one horizontal bar per
@@ -1427,6 +1470,12 @@ export function PriceChart({
       low: c.low,
       close: c.close,
     }))
+    // Snapshot the view + oldest bar BEFORE we swap the data, so a lazy older-
+    // history prepend can be detected and the scroll position held (see below).
+    const ts = chartRef.current?.timeScale()
+    const prevRange = ts?.getVisibleLogicalRange() ?? null
+    const prevOldest = prevOldestRef.current
+    const newOldest = candles[0]?.time ?? null
     seriesRef.current.setData(data)
     // Match the price-axis / crosshair precision to this asset's magnitude so a
     // sub-cent coin shows its real price instead of "0.00" (lightweight-charts
@@ -1460,7 +1509,33 @@ export function PriceChart({
       chartRef.current?.timeScale().fitContent()
       didFitRef.current = true
       fitKeyRef.current = fitKey
+    } else if (
+      ts &&
+      prevRange &&
+      prevOldest != null &&
+      newOldest != null &&
+      newOldest < prevOldest
+    ) {
+      // Older bars were just lazily prepended (pan-left infinite scroll). setData
+      // keeps the logical range fixed, so the same on-screen bars shifted right by
+      // `added` indices. Offset the saved range by that many bars to pin the view
+      // exactly where the user left it — no jump. (Polls slide the window forward,
+      // so oldest only goes newer/stays then; newOldest < prevOldest uniquely marks
+      // a genuine prepend.)
+      let added = 0
+      for (const c of candles) {
+        if (c.time < prevOldest) added++
+        else break
+      }
+      if (added > 0) {
+        try {
+          ts.setVisibleLogicalRange({ from: prevRange.from + added, to: prevRange.to + added })
+        } catch {
+          /* range not settable this frame — harmless, view just isn't re-pinned */
+        }
+      }
     }
+    prevOldestRef.current = newOldest
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [candles, fitKey])
 
@@ -2086,6 +2161,13 @@ export function PriceChart({
   actionsRef.current = { del: deleteSelected, cancel: cancelDraw }
   // And keep the bar duration fresh for the measure tool's bar count.
   barSecRef.current = TF_SECONDS[timeframe ?? ''] ?? 0
+  // Keep the lazy older-history closures + inputs the chart's range handler reads
+  // pointed at the latest render, so it fetches with current candles/timeframe and
+  // never fires while a fetch is already in flight.
+  candlesRef.current = candles
+  timeframeRef.current = timeframe ?? ''
+  onLoadOlderRef.current = onLoadOlder
+  loadingOlderRef.current = !!loadingOlder
 
   // Wipe all drawings when the parent bumps clearSignal (the assistant's "clear
   // the drawings" command). A change in value is the trigger; the value seen on

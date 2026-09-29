@@ -201,8 +201,14 @@ export const api = {
     }),
   closeTrade: (id: number) =>
     req<ExecutionResult>(`/api/trades/${id}/close`, { method: 'POST' }),
-  ohlcv: (symbol: string, timeframe = '1h', limit = 200) =>
-    req<Candle[]>(`/api/ohlcv/${encodeURIComponent(symbol)}?timeframe=${timeframe}&limit=${limit}`),
+  // `end` (ms, exclusive) asks for the older window ending strictly before that
+  // timestamp — the infinite-scroll chunk when a user pans left. Omit it for the
+  // recent tail (or deep history when limit > 1000).
+  ohlcv: (symbol: string, timeframe = '1h', limit = 200, end?: number) =>
+    req<Candle[]>(
+      `/api/ohlcv/${encodeURIComponent(symbol)}?timeframe=${timeframe}&limit=${limit}` +
+        (end !== undefined ? `&end=${end}` : ''),
+    ),
   ticker: (symbol: string) =>
     req<Ticker>(`/api/ticker/${encodeURIComponent(symbol)}`),
   // Live order book: the market's real resting bids (buy side) and asks (sell

@@ -38,6 +38,7 @@ import {
   type ChartLayout,
 } from './layouts'
 import { loadTurns, saveTurns } from './chatHistory'
+import { mergeOlder, mergeRecent, nextOlderEndMs, tfMs, OLDER_CHUNK } from './lazyHistory'
 import { useBinanceStream } from './useBinanceStream'
 import { Login, LicenseGate } from './Login'
 import { Admin } from './Admin'
@@ -1264,10 +1265,17 @@ function Dashboard({
   useEffect(() => {
     let alive = true
     setCandles([]) // drop the previous market's bars immediately on a switch
+    noMoreOlderRef.current.delete(`${symbol}|${timeframe}`) // re-probe older depth
     const load = (isInitial: boolean) =>
       api
         .ohlcv(symbol, timeframe, chartBars)
-        .then((c) => alive && setCandles(c))
+        .then((c) => {
+          if (!alive) return
+          // First fetch owns the array; later polls MERGE onto it so any older
+          // history the user lazily scrolled in (prepended below) survives — a
+          // poll only refreshes the recent tail, it never wipes the past.
+          setCandles((prev) => (isInitial ? c : mergeRecent(prev, c)))
+        })
         .catch(() => {
           // Only blank the chart if the very first fetch for this market
           // fails (genuine "no data"); on background polls keep the last good
@@ -1282,6 +1290,50 @@ function Dashboard({
       clearInterval(id)
     }
   }, [symbol, timeframe, chartBars])
+
+  // Lazy "load older on pan" (TradingView infinite-scroll parity). When the
+  // chart reports the user has panned near the oldest loaded bar it calls
+  // loadOlder, which fetches ONE older window (real bars strictly before the
+  // oldest we hold) and prepends it. Guards: one request at a time, never during
+  // replay, skip unknown timeframes (backend can't place a window), and remember
+  // per market when the venue has no more history so we stop asking. Every bar is
+  // real exchange data — nothing here fabricates or pads a candle.
+  const loadingOlderRef = useRef(false)
+  const noMoreOlderRef = useRef<Set<string>>(new Set())
+  const chartKeyRef = useRef('')
+  chartKeyRef.current = `${symbol}|${timeframe}`
+  const [loadingOlder, setLoadingOlder] = useState(false)
+  const loadOlder = useCallback(() => {
+    if (loadingOlderRef.current) return
+    const key = `${symbol}|${timeframe}`
+    if (noMoreOlderRef.current.has(key)) return
+    if (!tfMs(timeframe)) return // unknown spacing → backend returns []; don't ask
+    const endMs = nextOlderEndMs(candles)
+    if (endMs == null) return // nothing loaded yet
+    loadingOlderRef.current = true
+    setLoadingOlder(true)
+    api
+      .ohlcv(symbol, timeframe, OLDER_CHUNK, endMs)
+      .then((older) => {
+        if (chartKeyRef.current !== key) return // symbol/timeframe changed mid-flight
+        if (!older.length) {
+          noMoreOlderRef.current.add(key) // venue has nothing before this — stop paging
+          return
+        }
+        setCandles((prev) => {
+          const merged = mergeOlder(prev, older)
+          if (merged === prev) noMoreOlderRef.current.add(key) // all overlap; exhausted
+          return merged
+        })
+      })
+      .catch(() => {
+        /* transient — leave the flag clear so a later pan retries */
+      })
+      .finally(() => {
+        loadingOlderRef.current = false
+        setLoadingOlder(false)
+      })
+  }, [symbol, timeframe, candles])
 
   // Remember the compare choice, and never let it point at the main symbol.
   useEffect(() => {
@@ -2051,6 +2103,8 @@ function Dashboard({
                     fullscreen={chartMax}
                     zoomLock={chartZoomLock}
                     compare={comparePayload}
+                    onLoadOlder={replay.active ? undefined : loadOlder}
+                    loadingOlder={loadingOlder}
                   />
                 </>
               ) : (

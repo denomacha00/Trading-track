@@ -475,7 +475,8 @@ class BinanceConnector:
         return (ask_f - bid_f) / mid * 100.0
 
     def fetch_ohlcv(
-        self, symbol: str, timeframe: str = "1h", limit: int = 200
+        self, symbol: str, timeframe: str = "1h", limit: int = 200,
+        end_ms: int | None = None,
     ) -> list[list[float]]:
         """Recent candles for `symbol`, newest last.
 
@@ -485,8 +486,29 @@ class BinanceConnector:
         single exchange call allows — TradingView-paid history parity. Every row
         returned is real exchange data: gaps are left as gaps (never padded) and
         we stop as soon as the venue stops handing back new, forward-moving bars.
+
+        When `end_ms` is given, instead fetch the `limit` bars ending strictly
+        BEFORE that timestamp (ms) — the chart's "load older on pan" lazy-scroll.
+        Needs a known bar spacing to place the window; an unknown timeframe
+        returns [] rather than guessing or serving the wrong (recent) bars.
         """
         n = max(1, int(limit))
+        if end_ms is not None:
+            # Lazy "load older" window: the `n` bars immediately before `end_ms`.
+            tf_ms = _TIMEFRAME_MS.get(timeframe)
+            if not tf_ms:
+                return []  # can't honestly place an older window without spacing
+            n = min(n, _MAX_SINGLE_CALL)
+            since = int(end_ms) - n * tf_ms
+            page = self._fetch_public(
+                lambda c: c.fetch_ohlcv(
+                    symbol, timeframe=timeframe, since=since, limit=_MAX_SINGLE_CALL
+                )
+            )
+            # Keep only real bars that fall strictly before the boundary, so the
+            # older window abuts the already-loaded bars without overlapping.
+            older = [row for row in page if row[0] < int(end_ms)]
+            return older[-n:] if len(older) > n else older
         if n <= _MAX_SINGLE_CALL:
             return self._fetch_public(
                 lambda c: c.fetch_ohlcv(symbol, timeframe=timeframe, limit=n)

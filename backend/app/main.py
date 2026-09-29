@@ -1585,14 +1585,22 @@ def ohlcv(
     symbol: str,
     timeframe: str = "1h",
     limit: int = 200,
+    end: int | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(require_licensed_user),
 ):
     engine = _engine_for(db, user)
     try:
-        # Up to 5000 bars: the chart's deep-history ("year+") depth picker. The
-        # connector stitches several capped exchange calls for anything > 1000.
-        raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, max(1, min(limit, 5000)))
+        if end is not None:
+            # Lazy "load older on pan": the bars ending just before `end` (ms).
+            # Capped at a single 1000-bar call — a scroll chunk, not deep history.
+            raw = engine.connector.fetch_ohlcv(
+                symbol.upper(), timeframe, max(1, min(limit, 1000)), end_ms=int(end)
+            )
+        else:
+            # Up to 5000 bars: the chart's deep-history ("year+") depth picker.
+            # The connector stitches several capped exchange calls for > 1000.
+            raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, max(1, min(limit, 5000)))
     except Exception as exc:
         raise _upstream_error("OHLCV unavailable", exc)
     return [

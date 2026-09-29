@@ -107,3 +107,44 @@ def test_no_progress_terminates_without_hanging():
     _assert_strictly_ascending_unique(out)
     assert len(client.calls) == 2  # one real page, one that trips the guard
 
+
+# --- Lazy "load older on pan" window (end_ms) ------------------------------
+# Given an `end_ms` boundary, fetch_ohlcv returns the bars ending STRICTLY
+# before it — the chart's infinite-scroll chunk that abuts the already-loaded
+# bars without overlap. Real bars only, capped at a single call.
+
+
+def test_end_ms_returns_the_window_before_the_boundary():
+    client = FakeClient(total=6000)
+    end_ms = NOW_MS - 1000 * TF_MS
+    out = _conn(client).fetch_ohlcv("BTC/USDT", "1h", 500, end_ms=end_ms)
+    assert len(out) == 500
+    _assert_strictly_ascending_unique(out)
+    assert all(r[0] < end_ms for r in out)  # strictly before the boundary
+    assert out[-1][0] == end_ms - TF_MS  # newest returned bar abuts the boundary
+    assert out[0][0] == end_ms - 500 * TF_MS
+
+
+def test_end_ms_excludes_the_boundary_bar():
+    client = FakeClient(total=2000)
+    out = _conn(client).fetch_ohlcv("BTC/USDT", "1h", 100, end_ms=NOW_MS)
+    assert len(out) == 100
+    assert out[-1][0] == NOW_MS - TF_MS  # the bar AT the boundary (NOW) is excluded
+
+
+def test_end_ms_unknown_timeframe_returns_empty_not_wrong_bars():
+    client = FakeClient(total=3000)
+    out = _conn(client).fetch_ohlcv("BTC/USDT", "7m", 500, end_ms=NOW_MS)
+    assert out == []  # can't place an older window without a known spacing
+    assert client.calls == []  # never even queried the venue
+
+
+def test_end_ms_caps_at_a_single_call():
+    client = FakeClient(total=6000)
+    end_ms = NOW_MS - 100 * TF_MS
+    out = _conn(client).fetch_ohlcv("BTC/USDT", "1h", 5000, end_ms=end_ms)
+    assert len(out) == _MAX_SINGLE_CALL  # 1000, not 5000 — a scroll chunk, not deep history
+    _assert_strictly_ascending_unique(out)
+    assert all(r[0] < end_ms for r in out)
+
+
