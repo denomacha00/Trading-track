@@ -10,6 +10,7 @@ from sqlalchemy import select
 from app.database import SessionLocal
 from app.engine import TradingEngine
 from app.models import PriceAlert, Trade, TradeStatus, _utcnow
+from app.news import fetch_market_news
 from app.state import load_monitor_interval
 from app.ws import Broadcaster
 
@@ -303,3 +304,101 @@ def _current_interval(fallback: float) -> float:
         return load_monitor_interval(db, fallback)
     finally:
         db.close()
+
+
+# ---- News alarm: forward genuinely-new headlines to Telegram -----------
+# A SEPARATE loop from the monitor so a slow multi-feed RSS fetch never delays
+# time-critical SL/TP monitoring. Each engine primes on its first poll (records
+# what's already out there WITHOUT alarming) so enabling the feature never dumps
+# a 24h backlog; after that only headlines it hasn't seen fire, capped per poll.
+_NEWS_POLL_S = 600.0        # 10 min between polls (feeds don't move faster)
+_NEWS_ALARM_MAX = 3         # most new headlines to push in one poll (anti-burst)
+_NEWS_SEEN_CAP = 400        # bound the per-engine seen-set on a long-lived process
+
+
+def _news_key(item: dict) -> str:
+    """Stable identity for a headline: prefer the link, fall back to the title."""
+    return str(item.get("link") or item.get("title") or "").strip()
+
+
+def _poll_news_once(manager) -> None:
+    """Fetch the news feeds once and Telegram any genuinely-new headline to each
+    opted-in user. Blocking (httpx + notify) — always run via asyncio.to_thread.
+    """
+    db = SessionLocal()
+    try:
+        engines = manager.engines_for_active_users(db)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("news poll: could not list engines: %s", exc)
+        db.close()
+        return
+    finally:
+        db.close()
+
+    for _user, engine in engines:
+        try:
+            if not getattr(engine.settings, "alert_news_enabled", False):
+                continue
+            if not getattr(engine.notifier, "enabled", False):
+                continue  # no Telegram creds -> nothing to alarm to
+            feeds = engine.settings.news_feed_list
+            if not feeds:
+                continue
+            items, _errors = fetch_market_news(feeds, limit=12)
+            if not items:
+                continue
+            keys = [k for k in (_news_key(it) for it in items) if k]
+
+            # First poll for this engine: record what's already out there and stay
+            # silent — enabling the alarm must not dump the existing backlog.
+            if not engine._news_primed:
+                engine._news_seen = set(keys[:_NEWS_SEEN_CAP])
+                engine._news_primed = True
+                continue
+
+            fresh = [it for it in items if _news_key(it) and _news_key(it) not in engine._news_seen]
+            for it in items:
+                k = _news_key(it)
+                if k:
+                    engine._news_seen.add(k)
+            # Keep the seen-set bounded; the freshest keys are the ones worth keeping.
+            if len(engine._news_seen) > _NEWS_SEEN_CAP:
+                engine._news_seen = set(keys[:_NEWS_SEEN_CAP])
+            if not fresh:
+                continue
+
+            shown = fresh[:_NEWS_ALARM_MAX]
+            lines = [f"📰 Market news ({len(fresh)} new):"]
+            for it in shown:
+                src = (it.get("source") or "").strip()
+                title = (it.get("title") or "").strip()
+                line = f"• {title}" if not src else f"• [{src}] {title}"
+                link = (it.get("link") or "").strip()
+                if link:
+                    line += f"\n  {link}"
+                lines.append(line)
+            if len(fresh) > len(shown):
+                lines.append(f"…and {len(fresh) - len(shown)} more.")
+            try:
+                engine._notify("\n".join(lines))
+            except Exception as exc:  # pragma: no cover - notify never breaks the loop
+                logger.warning("news notify failed for user=%s: %s", _user.id, exc)
+        except Exception as exc:  # keep one bad engine from stalling the rest
+            logger.warning("news poll failed for user=%s: %s", getattr(_user, "id", "?"), exc)
+
+
+async def news_alarm_loop(manager, interval: float = _NEWS_POLL_S) -> None:
+    """Periodically poll the news feeds and push new headlines to opted-in users.
+
+    Runs for the lifetime of the app, independent of the fast monitor loop so a
+    slow RSS fetch can never delay SL/TP checks. Failures are logged and the loop
+    keeps running; nothing here ever fabricates a headline.
+    """
+    while True:
+        try:
+            await asyncio.to_thread(_poll_news_once, manager)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - keep loop alive
+            logger.exception("news_alarm_loop error: %s", exc)
+        await asyncio.sleep(interval)

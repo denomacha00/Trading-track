@@ -442,6 +442,14 @@ export interface Settings {
   // runs to its stop/target ("it must finish"). Only ever sells a real winner.
   take_profit_on_reversal: boolean
   reversal_confirm_count: number
+  // Proactive Telegram alarms (heads-up only, never trade). alert_signal_on_flat:
+  // ping me when the brain prints a confident BUY on a coin I'm holding nothing in
+  // (a live entry the bot isn't taking); alert_signal_min_confidence (0..1) is the
+  // bar it must clear. alert_news_enabled: forward new market headlines as they
+  // appear. Both need Telegram configured to actually reach you.
+  alert_signal_on_flat: boolean
+  alert_signal_min_confidence: number
+  alert_news_enabled: boolean
   // Background monitor cadence (seconds); server clamps to [3, 60]. This is a
   // GLOBAL setting (one shared monitor loop), not per-symbol.
   monitor_interval_seconds: number

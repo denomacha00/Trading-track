@@ -253,7 +253,8 @@ _ACTION_GUIDE = (
     "profit_lock_trigger_pct, profit_lock_floor_pct, profit_lock_trail_pct, "
     "take_profit_on_reversal, reversal_confirm_count, auto_trade_enabled, "
     "auto_symbols, auto_timeframe, auto_confirm_timeframe, use_saved_strategy, "
-    "ai_trade_confirm, ai_monitor_enabled. You CANNOT switch "
+    "ai_trade_confirm, ai_monitor_enabled, alert_signal_on_flat, "
+    "alert_signal_min_confidence, alert_news_enabled. You CANNOT switch "
     "between paper and live here — going live is a deliberate human step, so guide "
     "them to Settings → Trading mode for that.\n"
     "PROFIT PROTECTION — you CAN make the bot auto-take profit, so offer it plainly "
@@ -273,6 +274,15 @@ _ACTION_GUIDE = (
     "take_profit_on_reversal=true (with reversal_confirm_count, default 2, as anti-"
     "whipsaw) sells a real net winner when the read turns bearish and stays bearish. "
     "These apply to long (spot) positions.\n"
+    "PROACTIVE ALARMS — heads-up Telegram messages, never trades (they place no "
+    "order). Offer them when someone wants to be TOLD about opportunities or news "
+    "instead of watching the screen: set alert_signal_on_flat=true to ping them when "
+    "the brain prints a confident BUY on a coin they hold nothing in (a live entry the "
+    "bot isn't taking because autopilot execution is off or a safety pause held it) — "
+    "tune the bar with alert_signal_min_confidence (0..1, default 0.75). Set "
+    "alert_news_enabled=true to forward new market headlines as they appear. BOTH need "
+    "Telegram configured to reach them; if notifications aren't set up, say so and "
+    "point them to Settings rather than promising a message that can't be delivered.\n"
     '• Start/stop the bot: {"type":"bot","state":"start|stop","reason":"..."}.\n'
     '• Set a price alert: {"type":"alert","symbol":"BTC/USDT","condition":"above|'
     'below","price":65000,"reason":"..."}. It fires once when the REAL live price '

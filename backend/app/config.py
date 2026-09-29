@@ -409,6 +409,21 @@ class Settings(BaseSettings):
         )
     )
 
+    # Proactive Telegram alarms (heads-up notifications, NOT trades). Both are OFF
+    # by default and both need Telegram creds configured to do anything.
+    # alert_signal_on_flat: ping me when the brain prints a confident BUY on a
+    # symbol the bot is holding NOTHING in — a live entry it isn't taking because
+    # autonomous execution is off or a safety pause stood it aside. Long-only, so
+    # only a buy-while-flat alarms; deduped per symbol on a 30-min cooldown.
+    alert_signal_on_flat: bool = Field(default=False)
+    # Minimum analyzer confidence (0..1) a flat-signal alarm must clear before it
+    # fires, so only genuinely strong setups ping. Default 0.75.
+    alert_signal_min_confidence: float = Field(default=0.75)
+    # alert_news_enabled: forward genuinely-new market headlines from the news
+    # feeds above to Telegram as they appear. Primes silently on first poll (no
+    # backlog dump) and is capped per poll so a feed burst can't spam.
+    alert_news_enabled: bool = Field(default=False)
+
     # Paper trading
     paper_starting_balance: float = Field(default=10_000.0)
     # Simulated taker fee (percent per fill) applied to PAPER trades so the
@@ -542,6 +557,11 @@ class Settings(BaseSettings):
             raise ValueError(
                 "min_signal_confidence must be between 0 and 1 (got "
                 f"{self.min_signal_confidence!r})."
+            )
+        if not 0.0 <= self.alert_signal_min_confidence <= 1.0:
+            raise ValueError(
+                "alert_signal_min_confidence must be between 0 and 1 (got "
+                f"{self.alert_signal_min_confidence!r})."
             )
         return self
 

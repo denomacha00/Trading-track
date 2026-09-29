@@ -285,6 +285,10 @@ class SettingsOut(BaseModel):
     profit_lock_trail_pct: float = 0.0
     take_profit_on_reversal: bool = False
     reversal_confirm_count: int = 2
+    # Proactive Telegram alarms (heads-up only, never trades).
+    alert_signal_on_flat: bool = False
+    alert_signal_min_confidence: float = 0.75
+    alert_news_enabled: bool = False
     # Global background monitor cadence (seconds).
     monitor_interval_seconds: float = 5.0
     notifications_enabled: bool
@@ -348,6 +352,9 @@ class SettingsUpdate(BaseModel):
     profit_lock_trail_pct: Optional[float] = Field(default=None, ge=0, le=100)
     take_profit_on_reversal: Optional[bool] = None
     reversal_confirm_count: Optional[int] = Field(default=None, ge=1, le=20)
+    alert_signal_on_flat: Optional[bool] = None
+    alert_signal_min_confidence: Optional[float] = Field(default=None, ge=0, le=1)
+    alert_news_enabled: Optional[bool] = None
     # Global background monitor cadence (seconds); clamped to [3, 60] server-side.
     monitor_interval_seconds: Optional[float] = Field(default=None, ge=3, le=60)
 

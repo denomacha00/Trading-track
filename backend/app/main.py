@@ -109,7 +109,7 @@ from app.news import fetch_market_news
 from app.fundamentals import fetch_fundamentals, summarize_fundamentals
 from app.performance import compute_performance
 from app.strategies import STRATEGY_REGISTRY, build_strategy
-from app.tasks import monitor_loop
+from app.tasks import monitor_loop, news_alarm_loop
 from app.technicals import compute_technicals, summarize_technicals
 from app.ws import Broadcaster
 from app.logging_config import configure_logging
@@ -228,15 +228,18 @@ async def lifespan(app: FastAPI):
             "keys cannot be stored. Set SECRET_KEY before going live."
         )
     monitor_task = asyncio.create_task(monitor_loop(get_manager(), broadcaster))
+    news_task = asyncio.create_task(news_alarm_loop(get_manager()))
     logger.info("Tranding-track backend started (multi-user)")
     try:
         yield
     finally:
         monitor_task.cancel()
-        try:
-            await monitor_task
-        except asyncio.CancelledError:
-            pass
+        news_task.cancel()
+        for _t in (monitor_task, news_task):
+            try:
+                await _t
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="Tranding-track", version=__version__, lifespan=lifespan)
@@ -1220,8 +1223,13 @@ def _settings_out(engine, user: User, db: Session | None = None) -> SettingsOut:
         profit_lock_enabled=getattr(s, "profit_lock_enabled", False),
         profit_lock_trigger_pct=getattr(s, "profit_lock_trigger_pct", 1.0),
         profit_lock_floor_pct=getattr(s, "profit_lock_floor_pct", 0.3),
+        profit_lock_trigger_usd=getattr(s, "profit_lock_trigger_usd", 0.0),
+        profit_lock_trail_pct=getattr(s, "profit_lock_trail_pct", 0.0),
         take_profit_on_reversal=getattr(s, "take_profit_on_reversal", False),
         reversal_confirm_count=getattr(s, "reversal_confirm_count", 2),
+        alert_signal_on_flat=getattr(s, "alert_signal_on_flat", False),
+        alert_signal_min_confidence=getattr(s, "alert_signal_min_confidence", 0.75),
+        alert_news_enabled=getattr(s, "alert_news_enabled", False),
         monitor_interval_seconds=monitor_interval,
         notifications_enabled=engine.notifier.enabled,
         api_key_set=bool(user.binance_api_key_enc and user.binance_api_secret_enc),
@@ -2110,6 +2118,8 @@ _AI_SETTINGS_FLOAT = {
     "strategy_max_drawdown_pct",
     "monitor_interval_seconds",
     "auto_confirm_ttl_minutes",
+    # Proactive-alarm confidence gate — a notification threshold, not a money knob.
+    "alert_signal_min_confidence",
 }
 _AI_SETTINGS_INT = {"max_open_positions", "strategy_min_trades", "reversal_confirm_count"}
 _AI_SETTINGS_BOOL = {
@@ -2135,6 +2145,10 @@ _AI_SETTINGS_BOOL = {
     # Fundamentals/macro/sentiment feed is read-only market DATA (no money
     # behaviour), so it's safe for the AI to toggle like the ICT lens.
     "fundamentals_enabled",
+    # Proactive Telegram alarms are heads-up NOTIFICATIONS only — they place no
+    # order and move no money, so they're proposable and deliberately non-risk.
+    "alert_signal_on_flat",
+    "alert_news_enabled",
 }
 _AI_SETTINGS_STR = {"auto_symbols", "auto_timeframe", "auto_confirm_timeframe"}
 

@@ -12,6 +12,7 @@ import datetime as dt
 import json
 import logging
 import threading
+import time
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -38,6 +39,12 @@ from app.state import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Re-alarm cooldown (seconds) for the "confident signal while flat" heads-up, per
+# symbol+verdict. A steady trend keeps printing the same confident buy every ~5s
+# tick; without this the user would get a Telegram ping every few seconds. 30 min
+# is long enough to not spam, short enough to re-remind on a persisting setup.
+_FLAT_ALARM_COOLDOWN_S = 30 * 60.0
 
 
 def _utcnow() -> dt.datetime:
@@ -116,6 +123,16 @@ class TradingEngine:
         # Symbols whose price feed is currently unreachable during monitoring, so
         # a "protection degraded" alert is emitted once per outage, not every tick.
         self._monitor_degraded: set[str] = set()
+        # Last "confident signal while flat" heads-up per symbol, as (verdict, ts),
+        # so the alarm re-fires at most once per cooldown window rather than every
+        # ~5s tick a strong setup persists. In-memory: a restart re-arms harmlessly.
+        self._last_flat_alarm: dict[str, tuple[str, float]] = {}
+        # De-dupe + prime state for the opt-in news alarm (see tasks.news_alarm_loop).
+        # _news_seen holds the link/title keys already alerted; _news_primed guards
+        # the FIRST poll so the bot never dumps the existing 24h backlog at startup —
+        # it only alarms headlines that appear AFTER the user switches the alarm on.
+        self._news_seen: set[str] = set()
+        self._news_primed: bool = False
         # Paper wallet (quote currency, e.g. USDT).
         self.paper_balance = settings.paper_starting_balance
         # Trained strategies the user saved, keyed by uppercase SYMBOL. Loaded in
@@ -2803,6 +2820,14 @@ class TradingEngine:
             return False, f"analysis failed for {symbol}: {exc}"
         self._record_regime(symbol, analysis)
         ok, msg = self._decide_and_act(db, symbol, timeframe, analysis)
+        # If the bot stayed FLAT on a confident buy (a guard/pause blocked the
+        # entry, or execution is deterministic-only), tell the human there's a
+        # live setup. Fires only when no trade was opened — _maybe_alarm_flat_signal
+        # re-checks flatness, so a just-opened long never alarms.
+        try:
+            self._maybe_alarm_flat_signal(db, symbol, analysis)
+        except Exception as exc:  # pragma: no cover - alarms never break trading
+            logger.warning("flat-signal alarm failed for %s: %s", symbol, exc)
         # Persist the brain's OWN verdict (deduped on change) so the Signals tab
         # shows an honest timeline of autonomous decisions, not just TradingView
         # alerts. Logging must never break the trading loop.
@@ -2939,6 +2964,44 @@ class TradingEngine:
             },
         )
 
+    def _maybe_alarm_flat_signal(self, db: Session, symbol: str, analysis) -> None:
+        """Telegram heads-up when the bot is FLAT on a symbol yet the analyzer
+        prints a confident BUY — a real entry opportunity it isn't taking because
+        autonomous execution is off, or an entry guard/regime pause stood it aside.
+
+        This is a spot, long-only autopilot (see _decide_and_act), so only a
+        BUY-while-flat is actionable; a sell/hold verdict never alarms (there is
+        nothing to sell when flat). De-duped per symbol+verdict on a cooldown so a
+        persisting trend can't ping every ~5s tick. It NEVER trades — it only tells
+        a human there is a strong setup to look at, honestly labelled as such.
+        """
+        if not getattr(self.settings, "alert_signal_on_flat", False):
+            return
+        if analysis is None or getattr(analysis, "verdict", "hold") != "buy":
+            return
+        thresh = float(getattr(self.settings, "alert_signal_min_confidence", 0.75) or 0.0)
+        conf = float(getattr(analysis, "confidence", 0.0) or 0.0)
+        if conf < thresh:
+            return
+        sym = symbol.upper()
+        with self._lock:
+            if self._open_trade_for_symbol(db, sym) is not None:
+                return  # not flat — an open/pending trade already covers this symbol
+        now = time.monotonic()
+        prev = self._last_flat_alarm.get(sym)
+        if prev and prev[0] == "buy" and (now - prev[1]) < _FLAT_ALARM_COOLDOWN_S:
+            return
+        self._last_flat_alarm[sym] = ("buy", now)
+        self._notify(
+            f"🔔 {sym}: confident BUY signal ({conf:.0%}) and the bot is holding "
+            f"nothing here — it hasn't entered (autonomous execution off, or a "
+            f"safety pause). Review it and act if you agree. Heads-up only, not a trade."
+        )
+        self._emit(
+            "signal_alarm",
+            {"symbol": sym, "verdict": "buy", "confidence": round(conf, 3)},
+        )
+
     def observe_symbol(
         self, db: Session, symbol: str, timeframe: str = "1h"
     ) -> tuple[bool, str]:
@@ -2953,6 +3016,10 @@ class TradingEngine:
         except Exception as exc:
             return False, f"analysis failed for {symbol}: {exc}"
         self._record_regime(symbol, analysis)
+        try:
+            self._maybe_alarm_flat_signal(db, symbol, analysis)
+        except Exception as exc:  # pragma: no cover - alarms never break monitoring
+            logger.warning("flat-signal alarm failed for %s: %s", symbol, exc)
         try:
             self._log_auto_verdict(
                 db, symbol.upper(), analysis, False,

@@ -6877,6 +6877,9 @@ function SettingsPanel({
         profit_lock_trail_pct: form.profit_lock_trail_pct,
         take_profit_on_reversal: form.take_profit_on_reversal,
         reversal_confirm_count: form.reversal_confirm_count,
+        alert_signal_on_flat: form.alert_signal_on_flat,
+        alert_signal_min_confidence: form.alert_signal_min_confidence,
+        alert_news_enabled: form.alert_news_enabled,
         monitor_interval_seconds: form.monitor_interval_seconds,
       })
       onSaved(saved)
@@ -7583,6 +7586,60 @@ function SettingsPanel({
           />
         </div>
       )}
+      <h4 style={{ marginBottom: 4 }}>Heads-up alarms (Telegram)</h4>
+      <p className="hint">
+        Get pinged on Telegram about opportunities and news — these{' '}
+        <b>never place a trade</b>, they just tell you.
+        {!form.notifications_enabled && (
+          <>
+            {' '}
+            <b>Telegram isn't connected yet</b>, so these won't reach you until you
+            set <code>TELEGRAM_BOT_TOKEN</code> and <code>TELEGRAM_CHAT_ID</code>.
+          </>
+        )}
+      </p>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={form.alert_signal_on_flat}
+          onChange={(e) =>
+            setForm({ ...form, alert_signal_on_flat: e.target.checked })
+          }
+        />
+        Alert me when there's a strong BUY setup I'm not in
+      </label>
+      <p className="hint">
+        When the brain reads a <b>confident buy</b> on a coin you're holding{' '}
+        <b>nothing</b> in — a live entry the bot isn't taking (autopilot execution
+        off, or a safety pause) — it messages you so you can act. Long-only, so it
+        only flags buys; deduped so a lasting trend won't spam you.
+      </p>
+      {form.alert_signal_on_flat && (
+        <div className="field" style={{ maxWidth: 280 }}>
+          <label>Only alert above this confidence (0–1)</label>
+          <NumField
+            className="input"
+            value={form.alert_signal_min_confidence}
+            onChange={setNum('alert_signal_min_confidence')}
+            inputMode="decimal"
+          />
+        </div>
+      )}
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={form.alert_news_enabled}
+          onChange={(e) =>
+            setForm({ ...form, alert_news_enabled: e.target.checked })
+          }
+        />
+        Forward new market headlines to me
+      </label>
+      <p className="hint">
+        New headlines from your news feeds are pushed to Telegram as they appear. It
+        primes quietly first (no dump of old news) and is capped per check so a burst
+        can't flood you.
+      </p>
       <div className="field" style={{ maxWidth: 280 }}>
         <label>Monitor check interval (seconds)</label>
         <NumField
