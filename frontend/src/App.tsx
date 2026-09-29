@@ -26,6 +26,17 @@ import {
   type IctOverlayPrefs,
 } from './ictOverlays'
 import { tradesToMarkers } from './chartMarkers'
+import {
+  parseLayouts,
+  serializeLayouts,
+  upsertLayout,
+  removeLayout,
+  isFull as layoutsFull,
+  normalizeName as normalizeLayoutName,
+  MAX_LAYOUTS,
+  MAX_NAME_LEN as MAX_LAYOUT_NAME_LEN,
+  type ChartLayout,
+} from './layouts'
 import { loadTurns, saveTurns } from './chatHistory'
 import { useBinanceStream } from './useBinanceStream'
 import { Login, LicenseGate } from './Login'
@@ -356,6 +367,21 @@ function Dashboard({
   // The chart draws only the layers turned on here, and only from levels the
   // backend actually computed — a toggle reveals a real layer, never fakes one.
   const [ictOverlays, setIctOverlays] = useState<IctOverlayPrefs>(() => loadIctOverlays())
+  // Saved chart layouts (TradingView-paid "multiple layouts" parity): named,
+  // reusable presets of timeframe + history depth + indicator & ICT overlays.
+  // Persisted to localStorage; parsing is boot-safe (a corrupt value yields []).
+  // A layout applies to whatever pair is charted — it captures the setup, not
+  // the symbol — so nothing here fabricates data; it just replays your choices.
+  const [layouts, setLayouts] = useState<ChartLayout[]>(
+    () => parseLayouts(localStorage.getItem('tt.layouts')),
+  )
+  useEffect(() => {
+    try {
+      localStorage.setItem('tt.layouts', serializeLayouts(layouts))
+    } catch {
+      /* storage full/unavailable — non-fatal, layouts just won't persist */
+    }
+  }, [layouts])
   // The latest computed ICT read for the charted symbol/timeframe (from the
   // analyze endpoint), or null when ICT is off, thin, or the fetch failed. Fed to
   // the chart for drawing and to the ICT menu's live count. Never fabricated.
@@ -752,6 +778,42 @@ function Dashboard({
   const reorderWatch = useCallback((sym: string, dir: -1 | 1) => {
     setWatchlist((list) => moveWatchSymbol(list, sym, dir))
   }, [])
+
+  // Saved chart layouts. saveLayout snapshots the CURRENT setup (timeframe +
+  // depth + indicator/ICT overlays) under a name, overwriting a same-name entry;
+  // applyLayout replays a saved setup onto whatever pair is charted (timeframe &
+  // depth clamped to the menus so a stale value can't wedge the picker);
+  // deleteLayout drops one. Each outcome — saved / updated / full / applied /
+  // deleted — toasts honestly. No data is fabricated; a layout just replays your
+  // own earlier choices, all computed from the real candles.
+  const saveLayout = useCallback((rawName: string): boolean => {
+    const name = normalizeLayoutName(rawName)
+    if (!name) {
+      showToast('error', 'Enter a name for the layout')
+      return false
+    }
+    if (layoutsFull(layouts, name)) {
+      showToast('error', `Layouts are full (${MAX_LAYOUTS} max) — delete one first`)
+      return false
+    }
+    const existed = layouts.some((l) => l.name.toLowerCase() === name.toLowerCase())
+    setLayouts((list) => upsertLayout(list, { name, timeframe, chartBars, indicators, ict: ictOverlays }))
+    showToast('ok', existed ? `Updated layout "${name}"` : `Saved layout "${name}"`)
+    return true
+  }, [layouts, timeframe, chartBars, indicators, ictOverlays, showToast])
+
+  const applyLayout = useCallback((l: ChartLayout) => {
+    if (TIMEFRAMES.includes(l.timeframe)) setTimeframe(l.timeframe)
+    if (HISTORY_DEPTHS.includes(l.chartBars)) setChartBars(l.chartBars)
+    setIndicators({ ...l.indicators })
+    setIctOverlays({ ...l.ict })
+    showToast('ok', `Applied layout "${l.name}"`)
+  }, [showToast])
+
+  const deleteLayout = useCallback((name: string) => {
+    setLayouts((list) => removeLayout(list, name))
+    showToast('ok', `Deleted layout "${name}"`)
+  }, [showToast])
 
   // A stable Set of watched symbols for O(1) star-state lookups in the movers
   // rows and the chart header, recomputed only when the list actually changes.
@@ -1792,6 +1854,14 @@ function Dashboard({
                 )}
                 {chartView === 'bot' && settings?.ict_enabled && (
                   <IctMenu value={ictOverlays} onChange={setIctOverlays} />
+                )}
+                {chartView === 'bot' && (
+                  <LayoutsMenu
+                    layouts={layouts}
+                    onSave={saveLayout}
+                    onApply={applyLayout}
+                    onDelete={deleteLayout}
+                  />
                 )}
                 {chartView === 'bot' && (
                   <div className="chart-view-toggle" role="group" aria-label="Trade arrows">
@@ -2854,6 +2924,119 @@ function IndicatorsMenu({
             >
               Clear all
             </button>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Saved chart LAYOUTS (templates) — TradingView-paid "multiple layouts" parity.
+// A layout is a named snapshot of the chart's *configuration* (timeframe, history
+// depth, overlay indicators, ICT overlays) — never the symbol, so it applies to
+// whatever pair you're on. Type a name + Save to store the current setup; click a
+// saved one to apply it; ✕ to delete. Nothing here is market data — it only
+// replays choices you already made, so there's nothing to fabricate.
+function LayoutsMenu({
+  layouts,
+  onSave,
+  onApply,
+  onDelete,
+}: {
+  layouts: ChartLayout[]
+  onSave: (name: string) => boolean
+  onApply: (l: ChartLayout) => void
+  onDelete: (name: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [name, setName] = useState('')
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDoc)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+  const submit = () => {
+    // onSave returns true only when it actually stored (non-empty, not full);
+    // clear the box on success so the next save starts fresh.
+    if (onSave(name)) setName('')
+  }
+  return (
+    <div className="ind-menu" ref={ref}>
+      <button
+        type="button"
+        className="ind-btn"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="true"
+        aria-expanded={open}
+        title="Save the chart's timeframe, history depth, indicators and ICT overlays as a reusable layout — applies to whatever pair you're viewing"
+      >
+        Layouts{layouts.length ? ` (${layouts.length})` : ''}
+        <span className="ind-caret">▾</span>
+      </button>
+      {open && (
+        <div className="ind-panel layouts-panel">
+          <div className="layout-save">
+            <input
+              className="layout-name"
+              type="text"
+              value={name}
+              maxLength={MAX_LAYOUT_NAME_LEN}
+              placeholder="Name this layout…"
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  submit()
+                }
+              }}
+            />
+            <button type="button" className="layout-save-btn" onClick={submit}>
+              Save
+            </button>
+          </div>
+          {layouts.length === 0 ? (
+            <div className="layout-empty">
+              No saved layouts yet. Set up the chart the way you like it, name it above and Save — then apply it to any pair in one click.
+            </div>
+          ) : (
+            layouts.map((l) => (
+              <div key={l.name} className="layout-row">
+                <button
+                  type="button"
+                  className="layout-apply"
+                  title={`Apply "${l.name}" to the current chart`}
+                  onClick={() => {
+                    onApply(l)
+                    setOpen(false)
+                  }}
+                >
+                  <span className="layout-row-name">{l.name}</span>
+                  <span className="layout-row-meta">
+                    {l.timeframe} · {l.chartBars.toLocaleString()} bars
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className="layout-del"
+                  aria-label={`Delete layout ${l.name}`}
+                  title="Delete this layout"
+                  onClick={() => onDelete(l.name)}
+                >
+                  ✕
+                </button>
+              </div>
+            ))
           )}
         </div>
       )}

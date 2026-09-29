@@ -1161,6 +1161,100 @@ th.mono {
   color: var(--text);
 }
 
+/* Saved chart layouts dropdown — reuses .ind-menu / .ind-btn / .ind-panel; the
+   rules below style the "name + Save" row and each saved-layout row (an apply
+   button showing name + timeframe/depth, plus a delete ✕). */
+.layouts-panel {
+  width: 250px;
+}
+.layout-save {
+  display: flex;
+  gap: 6px;
+  padding: 2px 2px 6px;
+}
+.layout-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--input-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+.layout-name:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.layout-save-btn {
+  flex: 0 0 auto;
+  background: var(--accent);
+  color: #05070d;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.layout-save-btn:hover {
+  filter: brightness(1.08);
+}
+.layout-empty {
+  padding: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+.layout-row {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  border-radius: 6px;
+}
+.layout-row:hover {
+  background: var(--panel-2);
+}
+.layout-apply {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  background: transparent;
+  border: none;
+  padding: 6px 8px;
+  cursor: pointer;
+  text-align: left;
+}
+.layout-row-name {
+  color: var(--text);
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.layout-row-meta {
+  color: var(--muted);
+  font-size: 11px;
+}
+.layout-del {
+  flex: 0 0 auto;
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  padding: 0 8px;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.layout-del:hover {
+  color: var(--danger, #f6465d);
+  background: var(--panel);
+}
+
 /* Embedded full TradingView chart. Taller than the bot chart to give the
    drawing-tools rail room; fills its host via the widget's autosize. */
 .tv-wrap {
