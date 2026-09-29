@@ -304,10 +304,19 @@ _ACTION_GUIDE = (
     "orderBlocks, fvg, breakers, rejection, bpr, volumeImbalance, liquidity, "
     "dealingRange (premium/discount + OTE), keyLevels (PDH/PDL/PWH/PWL). These only "
     "SHOW levels the bot already computed on closed bars — you never invent one, and "
-    "it moves no money. To UNDO your last chart change when they ask, "
+    "it moves no money. You can ALSO tune an indicator's LENGTHS with an optional "
+    '"params" object, e.g. {"type":"chart","params":{"rsiPeriod":21,"bbMult":2.5},'
+    '"reason":"..."}. Send it when the operator asks to change a look-back or '
+    "multiple (e.g. 'make the RSI 21' or 'Bollinger 2.5 std dev'). Setting a param "
+    "does NOT turn the indicator on — toggle it with the indicators object if it's "
+    "off. Param keys: emaFast, emaSlow, smaFast, smaSlow, hma, bbPeriod, bbMult, "
+    "kcEma, kcAtr, kcMult, donchian, rsiPeriod, macdFast, macdSlow, macdSignal, "
+    "stochK, stochD, stochSmooth, atrPeriod. Look-backs are whole bars 1-1000; the "
+    "multiples bbMult and kcMult are 0.1-10 (out-of-range values get clamped). "
+    "To UNDO your last chart change when they ask, "
     'send {"type":"chart","undo":true} — that steps the view back one change. One '
     "caution to state honestly: clearing drawings deletes them, so undo restores the "
-    "view (symbol/timeframe/indicators/ICT) but cannot bring wiped drawings back.\n"
+    "view (symbol/timeframe/indicators/ICT/lengths) but cannot bring wiped drawings back.\n"
     "The tag is hidden from the user, so keep your sentence before it self-contained."
 )
 

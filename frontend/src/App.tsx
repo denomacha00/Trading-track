@@ -44,9 +44,11 @@ import { CHART_TYPES, isChartKind, type ChartKind } from './chartTypes'
 import {
   DEFAULT_INDICATOR_PARAMS,
   PARAM_GROUPS,
+  PARAM_LABELS,
   parseParams,
   clampField,
   indicatorLabel,
+  sanitizeParamsPatch,
   type IndicatorParams,
   type ParamField,
 } from './indicatorParams'
@@ -434,7 +436,7 @@ function Dashboard({
   const [chartClearSignal, setChartClearSignal] = useState(0)
   // View-history for the assistant's chart commands, so "undo" steps the chart
   // back one change. Each entry is the view as it was BEFORE a change we applied.
-  const chartUndoRef = useRef<{ symbol: string; timeframe: string; indicators: IndicatorPrefs; ictOverlays: IctOverlayPrefs }[]>([])
+  const chartUndoRef = useRef<{ symbol: string; timeframe: string; indicators: IndicatorPrefs; ictOverlays: IctOverlayPrefs; params: IndicatorParams }[]>([])
   // "Watch the bot think": when ON, each autonomous verdict briefly drives the
   // chart to the symbol it just decided on and lights up the indicators for the
   // REAL factors behind that call — so you can SEE why it acted — then it
@@ -514,6 +516,7 @@ function Dashboard({
     timeframe?: string
     indicators?: Partial<IndicatorPrefs>
     ict?: Partial<IctOverlayPrefs>
+    params?: Partial<IndicatorParams>
     clear_drawings?: boolean
     undo?: boolean
   }): string => {
@@ -524,21 +527,27 @@ function Dashboard({
       setTimeframe(prev.timeframe)
       setIndicators(prev.indicators)
       setIctOverlays(prev.ictOverlays)
+      setIndicatorParams(prev.params)
       if (chartView !== 'bot') setChartView('bot')
       const on = Object.entries(prev.indicators).filter(([, v]) => v).map(([k]) => k).join(', ')
       return `Reverted the chart to ${prev.symbol} · ${prev.timeframe}${on ? ` · ${on}` : ''}.`
     }
     const parts: string[] = []
+    // Only the params the AI genuinely asked to change, each clamped to its range
+    // (an out-of-range or garbage value never quietly rewrites an untouched param).
+    const paramPatch = c.params ? sanitizeParamsPatch(c.params) : {}
+    const paramKeys = Object.keys(paramPatch) as (keyof IndicatorParams)[]
     const viewChanges =
       (!!c.symbol && c.symbol !== symbol) ||
       (!!c.timeframe && c.timeframe !== timeframe) ||
       (!!c.indicators && Object.keys(c.indicators).length > 0) ||
-      (!!c.ict && Object.keys(c.ict).length > 0)
+      (!!c.ict && Object.keys(c.ict).length > 0) ||
+      paramKeys.length > 0
     // Snapshot the CURRENT view before a view change so `undo` can restore it.
     // Clearing drawings is destructive and NOT snapshotted — undo can't un-delete
     // drawings (and the assistant is told to say so).
     if (viewChanges) {
-      chartUndoRef.current.push({ symbol, timeframe, indicators, ictOverlays })
+      chartUndoRef.current.push({ symbol, timeframe, indicators, ictOverlays, params: indicatorParams })
       if (chartUndoRef.current.length > 25) chartUndoRef.current.shift()
     }
     if (c.symbol && c.symbol !== symbol) {
@@ -564,6 +573,10 @@ function Dashboard({
       const hidden = Object.entries(patch).filter(([, v]) => v === false).map(([k]) => k)
       if (shown.length) parts.push(`ICT show ${shown.join(', ')}`)
       if (hidden.length) parts.push(`ICT hide ${hidden.join(', ')}`)
+    }
+    if (paramKeys.length > 0) {
+      setIndicatorParams((cur) => ({ ...cur, ...paramPatch }))
+      parts.push(...paramKeys.map((k) => `${PARAM_LABELS[k]} → ${paramPatch[k]}`))
     }
     if (c.clear_drawings) {
       setChartClearSignal((n) => n + 1)
@@ -5243,6 +5256,7 @@ function AssistantPanel({
     timeframe?: string
     indicators?: Partial<IndicatorPrefs>
     ict?: Partial<IctOverlayPrefs>
+    params?: Partial<IndicatorParams>
     clear_drawings?: boolean
     undo?: boolean
   }) => string
@@ -5513,6 +5527,13 @@ function AssistantPanel({
         if (shown.length) lines.push(`ICT show: ${shown.join(', ')}`)
         if (hidden.length) lines.push(`ICT hide: ${hidden.join(', ')}`)
       }
+      if (a.params && Object.keys(a.params).length) {
+        // Show the already-clamped values the operator will actually get, keyed by
+        // friendly label — an out-of-range request is dropped or clamped, not shown raw.
+        const patch = sanitizeParamsPatch(a.params)
+        for (const k of Object.keys(patch) as (keyof IndicatorParams)[])
+          lines.push(`${PARAM_LABELS[k]} → ${patch[k]}`)
+      }
       if (a.clear_drawings) lines.push('Clear all drawings (can’t be undone).')
       lines.push('View only — shows things, moves no money.')
       return { title: 'Update the chart', lines, danger: false }
@@ -5578,6 +5599,7 @@ function AssistantPanel({
           timeframe: action.timeframe,
           indicators: action.indicators,
           ict: action.ict,
+          params: action.params,
           clear_drawings: action.clear_drawings,
           undo: action.undo,
         })

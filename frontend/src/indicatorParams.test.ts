@@ -2,8 +2,10 @@ import { describe, it, expect } from 'vitest'
 import {
   DEFAULT_INDICATOR_PARAMS,
   PARAM_GROUPS,
+  PARAM_LABELS,
   clampField,
   sanitizeParams,
+  sanitizeParamsPatch,
   parseParams,
   indicatorLabel,
   type IndicatorParams,
@@ -85,6 +87,53 @@ describe('sanitizeParams', () => {
     const out = sanitizeParams({ bogus: 1, rsiPeriod: 30 })
     expect('bogus' in out).toBe(false)
     expect(DEFAULT_INDICATOR_PARAMS.rsiPeriod).toBe(14) // defaults intact
+  })
+})
+
+describe('sanitizeParamsPatch', () => {
+  it('keeps ONLY the provided finite fields, each clamped (never fills defaults)', () => {
+    const out = sanitizeParamsPatch({ rsiPeriod: 21, bbMult: 2.5 })
+    expect(out).toEqual({ rsiPeriod: 21, bbMult: 2.5 })
+    // A field the patch did not mention is absent — NOT set to its default.
+    expect('emaFast' in out).toBe(false)
+  })
+
+  it('clamps an out-of-range value instead of dropping it', () => {
+    expect(sanitizeParamsPatch({ rsiPeriod: 0 })).toEqual({ rsiPeriod: 1 })
+    expect(sanitizeParamsPatch({ rsiPeriod: 9999 })).toEqual({ rsiPeriod: 1000 })
+    expect(sanitizeParamsPatch({ bbMult: 99 })).toEqual({ bbMult: 10 })
+    expect(sanitizeParamsPatch({ rsiPeriod: 14.7 })).toEqual({ rsiPeriod: 15 })
+  })
+
+  it('DROPS null/blank/non-finite/boolean/unknown fields (never a silent default)', () => {
+    const out = sanitizeParamsPatch({
+      rsiPeriod: null,
+      emaFast: '',
+      macdFast: NaN,
+      stochK: Infinity,
+      atrPeriod: 'abc',
+      bbPeriod: true,
+      bogus: 5,
+      emaSlow: 30, // the one real change survives
+    })
+    expect(out).toEqual({ emaSlow: 30 })
+  })
+
+  it('accepts a numeric string and returns {} for a non-object', () => {
+    expect(sanitizeParamsPatch({ donchian: '25' })).toEqual({ donchian: 25 })
+    expect(sanitizeParamsPatch(null)).toEqual({})
+    expect(sanitizeParamsPatch('nope')).toEqual({})
+    expect(sanitizeParamsPatch(42)).toEqual({})
+  })
+})
+
+describe('PARAM_LABELS', () => {
+  it('has a friendly label for EVERY param field (exhaustive, non-empty)', () => {
+    for (const key of Object.keys(DEFAULT_INDICATOR_PARAMS) as (keyof IndicatorParams)[]) {
+      expect(typeof PARAM_LABELS[key]).toBe('string')
+      expect(PARAM_LABELS[key].length).toBeGreaterThan(0)
+    }
+    expect(Object.keys(PARAM_LABELS).sort()).toEqual(Object.keys(DEFAULT_INDICATOR_PARAMS).sort())
   })
 })
 

@@ -842,6 +842,57 @@ def test_normalize_chart_ict_overlays():
     assert combo["ict"] == {"liquidity": True}
 
 
+def test_normalize_chart_params_clamped():
+    # The chart action can ALSO tune indicator LENGTHS/multiples. Only allowlisted
+    # param keys survive; look-backs are whole bars clamped to [1, 1000]; the two
+    # multipliers (bbMult/kcMult) stay fractional in [0.1, 10]; anything unknown,
+    # non-finite or boolean is DROPPED (never coerced to a default). Setting a param
+    # only changes what an indicator draws — it moves no money, so it's autopilot-safe.
+    from app.main import _normalize_proposed_action
+
+    a = _normalize_proposed_action(
+        {
+            "type": "chart",
+            "params": {
+                "rsiPeriod": 21,        # kept as-is
+                "emaFast": 0,           # clamped up to the min look-back (1)
+                "macdSlow": 9999,       # clamped down to the max (1000)
+                "bbMult": 2.5,          # multiplier kept fractional
+                "kcMult": 99,           # multiplier clamped to 10
+                "stochK": 14.7,         # look-back rounded to a whole bar (15)
+                "atrPeriod": "abc",     # non-numeric -> dropped
+                "rsiPeriod2": 5,        # unknown key -> dropped
+                "donchian": True,       # boolean -> dropped (not a length)
+            },
+            "reason": "make the RSI 21",
+        },
+        None,
+    )
+    assert a == {
+        "type": "chart",
+        "params": {
+            "rsiPeriod": 21,
+            "emaFast": 1,
+            "macdSlow": 1000,
+            "bbMult": 2.5,
+            "kcMult": 10.0,
+            "stochK": 15,
+        },
+        "reason": "make the RSI 21",
+        "auto": False,
+    }
+    # A params object with only bad/unknown keys leaves nothing actionable -> refused.
+    assert _normalize_proposed_action({"type": "chart", "params": {"nope": 5}}, None) is None
+    assert _normalize_proposed_action({"type": "chart", "params": {"rsiPeriod": "x"}}, None) is None
+    # Params combine with an indicator toggle in one view-only proposal.
+    combo = _normalize_proposed_action(
+        {"type": "chart", "indicators": {"rsi": True}, "params": {"rsiPeriod": 30}},
+        None,
+    )
+    assert combo["indicators"] == {"rsi": True}
+    assert combo["params"] == {"rsiPeriod": 30}
+
+
 class _AutopilotEngine:
     """Minimal engine stub exposing just the settings the normalizer reads."""
 

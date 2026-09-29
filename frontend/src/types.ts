@@ -2,6 +2,7 @@
 
 import type { IndicatorPrefs } from './indicators'
 import type { IctOverlayPrefs } from './ictOverlays'
+import type { IndicatorParams } from './indicatorParams'
 
 // Per-symbol market-regime snapshot the bot publishes so the UI can SHOW it
 // standing aside in a bad market and re-engaging in a good one (the visible
@@ -298,6 +299,11 @@ export type ProposedAction =
       // view-only nature as `indicators`: it only changes what's drawn, never
       // money or account state. Only the keys that change are sent.
       ict?: Partial<IctOverlayPrefs>
+      // Per-indicator lengths/multiples to set (TradingView "inputs"). Same
+      // view-only nature — a length only changes what an indicator DRAWS, never
+      // money. Setting a param NEVER toggles the indicator on/off; only the keys
+      // that change are sent, each clamped to its sane range on the way in.
+      params?: Partial<IndicatorParams>
       clear_drawings?: boolean
       undo?: boolean
       reason?: string | null

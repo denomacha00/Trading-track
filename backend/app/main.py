@@ -13,6 +13,7 @@ import binascii
 import datetime as dt
 import json
 import logging
+import math
 import os
 import re
 from contextlib import asynccontextmanager
@@ -2279,6 +2280,42 @@ _AI_CHART_ICT = {
     "rejection", "bpr", "volumeImbalance", "liquidity", "dealingRange", "keyLevels",
 }
 
+# Per-indicator PARAMETERS the assistant may tune (mirrors the frontend
+# indicatorParams.ts exactly). Look-backs are whole bars in [1, 1000]; the two
+# multipliers are fractional in [0.1, 10]. Same VIEW-ONLY safety as an indicator
+# toggle — a length only changes what the chart DRAWS, never money or account
+# state. Setting a param NEVER flips an indicator on/off (that's the `indicators`
+# object). The frontend re-clamps every field through clampField (the single
+# source of truth), so this server pass is a tight allowlist + sanity clamp:
+# anything unknown, non-finite, or boolean is dropped — never coerced to a default.
+_AI_CHART_PARAM_MULT = {"bbMult", "kcMult"}
+_AI_CHART_PARAM_KEYS = {
+    "emaFast", "emaSlow", "smaFast", "smaSlow", "hma", "bbPeriod", "bbMult",
+    "kcEma", "kcAtr", "kcMult", "donchian", "rsiPeriod", "macdFast", "macdSlow",
+    "macdSignal", "stochK", "stochD", "stochSmooth", "atrPeriod",
+}
+
+
+def _clamp_chart_param(key: str, val) -> float | int | None:
+    """Clamp one AI-proposed indicator param to its range, or None to drop it.
+
+    A multiplier (bbMult/kcMult) stays fractional in [0.1, 10]; every other key is
+    a look-back rounded to a whole bar in [1, 1000]. A boolean, non-numeric, or
+    non-finite value returns None so the caller omits it — a garbage value never
+    silently rewrites a param (mirrors the frontend sanitizeParamsPatch contract).
+    """
+    if isinstance(val, bool):
+        return None
+    try:
+        n = float(val)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(n):
+        return None
+    if key in _AI_CHART_PARAM_MULT:
+        return max(0.1, min(10.0, n))
+    return max(1, min(1000, int(round(n))))
+
 
 def _coerce_bool(v) -> bool | None:
     if isinstance(v, bool):
@@ -2481,6 +2518,18 @@ def _normalize_proposed_action(raw: dict | None, engine) -> dict | None:
                             ict_patch[key] = b
                 if ict_patch:
                     out["ict"] = ict_patch
+                    changed = True
+            params_in = raw.get("params")
+            if isinstance(params_in, dict):
+                params_patch: dict = {}
+                for k, v in params_in.items():
+                    key = str(k).strip()
+                    if key in _AI_CHART_PARAM_KEYS:
+                        cv = _clamp_chart_param(key, v)
+                        if cv is not None:
+                            params_patch[key] = cv
+                if params_patch:
+                    out["params"] = params_patch
                     changed = True
             if _coerce_bool(raw.get("clear_drawings")):
                 out["clear_drawings"] = True

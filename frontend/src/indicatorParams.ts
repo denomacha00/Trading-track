@@ -149,8 +149,30 @@ export function sanitizeParams(raw: unknown): IndicatorParams {
   return out
 }
 
-// Boot-safe parse of the persisted JSON string (never throws): corrupt or absent
-// storage yields a fresh copy of the defaults.
+// Validate an untrusted PARTIAL patch (e.g. an AI-proposed chart change) into a
+// patch that carries ONLY the fields genuinely provided as a real, finite number —
+// each clamped to its spec. Differs from sanitizeParams on purpose: this NEVER
+// fills a missing field with its default, so applying the result touches only the
+// lengths the caller actually asked to change and leaves every other param the
+// user's current value. A null/blank/non-finite/unknown field is DROPPED (not
+// silently reset to the default), so a garbage value can't quietly rewrite a param
+// the caller never mentioned — honest by omission ([[nothing-fake-honest-data]]).
+export function sanitizeParamsPatch(raw: unknown): Partial<IndicatorParams> {
+  const out: Partial<IndicatorParams> = {}
+  if (raw && typeof raw === 'object') {
+    for (const key of Object.keys(DEFAULT_INDICATOR_PARAMS) as (keyof IndicatorParams)[]) {
+      const v = (raw as Record<string, unknown>)[key]
+      if (v === undefined || v === null || typeof v === 'boolean') continue
+      if (typeof v === 'string' && v.trim() === '') continue
+      const n = typeof v === 'number' ? v : Number(v)
+      if (!Number.isFinite(n)) continue // drop garbage — never reset to default here
+      out[key] = clampField(key, n)
+    }
+  }
+  return out
+}
+
+
 export function parseParams(rawJson: string | null): IndicatorParams {
   if (!rawJson) return { ...DEFAULT_INDICATOR_PARAMS }
   try {
@@ -193,3 +215,29 @@ export function indicatorLabel(ind: keyof IndicatorPrefs, p: IndicatorParams): s
       return null
   }
 }
+
+// Friendly, human-readable name for ONE param field — used on the AI's chart
+// "Confirm" card and its outcome line so a beginner reads "RSI length → 21", not
+// the raw key "rsiPeriod". Keyed by every IndicatorParams field (exhaustive).
+export const PARAM_LABELS: Record<keyof IndicatorParams, string> = {
+  emaFast: 'EMA (fast) length',
+  emaSlow: 'EMA (slow) length',
+  smaFast: 'SMA (fast) length',
+  smaSlow: 'SMA (slow) length',
+  hma: 'Hull MA length',
+  bbPeriod: 'Bollinger length',
+  bbMult: 'Bollinger StdDev',
+  kcEma: 'Keltner EMA length',
+  kcAtr: 'Keltner ATR length',
+  kcMult: 'Keltner multiple',
+  donchian: 'Donchian length',
+  rsiPeriod: 'RSI length',
+  macdFast: 'MACD fast',
+  macdSlow: 'MACD slow',
+  macdSignal: 'MACD signal',
+  stochK: 'Stochastic %K',
+  stochD: 'Stochastic %D',
+  stochSmooth: 'Stochastic smoothing',
+  atrPeriod: 'ATR length',
+}
+
