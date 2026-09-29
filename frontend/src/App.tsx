@@ -38,6 +38,7 @@ import {
   type ChartLayout,
 } from './layouts'
 import { loadTurns, saveTurns } from './chatHistory'
+import { formatTranscript, transcriptFilename } from './chatExport'
 import { mergeOlder, mergeRecent, nextOlderEndMs, tfMs, OLDER_CHUNK } from './lazyHistory'
 import { CHART_TYPES, isChartKind, type ChartKind } from './chartTypes'
 import {
@@ -5398,6 +5399,31 @@ function AssistantPanel({
     setTurns([])
   }
 
+  // Download the whole conversation as a Markdown file — a faithful, honest dump
+  // of the real turns (see chatExport). Frontend-only: builds the text from the
+  // in-memory transcript and saves it via a transient object-URL anchor; nothing
+  // leaves the browser. No-op with a toast when there's nothing to export.
+  const exportChat = () => {
+    if (!turns.length) {
+      onError('Nothing to export yet — start a conversation first.')
+      return
+    }
+    try {
+      const text = formatTranscript(turns)
+      const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = transcriptFilename()
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch {
+      onError('Could not export the conversation.')
+    }
+  }
+
   // Attach an image the AI can read. Validates it's an image, caps the raw file at
   // 12 MB (pre-downscale), then downscales+re-encodes to a small JPEG. Any failure
   // surfaces as a toast — never a silent drop or a fabricated attachment.
@@ -5615,6 +5641,14 @@ function AssistantPanel({
       <div className="chat-col">
         {turns.length > 0 && (
           <div className="chat-toolbar">
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={exportChat}
+              title="Download this conversation as a Markdown file"
+            >
+              ⬇ Export
+            </button>
             <button
               type="button"
               className="btn ghost sm"
