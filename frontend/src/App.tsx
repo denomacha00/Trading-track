@@ -1065,10 +1065,6 @@ function Dashboard({
   const chartPriceLines = useMemo(() => {
     const sym = symbol.toUpperCase()
     const lines: { price: number; color?: string; title?: string; dashed?: boolean; width?: 1 | 2 | 3 | 4; scale?: boolean }[] = []
-    for (const a of alerts) {
-      if (a.status !== 'armed' || a.symbol.toUpperCase() !== sym) continue
-      lines.push({ price: a.price, color: '#f0a020', title: `Alert ${a.condition} ${fmt(a.price)}` })
-    }
     // Signed % of a level away from entry, e.g. " (+4.0%)" / " (-2.0%)". Empty
     // when entry is missing — we never invent a distance.
     const gap = (level: number, entry: number | null | undefined) => {
@@ -1084,7 +1080,40 @@ function Dashboard({
       if (t.take_profit) lines.push({ price: t.take_profit, color: '#16c784', width: 2, scale: true, title: `TP ${fmt(t.take_profit)}${gap(t.take_profit, entry)}` })
     }
     return lines
-  }, [alerts, trades, symbol])
+  }, [trades, symbol])
+
+  // Armed price alerts for THIS symbol, drawn as DRAGGABLE dashed lines: grab
+  // one on the chart and slide it to re-arm the alert at a new price. Real user
+  // alerts only — nothing decorative. (Triggered alerts stay in the panel, not
+  // on the chart.)
+  const chartAlerts = useMemo(() => {
+    const sym = symbol.toUpperCase()
+    return alerts
+      .filter((a) => a.status === 'armed' && a.symbol.toUpperCase() === sym)
+      .map((a) => ({
+        id: a.id,
+        price: a.price,
+        condition: a.condition as 'above' | 'below',
+        color: '#f0a020',
+        title: `Alert ${a.condition} ${fmt(a.price)}`,
+      }))
+  }, [alerts, symbol])
+
+  // Persist a dragged alert: PATCH the new price/condition (the backend re-arms
+  // it), then refetch so the chart + panel reflect the real stored value.
+  const onAlertMove = useCallback(
+    async (id: number, price: number, condition: 'above' | 'below') => {
+      try {
+        await api.updateAlert(id, { price, condition })
+        await refreshAlerts()
+        showToast('ok', `Alert moved to ${condition} ${fmt(price)}`)
+      } catch (e) {
+        showToast('error', e instanceof Error ? e.message : 'Could not move the alert')
+        await refreshAlerts() // snap the panel/chart back to the stored value
+      }
+    },
+    [refreshAlerts],
+  )
 
   // Buy/sell arrows on the exact bars where THIS symbol's trades opened/closed —
   // real history only (see tradesToMarkers), snapped to the candle timeframe.
@@ -1837,6 +1866,8 @@ function Dashboard({
                     symbol={symbol}
                     timeframe={timeframe}
                     priceLines={chartPriceLines}
+                    alerts={chartAlerts}
+                    onAlertMove={onAlertMove}
                     indicators={indicators}
                     ict={ictRead}
                     ictOverlays={ictOverlays}
@@ -3225,6 +3256,12 @@ function AlertsPanel({
         <button type="button" className="btn" onClick={add} disabled={busy}>
           {busy ? 'Adding…' : 'Add alert'}
         </button>
+
+        {mine.some((a) => a.status === 'armed') && (
+          <div className="hint alert-drag-hint">
+            Tip: drag an armed alert line on the chart to move it.
+          </div>
+        )}
 
         {mine.length === 0 ? (
           <div className="empty">No alerts for {sym} yet.</div>

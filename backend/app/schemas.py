@@ -368,6 +368,20 @@ class AlertCreate(BaseModel):
     note: Optional[str] = Field(default=None, max_length=200)
 
 
+class AlertUpdate(BaseModel):
+    """Edit an existing alert — used by drag-to-move on the chart.
+
+    Every field is optional; only the ones sent are changed. Moving an alert
+    (a new ``price`` and/or ``condition``) re-arms it: a previously-triggered
+    alert goes back to "armed" and its trigger stamp is cleared, so a level you
+    reposition can fire again. Nothing here fabricates a crossing.
+    """
+
+    price: Optional[float] = Field(default=None, gt=0)
+    condition: Optional[Literal["above", "below"]] = None
+    note: Optional[str] = Field(default=None, max_length=200)
+
+
 class AlertOut(BaseModel):
     id: int
     symbol: str

@@ -44,6 +44,12 @@ import {
   type Pt,
   type Tool,
 } from './drawings'
+import {
+  nearestAlert,
+  conditionForDrag,
+  sanitizeAlertPrice,
+  type AlertHandle,
+} from './alertDrag'
 
 // Candlestick price chart powered by TradingView's lightweight-charts library.
 //
@@ -256,6 +262,8 @@ export function PriceChart({
   symbol,
   timeframe,
   priceLines,
+  alerts,
+  onAlertMove,
   indicators,
   markers,
   clearSignal,
@@ -289,6 +297,15 @@ export function PriceChart({
   // on-screen on any timeframe. All three are style/scale only — they never
   // change WHICH real number is drawn.
   priceLines?: { price: number; color?: string; title?: string; dashed?: boolean; width?: 1 | 2 | 3 | 4; scale?: boolean }[]
+  // Armed price alerts drawn as DRAGGABLE horizontal lines (TradingView-style):
+  // grab the line and slide it to a new price to re-arm the alert there. Each is
+  // a real user alert — nothing invented. Kept separate from `priceLines` (which
+  // stays static) so only these respond to the drag handlers. `onAlertMove` is
+  // called with the dropped price and the honest condition (above/below the last
+  // price); the parent persists it (PATCH /api/alerts/{id}) and feeds the fresh
+  // list back down. Undefined/empty = no draggable alerts.
+  alerts?: { id: number; price: number; condition: 'above' | 'below'; color?: string; title?: string }[]
+  onAlertMove?: (id: number, price: number, condition: 'above' | 'below') => void
   // Which moving-average / band / VWAP overlays to draw, all computed from the
   // real candles above. Undefined = none (unchanged plain chart).
   indicators?: IndicatorPrefs
@@ -352,6 +369,19 @@ export function PriceChart({
   // Levels the vertical auto-scale must keep in view (open position entry/stop/
   // target). Read live by the series' autoscaleInfoProvider; see extendAutoscale.
   const scaleLevelsRef = useRef<number[]>([])
+  // Draggable armed alerts, drawn as native price lines kept by id so a single
+  // one can be moved live during a drag and the set reconciled when it changes.
+  const alertLineObjsRef = useRef<Map<number, IPriceLine>>(new Map())
+  const alertsRef = useRef<{ id: number; price: number; condition: 'above' | 'below'; color?: string; title?: string }[]>([])
+  const onAlertMoveRef = useRef<typeof onAlertMove>(onAlertMove)
+  // Drag in progress: which alert, and its original price/condition to restore
+  // if the drag ends on an invalid price. Null when nothing is being dragged.
+  const alertDragRef = useRef<{ id: number; origPrice: number; origCond: 'above' | 'below' } | null>(null)
+  // Fullscreen / zoom-lock mirrored so the drag can restore the exact
+  // touch-action the tool effect would otherwise own (that effect doesn't re-run
+  // after a drag). Kept fresh in the tool effect below.
+  const fullscreenRef = useRef<boolean | undefined>(fullscreen)
+  const zoomLockRef = useRef<boolean | undefined>(zoomLock)
   // Indicator overlay line series (EMA/SMA/Bollinger/VWAP), keyed so we can add,
   // update, or remove one without disturbing the candles or the others.
   const overlayRef = useRef<Map<string, ISeriesApi<'Line'>>>(new Map())
@@ -1188,6 +1218,125 @@ export function PriceChart({
       drawViewRef.current?.requestUpdate()
     }
     containerRef.current?.addEventListener('contextmenu', onContextMenu)
+
+    // --- Drag-to-move price alerts (TradingView-style) --------------------
+    // Grab an armed alert's dashed line and slide it to a new price; on release
+    // the parent persists the move (re-arming the alert). Only in cursor mode —
+    // a drawing tool owns clicks. Pointer events cover mouse AND touch. We freeze
+    // chart pan/scale for the drag so the candles don't slide under the line, and
+    // capture the pointer so the whole gesture routes here, then restore both.
+    const ALERT_GRAB_PX = 8
+    const alertHandles = (): AlertHandle[] => {
+      const s = seriesRef.current
+      if (!s) return []
+      const out: AlertHandle[] = []
+      for (const a of alertsRef.current) {
+        const y = s.priceToCoordinate(a.price)
+        if (y != null) out.push({ id: a.id, y, price: a.price, condition: a.condition })
+      }
+      return out
+    }
+    const restoreTouchAction = () => {
+      const el = containerRef.current
+      if (!el) return
+      el.style.touchAction = !fullscreenRef.current
+        ? ''
+        : zoomLockRef.current === false
+          ? 'pinch-zoom'
+          : 'none'
+    }
+    const onAlertPointerDown = (e: PointerEvent) => {
+      if (e.button > 0) return // primary button / touch only (right-click deletes)
+      if (toolRef.current !== 'cursor') return // a drawing tool owns the click
+      const el = containerRef.current
+      const s = seriesRef.current
+      if (!el || !s) return
+      const r = el.getBoundingClientRect()
+      const id = nearestAlert(e.clientY - r.top, alertHandles(), ALERT_GRAB_PX)
+      if (id == null) return
+      const a = alertsRef.current.find((x) => x.id === id)
+      if (!a) return
+      alertDragRef.current = { id, origPrice: a.price, origCond: a.condition }
+      chart.applyOptions({ handleScroll: false, handleScale: false })
+      el.style.cursor = 'ns-resize'
+      el.style.touchAction = 'none'
+      try {
+        el.setPointerCapture(e.pointerId)
+      } catch {
+        /* capture unsupported */
+      }
+      e.preventDefault()
+      e.stopPropagation()
+    }
+    const onAlertPointerMove = (e: PointerEvent) => {
+      const el = containerRef.current
+      const s = seriesRef.current
+      if (!el || !s) return
+      const r = el.getBoundingClientRect()
+      const y = e.clientY - r.top
+      const drag = alertDragRef.current
+      if (!drag) {
+        // Hover cue: the grab cursor when hovering an alert line in cursor mode.
+        if (toolRef.current === 'cursor') {
+          el.style.cursor = nearestAlert(y, alertHandles(), ALERT_GRAB_PX) != null ? 'ns-resize' : ''
+        }
+        return
+      }
+      const price = sanitizeAlertPrice((s.coordinateToPrice(y) as number | null) ?? Number.NaN)
+      if (price == null) return
+      const ln = alertLineObjsRef.current.get(drag.id)
+      if (ln) {
+        try {
+          ln.applyOptions({ price })
+        } catch {
+          /* series torn down mid-drag */
+        }
+      }
+      e.preventDefault()
+    }
+    const endAlertDrag = (e: PointerEvent, commit: boolean) => {
+      const drag = alertDragRef.current
+      if (!drag) return
+      alertDragRef.current = null
+      const el = containerRef.current
+      const s = seriesRef.current
+      try {
+        el?.releasePointerCapture(e.pointerId)
+      } catch {
+        /* not captured */
+      }
+      if (el) el.style.cursor = ''
+      restoreTouchAction()
+      chart.applyOptions({ handleScroll: true, handleScale: true })
+      const ln = alertLineObjsRef.current.get(drag.id)
+      const r = el?.getBoundingClientRect()
+      const price =
+        commit && s && r
+          ? sanitizeAlertPrice((s.coordinateToPrice(e.clientY - r.top) as number | null) ?? Number.NaN)
+          : null
+      // Invalid drop or no real move → snap the line back to where it was.
+      if (price == null || Math.abs(price - drag.origPrice) < drag.origPrice * 1e-9) {
+        if (ln) {
+          try {
+            ln.applyOptions({ price: drag.origPrice })
+          } catch {
+            /* gone */
+          }
+        }
+        return
+      }
+      const last = lastBarRef.current?.close ?? null
+      const cond = conditionForDrag(price, last, drag.origCond)
+      onAlertMoveRef.current?.(drag.id, price, cond)
+    }
+    const onAlertPointerUp = (e: PointerEvent) => endAlertDrag(e, true)
+    const onAlertPointerCancel = (e: PointerEvent) => endAlertDrag(e, false)
+    const alertEl = containerRef.current
+    alertEl?.addEventListener('pointerdown', onAlertPointerDown, true)
+    alertEl?.addEventListener('pointermove', onAlertPointerMove)
+    alertEl?.addEventListener('pointerup', onAlertPointerUp)
+    alertEl?.addEventListener('pointercancel', onAlertPointerCancel)
+
     // Keyboard: Delete/Backspace removes the selected drawing; Escape cancels an
     // in-progress placement or clears the selection. Ignored while a form field
     // is focused so it never eats typing elsewhere in the app. Delegates to the
@@ -1212,6 +1361,10 @@ export function PriceChart({
       chart.unsubscribeClick(onClick)
       window.removeEventListener('keydown', onKeyDown)
       containerRef.current?.removeEventListener('contextmenu', onContextMenu)
+      alertEl?.removeEventListener('pointerdown', onAlertPointerDown, true)
+      alertEl?.removeEventListener('pointermove', onAlertPointerMove)
+      alertEl?.removeEventListener('pointerup', onAlertPointerUp)
+      alertEl?.removeEventListener('pointercancel', onAlertPointerCancel)
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(onMainRange)
       for (const kind of OSC_ORDER) destroySubPane(kind)
       try {
@@ -1420,7 +1573,69 @@ export function PriceChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [priceLinesKey])
 
-  // Trade markers: buy/sell arrows on the exact bars where the user's OWN trades
+  // Draggable armed alerts. Rendered as native price lines (so they get a clean
+  // axis label) but kept in a by-id map so the pointer handlers can move ONE of
+  // them live during a drag. Reconciled — create new, update changed, remove
+  // gone — only when the real alert set changes, never on a live tick. Every
+  // line is a real user alert; the drag re-arms it at a real price (see the
+  // pointer handlers in the mount effect and alertDrag.ts).
+  const alertsKey = JSON.stringify(
+    (alerts ?? []).map((a) => [a.id, a.price, a.condition, a.color, a.title]),
+  )
+  useEffect(() => {
+    alertsRef.current = alerts ?? []
+    onAlertMoveRef.current = onAlertMove
+    const series = seriesRef.current
+    if (!series) return
+    const map = alertLineObjsRef.current
+    const wanted = new Set<number>()
+    for (const a of alerts ?? []) {
+      if (!Number.isFinite(a.price) || a.price <= 0) continue
+      wanted.add(a.id)
+      const opts = {
+        price: a.price,
+        color: a.color || '#f0b90b',
+        lineWidth: 2 as const,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: a.title || `⤿ ${a.condition}`,
+      }
+      const existing = map.get(a.id)
+      if (existing) {
+        try {
+          existing.applyOptions(opts)
+        } catch {
+          /* series torn down */
+        }
+      } else {
+        try {
+          map.set(a.id, series.createPriceLine(opts))
+        } catch {
+          /* series torn down */
+        }
+      }
+    }
+    // Drop lines whose alert is gone.
+    for (const [id, ln] of map) {
+      if (!wanted.has(id)) {
+        try {
+          series.removePriceLine(ln)
+        } catch {
+          /* already gone */
+        }
+        map.delete(id)
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [alertsKey])
+
+  // Keep the move callback fresh for the once-bound pointer handlers even when
+  // the alert set itself hasn't changed.
+  useEffect(() => {
+    onAlertMoveRef.current = onAlertMove
+  }, [onAlertMove])
+
+
   // opened and closed (see tradesToMarkers). Real history only. Re-applied when
   // the set changes AND when the candles reload, so a marker never vanishes on a
   // periodic refresh (setData can drop markers) and always sits on a real bar.
@@ -1691,6 +1906,8 @@ export function PriceChart({
   useEffect(() => {
     const chart = chartRef.current
     if (!chart) return
+    fullscreenRef.current = fullscreen
+    zoomLockRef.current = zoomLock
     const drawing = tool !== 'cursor'
     chart.applyOptions({ handleScroll: !drawing, handleScale: !drawing })
     const el = containerRef.current

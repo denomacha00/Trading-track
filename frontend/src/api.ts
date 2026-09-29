@@ -331,6 +331,16 @@ export const api = {
     price: number
     note?: string | null
   }) => req<Alert>('/api/alerts', { method: 'POST', body: JSON.stringify(body) }),
+  // Edit an alert — used by drag-to-move on the chart. Moving the level
+  // (price/condition) re-arms it server-side so it can fire again.
+  updateAlert: (
+    id: number,
+    body: { price?: number; condition?: 'above' | 'below'; note?: string | null },
+  ) =>
+    req<Alert>(`/api/alerts/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
   deleteAlert: (id: number) =>
     req<{ deleted: number }>(`/api/alerts/${id}`, { method: 'DELETE' }),
 

@@ -61,6 +61,7 @@ from app.schemas import (
     AddLicenseDays,
     AlertCreate,
     AlertOut,
+    AlertUpdate,
     AutoConfirmationOut,
     BotStatus,
     CloseAllResult,
@@ -1340,6 +1341,44 @@ def create_alert(
         status="armed",
     )
     db.add(alert)
+    db.commit()
+    db.refresh(alert)
+    return AlertOut.model_validate(alert, from_attributes=True)
+
+
+@app.patch("/api/alerts/{alert_id}", response_model=AlertOut)
+def update_alert(
+    alert_id: int,
+    body: AlertUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    """Edit an alert — chiefly drag-to-move on the chart.
+
+    Repositioning the level (a new ``price`` and/or ``condition``) re-arms the
+    alert: a triggered one returns to "armed" and its trigger stamp clears, so
+    the moved level can fire again on the next real crossing.
+    """
+    alert = db.get(PriceAlert, alert_id)
+    if alert is None or alert.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Alert not found.")
+
+    moved = False
+    if body.price is not None and float(body.price) != alert.price:
+        alert.price = float(body.price)
+        moved = True
+    if body.condition is not None and body.condition != alert.condition:
+        alert.condition = body.condition
+        moved = True
+    if body.note is not None:
+        alert.note = body.note or None
+
+    # Moving the level re-arms it so it can fire again on the next real crossing.
+    if moved:
+        alert.status = "armed"
+        alert.triggered_at = None
+        alert.triggered_price = None
+
     db.commit()
     db.refresh(alert)
     return AlertOut.model_validate(alert, from_attributes=True)

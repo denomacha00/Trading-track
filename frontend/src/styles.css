@@ -2582,6 +2582,7 @@ pre.code {
 /* Price-alerts panel: the armed/triggered list under the add-alert form. Every
    row is a real, server-side alert for the current symbol (never fabricated). */
 .panel.alerts .panel-head { display: flex; align-items: center; justify-content: space-between; }
+.alert-drag-hint { margin-top: 8px; opacity: 0.75; }
 .alert-list {
   list-style: none;
   margin: 12px 0 0;
