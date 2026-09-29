@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { volumeProfile } from './volumeProfile'
+import { volumeProfile, valueArea, type VolumeRow } from './volumeProfile'
 import type { Candle } from './types'
 
 // Build candles; OHLC default to the close, volume defaults to 1. Pass highs/
@@ -72,5 +72,73 @@ describe('volumeProfile', () => {
     const c = candles([100, 101, 102], { vols: [Number.NaN, -5, 4] })
     const vp = volumeProfile(c, 4)
     expect(sumRows(vp.rows.map((r) => r.volume))).toBeCloseTo(4, 6)
+  })
+
+  it('reports a value area that brackets the POC and drops the light tails', () => {
+    // Volume clustered at 100–101, thin tails out to 110.
+    const vp = volumeProfile(
+      candles([100, 100, 100, 101, 101, 105, 110], { vols: [8, 8, 8, 6, 6, 1, 1] }),
+      12,
+    )
+    expect(vp.vah).not.toBeNull()
+    expect(vp.val).not.toBeNull()
+    expect(vp.poc).not.toBeNull()
+    // VAL <= POC <= VAH — the band contains the point of control.
+    expect(vp.val as number).toBeLessThanOrEqual(vp.poc as number)
+    expect(vp.vah as number).toBeGreaterThanOrEqual(vp.poc as number)
+    // The thin 110 tail is outside the accepted range.
+    expect(vp.vah as number).toBeLessThan(110)
+  })
+
+  it('has no value area when there is no volume', () => {
+    const vp = volumeProfile(candles([100, 101], { vols: [0, 0] }), 4)
+    expect(vp.vah).toBeNull()
+    expect(vp.val).toBeNull()
+  })
+
+  it('collapses the value area onto the single price of a flat range', () => {
+    const vp = volumeProfile(candles([100, 100], { vols: [2, 3] }), 24)
+    expect(vp.vah).toBe(100)
+    expect(vp.val).toBe(100)
+  })
+})
+
+// Build unit-width rows (lo=i, hi=i+1, mid=i+0.5) with the given volumes.
+const mkRows = (vols: number[]): VolumeRow[] =>
+  vols.map((v, i) => ({ lo: i, hi: i + 1, mid: i + 0.5, volume: v }))
+
+describe('valueArea', () => {
+  it('returns nulls for an empty or out-of-range profile', () => {
+    expect(valueArea([], 0)).toEqual({ vah: null, val: null })
+    expect(valueArea(mkRows([1, 2, 1]), 9)).toEqual({ vah: null, val: null })
+  })
+
+  it('returns nulls when every bucket is empty', () => {
+    expect(valueArea(mkRows([0, 0, 0]), 1)).toEqual({ vah: null, val: null })
+  })
+
+  it('expands from the POC toward the heavier side to reach ~70%', () => {
+    // POC at index 3 (vol 20). total=31, target=21.7. The pair above (4+1=5)
+    // beats the pair below (3+1=4), so the band grows up to index 5.
+    const rows = mkRows([1, 1, 3, 20, 4, 1, 1])
+    const { vah, val } = valueArea(rows, 3, 0.7)
+    expect(val).toBe(3) // rows[3].lo — POC bucket stayed the low edge
+    expect(vah).toBe(6) // rows[5].hi
+  })
+
+  it('covers at least the requested share of the volume', () => {
+    const rows = mkRows([1, 1, 3, 20, 4, 1, 1])
+    const total = 31
+    const { vah, val } = valueArea(rows, 3, 0.7)
+    const covered = rows
+      .filter((r) => r.lo >= (val as number) && r.hi <= (vah as number))
+      .reduce((a, r) => a + r.volume, 0)
+    expect(covered / total).toBeGreaterThanOrEqual(0.7)
+  })
+
+  it('spans the whole profile at 100% and only the POC bucket at 0%', () => {
+    const rows = mkRows([2, 5, 3])
+    expect(valueArea(rows, 1, 1)).toEqual({ vah: 3, val: 0 }) // rows[2].hi / rows[0].lo
+    expect(valueArea(rows, 1, 0)).toEqual({ vah: 2, val: 1 }) // POC bucket only
   })
 })

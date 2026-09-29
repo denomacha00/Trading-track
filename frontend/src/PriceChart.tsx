@@ -558,6 +558,9 @@ export function PriceChart({
       const s = seriesRef.current
       if (!vp || !s || vp.maxVolume <= 0) return
       const maxW = Math.max(40, width * 0.3) // widest bar spans ~30% of the plot
+      // A row is in the Value Area when its band overlaps [VAL, VAH].
+      const inVa = (lo: number, hi: number) =>
+        vp.val != null && vp.vah != null && hi > vp.val && lo < vp.vah
       ctx.save()
       for (const row of vp.rows) {
         if (row.volume <= 0) continue
@@ -568,9 +571,35 @@ export function PriceChart({
         const barH = Math.max(1, Math.abs(yLo - yHi) - 1) // 1px gap between rows
         const w = (row.volume / vp.maxVolume) * maxW
         const isPoc = vp.poc != null && row.lo <= vp.poc && vp.poc <= row.hi
-        ctx.fillStyle = isPoc ? 'rgba(240,185,11,0.55)' : 'rgba(91,141,239,0.32)'
+        // POC gold; value-area rows a solid blue; the tails outside the ~70% band
+        // faded so the accepted range reads clearly (TradingView's VA shading).
+        ctx.fillStyle = isPoc
+          ? 'rgba(240,185,11,0.55)'
+          : inVa(row.lo, row.hi)
+            ? 'rgba(91,141,239,0.34)'
+            : 'rgba(91,141,239,0.14)'
         ctx.fillRect(width - w, top, w, barH)
       }
+      // VAH / VAL boundary lines with small labels, spanning the profile's width.
+      const vaLine = (price: number, label: string) => {
+        const y = s.priceToCoordinate(price)
+        if (y == null) return
+        ctx.strokeStyle = 'rgba(91,141,239,0.7)'
+        ctx.lineWidth = 1
+        ctx.setLineDash([4, 3])
+        ctx.beginPath()
+        ctx.moveTo(width - maxW, y)
+        ctx.lineTo(width, y)
+        ctx.stroke()
+        ctx.setLineDash([])
+        ctx.font = '10px sans-serif'
+        ctx.fillStyle = 'rgba(150,180,255,0.95)'
+        ctx.textAlign = 'right'
+        ctx.textBaseline = label === 'VAH' ? 'bottom' : 'top'
+        ctx.fillText(label, width - 2, y)
+      }
+      if (vp.vah != null) vaLine(vp.vah, 'VAH')
+      if (vp.val != null) vaLine(vp.val, 'VAL')
       ctx.restore()
     }
     // Paint the computed ICT / smart-money read (see app/ict.py). Every layer is
