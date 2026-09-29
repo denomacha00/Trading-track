@@ -25,6 +25,7 @@ import type { Theme } from './theme'
 import { sma, ema, bollinger, vwap, rsi, macd, hma, donchian, keltner, stochastic, atr, obv, type IndicatorPrefs, type LinePoint } from './indicators'
 import { volumeProfile, type VolumeProfile } from './volumeProfile'
 import { heikinAshi, haBar, type ChartKind, type Ohlc } from './chartTypes'
+import { DEFAULT_INDICATOR_PARAMS, type IndicatorParams } from './indicatorParams'
 import { priceDecimals, fmtPrice, priceMinMove } from './priceFormat'
 import type { ChartMarker } from './chartMarkers'
 import { DEFAULT_ICT_OVERLAYS, ICT_COLORS, type IctOverlayPrefs } from './ictOverlays'
@@ -282,6 +283,7 @@ export function PriceChart({
   onLoadOlder,
   loadingOlder,
   chartType,
+  indicatorParams,
 }: {
   candles: Candle[]
   theme: Theme
@@ -363,6 +365,12 @@ export function PriceChart({
   // 'candles'. Indicators, drawings and alerts always stay on the real candles;
   // only the drawn bodies change, so switching is lossless.
   chartType?: ChartKind
+  // Per-indicator look-backs / multipliers (TradingView "settings" parity). The
+  // real math in indicators.ts is fed these instead of hard-coded periods, so
+  // RSI(14)→RSI(21), Bollinger(20,2)→(30,2.5), etc. are all user-tunable. Undefined
+  // = the shipped defaults, so an untouched chart is unchanged. Purely the lengths
+  // the real math uses — nothing here fabricates a value.
+  indicatorParams?: IndicatorParams
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -1803,36 +1811,40 @@ export function PriceChart({
   // — add a newly-enabled line, drop a disabled one, refresh values on reload —
   // so toggling one never churns the others or the candles. Times align to the
   // bars, so the overlays sit exactly on price.
-  const indKey = JSON.stringify(indicators ?? {})
+  // The per-indicator params, defaulted so an untouched chart uses the shipped
+  // periods. Folded into indKey below so the overlay/oscillator effects recompute
+  // the moment a length or multiplier changes.
+  const prm = indicatorParams ?? DEFAULT_INDICATOR_PARAMS
+  const indKey = JSON.stringify({ i: indicators ?? {}, p: indicatorParams ?? {} })
   useEffect(() => {
     const chart = chartRef.current
     if (!chart) return
     const p = indicators
     const specs: { key: string; color: string; data: LinePoint[] }[] = []
-    if (p?.ema9) specs.push({ key: 'ema9', color: '#f0b90b', data: ema(candles, 9) })
-    if (p?.ema21) specs.push({ key: 'ema21', color: '#3b82f6', data: ema(candles, 21) })
-    if (p?.sma50) specs.push({ key: 'sma50', color: '#a855f7', data: sma(candles, 50) })
-    if (p?.sma200) specs.push({ key: 'sma200', color: '#9aa7b8', data: sma(candles, 200) })
+    if (p?.ema9) specs.push({ key: 'ema9', color: '#f0b90b', data: ema(candles, prm.emaFast) })
+    if (p?.ema21) specs.push({ key: 'ema21', color: '#3b82f6', data: ema(candles, prm.emaSlow) })
+    if (p?.sma50) specs.push({ key: 'sma50', color: '#a855f7', data: sma(candles, prm.smaFast) })
+    if (p?.sma200) specs.push({ key: 'sma200', color: '#9aa7b8', data: sma(candles, prm.smaSlow) })
     if (p?.vwap) specs.push({ key: 'vwap', color: '#e6c200', data: vwap(candles) })
     if (p?.bb) {
-      const bb = bollinger(candles, 20, 2)
+      const bb = bollinger(candles, prm.bbPeriod, prm.bbMult)
       specs.push({ key: 'bbUpper', color: 'rgba(120,144,180,0.9)', data: bb.upper })
       specs.push({ key: 'bbBasis', color: 'rgba(120,144,180,0.45)', data: bb.basis })
       specs.push({ key: 'bbLower', color: 'rgba(120,144,180,0.9)', data: bb.lower })
     }
     if (p?.donchian) {
-      const dc = donchian(candles, 20)
+      const dc = donchian(candles, prm.donchian)
       specs.push({ key: 'dcUpper', color: 'rgba(45,212,191,0.95)', data: dc.upper })
       specs.push({ key: 'dcBasis', color: 'rgba(45,212,191,0.45)', data: dc.basis })
       specs.push({ key: 'dcLower', color: 'rgba(45,212,191,0.95)', data: dc.lower })
     }
     if (p?.keltner) {
-      const kc = keltner(candles, 20, 10, 2)
+      const kc = keltner(candles, prm.kcEma, prm.kcAtr, prm.kcMult)
       specs.push({ key: 'kcUpper', color: 'rgba(251,146,60,0.95)', data: kc.upper })
       specs.push({ key: 'kcBasis', color: 'rgba(251,146,60,0.45)', data: kc.basis })
       specs.push({ key: 'kcLower', color: 'rgba(251,146,60,0.95)', data: kc.lower })
     }
-    if (p?.hma) specs.push({ key: 'hma', color: '#ec4899', data: hma(candles, 55) })
+    if (p?.hma) specs.push({ key: 'hma', color: '#ec4899', data: hma(candles, prm.hma) })
     const want = new Set(specs.map((s) => s.key))
     const map = overlayRef.current
     for (const [key, series] of map) {
@@ -2029,12 +2041,13 @@ export function PriceChart({
         })
       }
       if (kind === 'rsi') {
-        const data = rsi(candles, 14)
+        const data = rsi(candles, prm.rsiPeriod)
         pane.lines[0].setData(data.map((pt) => ({ time: pt.time as Time, value: pt.value })))
         const latest = data.length ? data[data.length - 1].value : null
-        if (pane.label) pane.label.textContent = latest == null ? 'RSI 14' : `RSI 14  ${latest.toFixed(2)}`
+        const tag = `RSI ${prm.rsiPeriod}`
+        if (pane.label) pane.label.textContent = latest == null ? tag : `${tag}  ${latest.toFixed(2)}`
       } else if (kind === 'macd') {
-        const m = macd(candles)
+        const m = macd(candles, prm.macdFast, prm.macdSlow, prm.macdSignal)
         pane.lines[0].setData(m.macd.map((pt) => ({ time: pt.time as Time, value: pt.value })))
         pane.lines[1].setData(m.signal.map((pt) => ({ time: pt.time as Time, value: pt.value })))
         pane.hist?.setData(
@@ -2042,30 +2055,33 @@ export function PriceChart({
         )
         const lastLine = m.macd.length ? m.macd[m.macd.length - 1].value : null
         const lastSig = m.signal.length ? m.signal[m.signal.length - 1].value : null
+        const tag = `MACD ${prm.macdFast} ${prm.macdSlow} ${prm.macdSignal}`
         if (pane.label) {
           pane.label.textContent = lastLine == null
-            ? 'MACD 12 26 9'
-            : `MACD 12 26 9  ${lastLine.toFixed(2)} / ${lastSig != null ? lastSig.toFixed(2) : '—'}`
+            ? tag
+            : `${tag}  ${lastLine.toFixed(2)} / ${lastSig != null ? lastSig.toFixed(2) : '—'}`
         }
       } else if (kind === 'stoch') {
-        const s = stochastic(candles, 14, 3, 3)
+        const s = stochastic(candles, prm.stochK, prm.stochD, prm.stochSmooth)
         pane.lines[0].setData(s.k.map((pt) => ({ time: pt.time as Time, value: pt.value })))
         pane.lines[1].setData(s.d.map((pt) => ({ time: pt.time as Time, value: pt.value })))
         const lastK = s.k.length ? s.k[s.k.length - 1].value : null
         const lastD = s.d.length ? s.d[s.d.length - 1].value : null
+        const tag = `Stoch ${prm.stochK} ${prm.stochD} ${prm.stochSmooth}`
         if (pane.label) {
           pane.label.textContent = lastK == null
-            ? 'Stoch 14 3 3'
-            : `Stoch 14 3 3  ${lastK.toFixed(2)} / ${lastD != null ? lastD.toFixed(2) : '—'}`
+            ? tag
+            : `${tag}  ${lastK.toFixed(2)} / ${lastD != null ? lastD.toFixed(2) : '—'}`
         }
       } else if (kind === 'atr') {
-        const a = atr(candles, 14)
+        const a = atr(candles, prm.atrPeriod)
         pane.lines[0].setData(a.map((pt) => ({ time: pt.time as Time, value: pt.value })))
         const latest = a.length ? a[a.length - 1].value : null
+        const tag = `ATR ${prm.atrPeriod}`
         if (pane.label) {
           pane.label.textContent = latest == null
-            ? 'ATR 14'
-            : `ATR 14  ${latest.toLocaleString('en-US', { maximumSignificantDigits: 5 })}`
+            ? tag
+            : `${tag}  ${latest.toLocaleString('en-US', { maximumSignificantDigits: 5 })}`
         }
       } else {
         // obv — cumulative from the loaded range; compact label (values are large).

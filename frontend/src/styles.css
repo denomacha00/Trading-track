@@ -1107,7 +1107,7 @@ th.mono {
   top: calc(100% + 4px);
   right: 0;
   z-index: 40;
-  width: 220px;
+  width: 260px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -1159,6 +1159,57 @@ th.mono {
 }
 .ind-clear:hover {
   color: var(--text);
+}
+/* An indicator row plus (when it's on and tunable) its param inputs under it. */
+.ind-item {
+  display: flex;
+  flex-direction: column;
+}
+/* Compact, indented row of length/multiplier inputs under an enabled indicator
+   (TradingView "settings" parity). Wraps so a 3-input study (MACD, Stochastic,
+   Keltner) lays out cleanly inside the panel. */
+.ind-params {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 2px 8px 8px 30px;
+}
+.ind-param {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  cursor: default;
+}
+.ind-param-name {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+}
+.ind-param-input {
+  width: 54px;
+  background: var(--input-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+.ind-param-input:focus {
+  outline: none;
+  border-color: var(--accent, #f0b90b);
+}
+/* Footer holding Clear-all / Reset-lengths side by side. */
+.ind-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
+}
+.ind-actions .ind-clear {
+  border-top: none;
+  width: auto;
+  flex: 1 1 auto;
 }
 
 /* Saved chart layouts dropdown — reuses .ind-menu / .ind-btn / .ind-panel; the

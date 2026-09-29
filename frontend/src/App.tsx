@@ -40,6 +40,15 @@ import {
 import { loadTurns, saveTurns } from './chatHistory'
 import { mergeOlder, mergeRecent, nextOlderEndMs, tfMs, OLDER_CHUNK } from './lazyHistory'
 import { CHART_TYPES, isChartKind, type ChartKind } from './chartTypes'
+import {
+  DEFAULT_INDICATOR_PARAMS,
+  PARAM_GROUPS,
+  parseParams,
+  clampField,
+  indicatorLabel,
+  type IndicatorParams,
+  type ParamField,
+} from './indicatorParams'
 import { useBinanceStream } from './useBinanceStream'
 import { Login, LicenseGate } from './Login'
 import { Admin } from './Admin'
@@ -375,6 +384,20 @@ function Dashboard({
     }
     return DEFAULT_INDICATORS
   })
+  // Per-indicator look-backs / multipliers (TradingView "settings" parity),
+  // persisted so a tuned RSI(21) or Bollinger(30,2.5) sticks between visits.
+  // parseParams is boot-safe and re-validates every field, so a corrupt or stale
+  // stored value can never feed a garbage period into the chart's real math.
+  const [indicatorParams, setIndicatorParams] = useState<IndicatorParams>(
+    () => parseParams(localStorage.getItem('tt.indicatorParams')),
+  )
+  useEffect(() => {
+    try {
+      localStorage.setItem('tt.indicatorParams', JSON.stringify(indicatorParams))
+    } catch {
+      /* storage full/unavailable — non-fatal, params just won't persist */
+    }
+  }, [indicatorParams])
   // Which ICT / smart-money overlays are switched on (persisted like the layout).
   // The chart draws only the layers turned on here, and only from levels the
   // backend actually computed — a toggle reveals a real layer, never fakes one.
@@ -1931,7 +1954,12 @@ function Dashboard({
                   </select>
                 )}
                 {chartView === 'bot' && (
-                  <IndicatorsMenu value={indicators} onChange={setIndicators} />
+                  <IndicatorsMenu
+                    value={indicators}
+                    onChange={setIndicators}
+                    params={indicatorParams}
+                    onParams={setIndicatorParams}
+                  />
                 )}
                 {chartView === 'bot' && settings?.ict_enabled && (
                   <IctMenu value={ictOverlays} onChange={setIctOverlays} />
@@ -2125,6 +2153,7 @@ function Dashboard({
                     alerts={chartAlerts}
                     onAlertMove={onAlertMove}
                     indicators={indicators}
+                    indicatorParams={indicatorParams}
                     ict={ictRead}
                     ictOverlays={ictOverlays}
                     markers={showTradeMarkers ? chartMarkers : []}
@@ -2918,6 +2947,56 @@ const VOLUME_DEFS: { key: keyof IndicatorPrefs; label: string; color: string }[]
   { key: 'volumeProfile', label: 'Volume Profile (VPVR)', color: '#f0b90b' },
 ]
 
+// Look-up from an indicator toggle to its tunable fields (built once from the
+// param groups), so a menu row can show the right inputs under each indicator.
+const PARAM_FIELDS_BY_IND = new Map<keyof IndicatorPrefs, ParamField[]>(
+  PARAM_GROUPS.map((g) => [g.ind, g.fields]),
+)
+
+// One validated number input for an indicator length/multiplier. The edit is kept
+// as free text while focused (so you can clear the box and retype); on blur / Enter
+// it's clamped to the field's real bounds (clampField) and committed. The draft
+// then re-syncs to the committed value, so a clamped-away entry snaps back to what
+// actually took effect — the box never shows a number the chart isn't using.
+function ParamInput({
+  field,
+  value,
+  onCommit,
+}: {
+  field: ParamField
+  value: number
+  onCommit: (v: number) => void
+}) {
+  const [draft, setDraft] = useState(String(value))
+  useEffect(() => {
+    setDraft(String(value))
+  }, [value])
+  const commit = () => {
+    const v = clampField(field.key, draft)
+    setDraft(String(v))
+    onCommit(v)
+  }
+  return (
+    <label className="ind-param" title={`${field.label} (${field.min}–${field.max})`}>
+      <span className="ind-param-name">{field.label}</span>
+      <input
+        type="number"
+        className="ind-param-input"
+        inputMode="decimal"
+        min={field.min}
+        max={field.max}
+        step={field.step}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+        }}
+      />
+    </label>
+  )
+}
+
 // TradingView-style "Indicators" dropdown for the bot chart: tick the moving
 // averages / bands / VWAP to overlay. The choice is saved (localStorage) by the
 // parent, so it persists like a saved layout. Every overlay is computed from the
@@ -2925,9 +3004,13 @@ const VOLUME_DEFS: { key: keyof IndicatorPrefs; label: string; color: string }[]
 function IndicatorsMenu({
   value,
   onChange,
+  params,
+  onParams,
 }: {
   value: IndicatorPrefs
   onChange: (v: IndicatorPrefs) => void
+  params: IndicatorParams
+  onParams: (p: IndicatorParams) => void
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
@@ -2950,6 +3033,38 @@ function IndicatorsMenu({
     INDICATOR_DEFS.filter((d) => value[d.key]).length +
     OSCILLATOR_DEFS.filter((d) => value[d.key]).length +
     VOLUME_DEFS.filter((d) => value[d.key]).length
+  const paramsDirty = JSON.stringify(params) !== JSON.stringify(DEFAULT_INDICATOR_PARAMS)
+  // One indicator row: the toggle + its live (param-reflecting) label, and — when
+  // it's on and has tunables — a compact row of validated number inputs beneath it.
+  const renderDef = (d: { key: keyof IndicatorPrefs; label: string; color: string }) => {
+    const fields = PARAM_FIELDS_BY_IND.get(d.key)
+    const on = value[d.key]
+    return (
+      <div key={d.key} className="ind-item">
+        <label className="ind-row">
+          <input
+            type="checkbox"
+            checked={on}
+            onChange={(e) => onChange({ ...value, [d.key]: e.target.checked })}
+          />
+          <span className="ind-swatch" style={{ background: d.color }} />
+          <span className="ind-label">{indicatorLabel(d.key, params) ?? d.label}</span>
+        </label>
+        {on && fields && (
+          <div className="ind-params">
+            {fields.map((f) => (
+              <ParamInput
+                key={f.key}
+                field={f}
+                value={params[f.key]}
+                onCommit={(v) => onParams({ ...params, [f.key]: v })}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
   return (
     <div className="ind-menu" ref={ref}>
       <button
@@ -2965,49 +3080,33 @@ function IndicatorsMenu({
       </button>
       {open && (
         <div className="ind-panel">
-          {INDICATOR_DEFS.map((d) => (
-            <label key={d.key} className="ind-row">
-              <input
-                type="checkbox"
-                checked={value[d.key]}
-                onChange={(e) => onChange({ ...value, [d.key]: e.target.checked })}
-              />
-              <span className="ind-swatch" style={{ background: d.color }} />
-              <span className="ind-label">{d.label}</span>
-            </label>
-          ))}
+          {INDICATOR_DEFS.map(renderDef)}
           <div className="ind-group">Oscillators · own pane</div>
-          {OSCILLATOR_DEFS.map((d) => (
-            <label key={d.key} className="ind-row">
-              <input
-                type="checkbox"
-                checked={value[d.key]}
-                onChange={(e) => onChange({ ...value, [d.key]: e.target.checked })}
-              />
-              <span className="ind-swatch" style={{ background: d.color }} />
-              <span className="ind-label">{d.label}</span>
-            </label>
-          ))}
+          {OSCILLATOR_DEFS.map(renderDef)}
           <div className="ind-group">Volume</div>
-          {VOLUME_DEFS.map((d) => (
-            <label key={d.key} className="ind-row">
-              <input
-                type="checkbox"
-                checked={value[d.key]}
-                onChange={(e) => onChange({ ...value, [d.key]: e.target.checked })}
-              />
-              <span className="ind-swatch" style={{ background: d.color }} />
-              <span className="ind-label">{d.label}</span>
-            </label>
-          ))}
-          {count > 0 && (
-            <button
-              type="button"
-              className="ind-clear"
-              onClick={() => onChange({ ...DEFAULT_INDICATORS })}
-            >
-              Clear all
-            </button>
+          {VOLUME_DEFS.map(renderDef)}
+          {(count > 0 || paramsDirty) && (
+            <div className="ind-actions">
+              {count > 0 && (
+                <button
+                  type="button"
+                  className="ind-clear"
+                  onClick={() => onChange({ ...DEFAULT_INDICATORS })}
+                >
+                  Clear all
+                </button>
+              )}
+              {paramsDirty && (
+                <button
+                  type="button"
+                  className="ind-clear"
+                  onClick={() => onParams({ ...DEFAULT_INDICATOR_PARAMS })}
+                  title="Restore every indicator length/multiplier to its default"
+                >
+                  Reset lengths
+                </button>
+              )}
+            </div>
           )}
         </div>
       )}
