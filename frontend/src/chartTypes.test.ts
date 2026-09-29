@@ -1,6 +1,17 @@
 import { describe, it, expect } from 'vitest'
-import { heikinAshi, haBar, CHART_TYPES, isChartKind } from './chartTypes'
+import {
+  heikinAshi,
+  haBar,
+  CHART_TYPES,
+  isChartKind,
+  hollowStyle,
+  hollowStyles,
+  HOLLOW_TRANSPARENT,
+} from './chartTypes'
 import type { Candle } from './types'
+
+const UP = '#16c784'
+const DOWN = '#ea3943'
 
 // A small hand-verifiable series (values chosen so the HA arithmetic is exact).
 const SERIES: Candle[] = [
@@ -79,13 +90,59 @@ describe('haBar (live-bar transform)', () => {
 })
 
 describe('CHART_TYPES / isChartKind', () => {
-  it('lists candles and heikin_ashi', () => {
-    expect(CHART_TYPES.map((t) => t.key)).toEqual(['candles', 'heikin_ashi'])
+  it('lists candles, heikin_ashi and hollow', () => {
+    expect(CHART_TYPES.map((t) => t.key)).toEqual(['candles', 'heikin_ashi', 'hollow'])
   })
   it('guards known kinds', () => {
     expect(isChartKind('candles')).toBe(true)
     expect(isChartKind('heikin_ashi')).toBe(true)
+    expect(isChartKind('hollow')).toBe(true)
     expect(isChartKind('line')).toBe(false)
     expect(isChartKind(null)).toBe(false)
+  })
+})
+
+describe('hollowStyle (one bar)', () => {
+  it('first bar (no prev close) colours by close vs open — up & hollow when close>=open', () => {
+    const s = hollowStyle({ open: 100, high: 110, low: 95, close: 105 }, null, UP, DOWN)
+    expect(s.borderColor).toBe(UP) // close(105) >= open(100) → up colour
+    expect(s.wickColor).toBe(UP)
+    expect(s.color).toBe(HOLLOW_TRANSPARENT) // bullish body → hollow
+  })
+
+  it('first bar down & filled when close<open', () => {
+    const s = hollowStyle({ open: 105, high: 106, low: 95, close: 98 }, null, UP, DOWN)
+    expect(s.borderColor).toBe(DOWN)
+    expect(s.color).toBe(DOWN) // bearish body → filled with the down colour
+  })
+
+  it('colours by PREVIOUS close, independent of the body fill', () => {
+    // Bar closed UP vs its open (hollow) but DOWN vs the previous close → red hollow.
+    const hollowButDown = hollowStyle({ open: 100, high: 112, low: 99, close: 108 }, 120, UP, DOWN)
+    expect(hollowButDown.color).toBe(HOLLOW_TRANSPARENT) // close>=open → hollow
+    expect(hollowButDown.borderColor).toBe(DOWN) // close(108) < prevClose(120) → down colour
+    // Bar closed DOWN vs its open (filled) but UP vs the previous close → green filled.
+    const filledButUp = hollowStyle({ open: 110, high: 111, low: 104, close: 106 }, 100, UP, DOWN)
+    expect(filledButUp.color).toBe(UP) // close<open → filled, coloured up
+    expect(filledButUp.borderColor).toBe(UP) // close(106) >= prevClose(100) → up colour
+  })
+
+  it('falls back to close vs open when prevClose is non-finite', () => {
+    const s = hollowStyle({ open: 100, high: 110, low: 95, close: 105 }, NaN, UP, DOWN)
+    expect(s.borderColor).toBe(UP)
+  })
+})
+
+describe('hollowStyles (batch)', () => {
+  it('keeps length/order and colours each bar against the prior close', () => {
+    const styles = hollowStyles(SERIES, UP, DOWN)
+    expect(styles.length).toBe(SERIES.length)
+    // Bar 0: no prev close, close(105)>=open(100) → up.
+    expect(styles[0].borderColor).toBe(UP)
+    // Bar 1: close(108) >= prevClose(105) → up.
+    expect(styles[1].borderColor).toBe(UP)
+    // Bar 2: close(106) < prevClose(108) → down (even though 106>=open? open=108 → filled).
+    expect(styles[2].borderColor).toBe(DOWN)
+    expect(styles[2].color).toBe(DOWN) // close(106) < open(108) → filled
   })
 })

@@ -24,7 +24,7 @@ import type { IctAnalysis, IctZone } from './types'
 import type { Theme } from './theme'
 import { sma, ema, bollinger, vwap, rsi, macd, hma, donchian, keltner, stochastic, atr, obv, type IndicatorPrefs, type LinePoint } from './indicators'
 import { volumeProfile, type VolumeProfile } from './volumeProfile'
-import { heikinAshi, haBar, type ChartKind, type Ohlc } from './chartTypes'
+import { heikinAshi, haBar, hollowStyle, hollowStyles, type ChartKind, type Ohlc } from './chartTypes'
 import { DEFAULT_INDICATOR_PARAMS, type IndicatorParams } from './indicatorParams'
 import { priceDecimals, fmtPrice, priceMinMove } from './priceFormat'
 import type { ChartMarker } from './chartMarkers'
@@ -393,6 +393,12 @@ export function PriceChart({
   // Live mirror of `chartType === 'heikin_ashi'` so the once-bound live-update
   // effects can branch without re-subscribing.
   const heikinRef = useRef<boolean>(chartType === 'heikin_ashi')
+  // Live mirror of `chartType === 'hollow'` plus the previous CLOSED bar's real
+  // close, so the forming hollow candle keeps its TradingView bar-over-bar colour
+  // as it ticks (colour = this close vs the previous close). Rolls forward when a
+  // bar closes, matching the batch styling in the seed effect exactly.
+  const hollowRef = useRef<boolean>(chartType === 'hollow')
+  const prevCloseRef = useRef<number | null>(null)
   const lastVolRef = useRef<number | undefined>(undefined)
   // The price-axis decimal precision currently applied to the candle series,
   // derived from the asset's magnitude (see priceDecimals) so a sub-cent coin
@@ -1484,6 +1490,10 @@ export function PriceChart({
       wickUpColor: p.up,
       wickDownColor: p.down,
     })
+    // Hollow candles carry per-point colours (set in the seed effect from the
+    // palette), so the series-level up/down above doesn't retint them; the next
+    // candle reload repaints them with the new theme's shade. The direction stays
+    // correct meanwhile — only the exact green/red shade lags one reload.
     if (lastBarRef.current && !hoveringRef.current) {
       renderLegend(lastBarRef.current, lastVolRef.current)
     }
@@ -1495,15 +1505,25 @@ export function PriceChart({
     if (!seriesRef.current || candles.length === 0) return
     // In Heikin-Ashi mode the DRAWN bars are the smoothed transform of the SAME
     // real candles; indicators/drawings/alerts below keep using the real ones.
+    // Hollow mode draws the REAL bars but recolours them (see hollowStyles).
     const ha = chartType === 'heikin_ashi'
+    const hollow = chartType === 'hollow'
     heikinRef.current = ha
+    hollowRef.current = hollow
     const bars = ha ? heikinAshi(candles) : candles
-    const data: CandlestickData[] = bars.map((c) => ({
+    // Hollow candles need the series border drawn (the outline that makes an
+    // unfilled body visible); candles / HA keep the borderless look they shipped
+    // with. Toggled here so switching type flips it in place (no series swap).
+    seriesRef.current.applyOptions({ borderVisible: hollow })
+    const pal = paletteRef.current
+    const styles = hollow && pal ? hollowStyles(candles, pal.up, pal.down) : null
+    const data: CandlestickData[] = bars.map((c, i) => ({
       time: c.time as Time,
       open: c.open,
       high: c.high,
       low: c.low,
       close: c.close,
+      ...(styles ? styles[i] : null),
     }))
     // Snapshot the view + oldest bar BEFORE we swap the data, so a lazy older-
     // history prepend can be detected and the scroll position held (see below).
@@ -1548,6 +1568,9 @@ export function PriceChart({
     // The HA bar just BEFORE the forming one, so the live paths continue the HA
     // recurrence exactly (null in candle mode or with a single bar).
     prevHARef.current = ha && data.length >= 2 ? { ...data[data.length - 2] } : null
+    // The real close of the bar BEFORE the forming one, so the live hollow candle
+    // keeps its bar-over-bar colour as it ticks (null unless hollow / <2 bars).
+    prevCloseRef.current = hollow && candles.length >= 2 ? candles[candles.length - 2].close : null
     lastVolRef.current = candles[candles.length - 1]?.volume
     if (!hoveringRef.current) renderLegend(lastBarRef.current, lastVolRef.current)
     // Fit the view on the first load and whenever the symbol/timeframe changes
@@ -1604,10 +1627,13 @@ export function PriceChart({
       close: last,
     }
     lastRawRef.current = updatedRaw
-    // Draw the real bar, or its HA transform (derived from the prior closed HA
-    // bar so it stays consistent with the batch transform), per the chart type.
+    // Draw the real bar, its HA transform (derived from the prior closed HA bar so
+    // it stays consistent with the batch transform), or the same real bar recoloured
+    // for hollow candles (bar-over-bar colour vs the previous close), per the type.
     const shown: CandlestickData = heikinRef.current
       ? { time: raw.time, ...haBar(updatedRaw, prevHARef.current) }
+      : hollowRef.current && paletteRef.current
+      ? { ...updatedRaw, ...hollowStyle(updatedRaw, prevCloseRef.current, paletteRef.current.up, paletteRef.current.down) }
       : updatedRaw
     lastBarRef.current = shown
     seriesRef.current.update(shown)
@@ -1625,12 +1651,13 @@ export function PriceChart({
     if (!Number.isFinite(liveBar.close) || liveBar.close <= 0) return
     const prevRaw = lastRawRef.current
     if (prevRaw && (liveBar.time as number) < (prevRaw.time as number)) return
-    // Rollover: the bar that was forming has just closed, so ITS Heikin-Ashi bar
-    // becomes the reference for the new one — keeping the recurrence exact between
-    // REST re-seeds (which is what makes a fresh HA candle land where a re-seed
-    // would put it).
-    if (heikinRef.current && prevRaw && (liveBar.time as number) > (prevRaw.time as number)) {
-      prevHARef.current = haBar(prevRaw, prevHARef.current)
+    // Rollover: the bar that was forming has just closed, so it becomes the
+    // reference for the new one — the Heikin-Ashi recurrence and hollow candles'
+    // bar-over-bar colour both key off the previous closed bar, kept exact between
+    // REST re-seeds (which is what makes a fresh bar land where a re-seed would).
+    if (prevRaw && (liveBar.time as number) > (prevRaw.time as number)) {
+      if (heikinRef.current) prevHARef.current = haBar(prevRaw, prevHARef.current)
+      if (hollowRef.current) prevCloseRef.current = prevRaw.close
     }
     const rawBar: CandlestickData = {
       time: liveBar.time as Time,
@@ -1642,6 +1669,8 @@ export function PriceChart({
     lastRawRef.current = rawBar
     const shown: CandlestickData = heikinRef.current
       ? { time: liveBar.time as Time, ...haBar(rawBar, prevHARef.current) }
+      : hollowRef.current && paletteRef.current
+      ? { ...rawBar, ...hollowStyle(rawBar, prevCloseRef.current, paletteRef.current.up, paletteRef.current.down) }
       : rawBar
     series.update(shown)
     lastBarRef.current = shown
