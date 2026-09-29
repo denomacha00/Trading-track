@@ -39,6 +39,7 @@ import {
 } from './layouts'
 import { loadTurns, saveTurns } from './chatHistory'
 import { mergeOlder, mergeRecent, nextOlderEndMs, tfMs, OLDER_CHUNK } from './lazyHistory'
+import { CHART_TYPES, isChartKind, type ChartKind } from './chartTypes'
 import { useBinanceStream } from './useBinanceStream'
 import { Login, LicenseGate } from './Login'
 import { Admin } from './Admin'
@@ -347,6 +348,16 @@ function Dashboard({
   useEffect(() => {
     localStorage.setItem('tt.chartZoomLock', chartZoomLock ? 'on' : 'off')
   }, [chartZoomLock])
+  // Candle-body style (TradingView "chart type"): real Candles or smoothed
+  // Heikin-Ashi. HA is a pure average of the SAME real bars — indicators, drawings
+  // and alerts stay on the real candles, so the switch is lossless. Remembered.
+  const [chartType, setChartType] = useState<ChartKind>(() => {
+    const saved = localStorage.getItem('tt.chartType')
+    return isChartKind(saved) ? saved : 'candles'
+  })
+  useEffect(() => {
+    localStorage.setItem('tt.chartType', chartType)
+  }, [chartType])
   // Bar replay (TradingView-style): step through history one candle at a time.
   // The hook owns the cursor + playback; we slice our own candle array at render
   // so PriceChart needs no replay knowledge — it just receives a window of bars
@@ -1902,6 +1913,24 @@ function Dashboard({
                   ))}
                 </select>
                 {chartView === 'bot' && (
+                  <select
+                    className="select"
+                    value={chartType}
+                    title="Chart type: real Candles, or smoothed Heikin-Ashi (a pure average of the same real bars — indicators and drawings stay on the real prices)."
+                    aria-label="Chart type"
+                    onChange={(e) => {
+                      const v = e.target.value
+                      if (isChartKind(v)) setChartType(v)
+                    }}
+                  >
+                    {CHART_TYPES.map((t) => (
+                      <option key={t.key} value={t.key}>
+                        {t.label}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                {chartView === 'bot' && (
                   <IndicatorsMenu value={indicators} onChange={setIndicators} />
                 )}
                 {chartView === 'bot' && settings?.ict_enabled && (
@@ -2105,6 +2134,7 @@ function Dashboard({
                     compare={comparePayload}
                     onLoadOlder={replay.active ? undefined : loadOlder}
                     loadingOlder={loadingOlder}
+                    chartType={chartType}
                   />
                 </>
               ) : (

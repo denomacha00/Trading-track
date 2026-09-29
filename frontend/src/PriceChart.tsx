@@ -24,6 +24,7 @@ import type { IctAnalysis, IctZone } from './types'
 import type { Theme } from './theme'
 import { sma, ema, bollinger, vwap, rsi, macd, hma, donchian, keltner, stochastic, atr, obv, type IndicatorPrefs, type LinePoint } from './indicators'
 import { volumeProfile, type VolumeProfile } from './volumeProfile'
+import { heikinAshi, haBar, type ChartKind, type Ohlc } from './chartTypes'
 import { priceDecimals, fmtPrice, priceMinMove } from './priceFormat'
 import type { ChartMarker } from './chartMarkers'
 import { DEFAULT_ICT_OVERLAYS, ICT_COLORS, type IctOverlayPrefs } from './ictOverlays'
@@ -280,6 +281,7 @@ export function PriceChart({
   compare,
   onLoadOlder,
   loadingOlder,
+  chartType,
 }: {
   candles: Candle[]
   theme: Theme
@@ -355,6 +357,12 @@ export function PriceChart({
   // undefined = the feature is off (e.g. during bar replay), an honest no-op.
   onLoadOlder?: () => void
   loadingOlder?: boolean
+  // Which candle-body style to draw (TradingView "chart type"): 'candles' shows
+  // the real OHLC bars; 'heikin_ashi' shows the smoothed Heikin-Ashi derivation
+  // (pure average of the SAME real bars — see chartTypes.heikinAshi). Undefined =
+  // 'candles'. Indicators, drawings and alerts always stay on the real candles;
+  // only the drawn bodies change, so switching is lossless.
+  chartType?: ChartKind
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -365,6 +373,18 @@ export function PriceChart({
   const compareRef = useRef<ISeriesApi<'Line'> | null>(null)
   // The newest bar, kept current so live ticks extend it rather than reset it.
   const lastBarRef = useRef<CandlestickData | null>(null)
+  // The REAL forming bar (true OHLC), kept separate from what's DRAWN. In Heikin-
+  // Ashi mode lastBarRef holds the smoothed HA bar (for the series + legend) while
+  // lastRawRef stays the genuine price — the accumulator the live-move path grows
+  // and the reference for real-price decisions (e.g. alert-drag above/below).
+  const lastRawRef = useRef<CandlestickData | null>(null)
+  // The previous CLOSED HA bar, so the forming HA candle is derived from it
+  // consistently as it ticks (and across a live rollover) — matching the batch
+  // transform exactly so a REST re-seed never makes the last candle jump.
+  const prevHARef = useRef<Ohlc | null>(null)
+  // Live mirror of `chartType === 'heikin_ashi'` so the once-bound live-update
+  // effects can branch without re-subscribing.
+  const heikinRef = useRef<boolean>(chartType === 'heikin_ashi')
   const lastVolRef = useRef<number | undefined>(undefined)
   // The price-axis decimal precision currently applied to the candle series,
   // derived from the asset's magnitude (see priceDecimals) so a sub-cent coin
@@ -1379,7 +1399,9 @@ export function PriceChart({
         }
         return
       }
-      const last = lastBarRef.current?.close ?? null
+      // The REAL last price (not the HA display close) decides above/below so a
+      // dragged alert re-arms against the genuine market level in either mode.
+      const last = lastRawRef.current?.close ?? lastBarRef.current?.close ?? null
       const cond = conditionForDrag(price, last, drag.origCond)
       onAlertMoveRef.current?.(drag.id, price, cond)
     }
@@ -1463,7 +1485,12 @@ export function PriceChart({
   // Seed / replace the full history when the candle set changes.
   useEffect(() => {
     if (!seriesRef.current || candles.length === 0) return
-    const data: CandlestickData[] = candles.map((c) => ({
+    // In Heikin-Ashi mode the DRAWN bars are the smoothed transform of the SAME
+    // real candles; indicators/drawings/alerts below keep using the real ones.
+    const ha = chartType === 'heikin_ashi'
+    heikinRef.current = ha
+    const bars = ha ? heikinAshi(candles) : candles
+    const data: CandlestickData[] = bars.map((c) => ({
       time: c.time as Time,
       open: c.open,
       high: c.high,
@@ -1479,9 +1506,10 @@ export function PriceChart({
     seriesRef.current.setData(data)
     // Match the price-axis / crosshair precision to this asset's magnitude so a
     // sub-cent coin shows its real price instead of "0.00" (lightweight-charts
-    // defaults to 2 dp). Derived from the latest real close; only re-applied when
-    // it actually changes so periodic reloads don't churn the series options.
-    const repClose = data[data.length - 1]?.close
+    // defaults to 2 dp). Derived from the latest REAL close (not the HA close) so
+    // the precision is stable across a chart-type switch; only re-applied when it
+    // actually changes so periodic reloads don't churn the series options.
+    const repClose = candles[candles.length - 1]?.close
     if (repClose != null && Number.isFinite(repClose) && repClose > 0) {
       const dp = priceDecimals(repClose)
       if (dp !== priceDpRef.current) {
@@ -1492,14 +1520,26 @@ export function PriceChart({
       }
     }
     if (volumeRef.current) {
-      const vol: HistogramData[] = candles.map((c) => ({
+      // Colour each volume bar to match the DRAWN candle's direction (HA or real)
+      // so the histogram reads with the bodies above it. The value stays the real
+      // traded volume — only the up/down tint follows the chart type.
+      const vol: HistogramData[] = candles.map((c, i) => ({
         time: c.time as Time,
         value: c.volume,
-        color: c.close >= c.open ? VOL_UP : VOL_DOWN,
+        color: bars[i].close >= bars[i].open ? VOL_UP : VOL_DOWN,
       }))
       volumeRef.current.setData(vol)
     }
+    // What's DRAWN + shown in the legend (HA bar in HA mode); the accumulator and
+    // real-price reference stay the genuine last candle.
     lastBarRef.current = { ...data[data.length - 1] }
+    const rawLast = candles[candles.length - 1]
+    lastRawRef.current = rawLast
+      ? { time: rawLast.time as Time, open: rawLast.open, high: rawLast.high, low: rawLast.low, close: rawLast.close }
+      : null
+    // The HA bar just BEFORE the forming one, so the live paths continue the HA
+    // recurrence exactly (null in candle mode or with a single bar).
+    prevHARef.current = ha && data.length >= 2 ? { ...data[data.length - 2] } : null
     lastVolRef.current = candles[candles.length - 1]?.volume
     if (!hoveringRef.current) renderLegend(lastBarRef.current, lastVolRef.current)
     // Fit the view on the first load and whenever the symbol/timeframe changes
@@ -1537,7 +1577,7 @@ export function PriceChart({
     }
     prevOldestRef.current = newOldest
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [candles, fitKey])
+  }, [candles, fitKey, chartType])
 
   // Move the newest bar live as the ticker price updates. Skipped entirely when
   // a real-time kline stream is feeding `liveBar` — that path is richer (true
@@ -1545,18 +1585,25 @@ export function PriceChart({
   useEffect(() => {
     if (liveBar) return
     if (!seriesRef.current || last == null || !Number.isFinite(last) || last <= 0) return
-    const bar = lastBarRef.current
-    if (!bar) return
-    const updated: CandlestickData = {
-      time: bar.time,
-      open: bar.open,
-      high: Math.max(bar.high, last),
-      low: Math.min(bar.low, last),
+    // Grow the REAL forming bar with the fresh trade price (real high/low/close).
+    const raw = lastRawRef.current
+    if (!raw) return
+    const updatedRaw: CandlestickData = {
+      time: raw.time,
+      open: raw.open,
+      high: Math.max(raw.high, last),
+      low: Math.min(raw.low, last),
       close: last,
     }
-    lastBarRef.current = updated
-    seriesRef.current.update(updated)
-    if (!hoveringRef.current) renderLegend(updated, lastVolRef.current)
+    lastRawRef.current = updatedRaw
+    // Draw the real bar, or its HA transform (derived from the prior closed HA
+    // bar so it stays consistent with the batch transform), per the chart type.
+    const shown: CandlestickData = heikinRef.current
+      ? { time: raw.time, ...haBar(updatedRaw, prevHARef.current) }
+      : updatedRaw
+    lastBarRef.current = shown
+    seriesRef.current.update(shown)
+    if (!hoveringRef.current) renderLegend(shown, lastVolRef.current)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [last, liveBar])
 
@@ -1568,26 +1615,37 @@ export function PriceChart({
     const series = seriesRef.current
     if (!series || !liveBar) return
     if (!Number.isFinite(liveBar.close) || liveBar.close <= 0) return
-    const prev = lastBarRef.current
-    if (prev && (liveBar.time as number) < (prev.time as number)) return
-    const bar: CandlestickData = {
+    const prevRaw = lastRawRef.current
+    if (prevRaw && (liveBar.time as number) < (prevRaw.time as number)) return
+    // Rollover: the bar that was forming has just closed, so ITS Heikin-Ashi bar
+    // becomes the reference for the new one — keeping the recurrence exact between
+    // REST re-seeds (which is what makes a fresh HA candle land where a re-seed
+    // would put it).
+    if (heikinRef.current && prevRaw && (liveBar.time as number) > (prevRaw.time as number)) {
+      prevHARef.current = haBar(prevRaw, prevHARef.current)
+    }
+    const rawBar: CandlestickData = {
       time: liveBar.time as Time,
       open: liveBar.open,
       high: liveBar.high,
       low: liveBar.low,
       close: liveBar.close,
     }
-    series.update(bar)
-    lastBarRef.current = bar
+    lastRawRef.current = rawBar
+    const shown: CandlestickData = heikinRef.current
+      ? { time: liveBar.time as Time, ...haBar(rawBar, prevHARef.current) }
+      : rawBar
+    series.update(shown)
+    lastBarRef.current = shown
     if (volumeRef.current && Number.isFinite(liveBar.volume)) {
       volumeRef.current.update({
         time: liveBar.time as Time,
         value: liveBar.volume,
-        color: liveBar.close >= liveBar.open ? VOL_UP : VOL_DOWN,
+        color: shown.close >= shown.open ? VOL_UP : VOL_DOWN,
       })
       lastVolRef.current = liveBar.volume
     }
-    if (!hoveringRef.current) renderLegend(bar, lastVolRef.current)
+    if (!hoveringRef.current) renderLegend(shown, lastVolRef.current)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveBar])
 
