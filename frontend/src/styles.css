@@ -2834,13 +2834,19 @@ pre.code {
 .chat-dock .hint.tiny { flex: 0 0 auto; }
 .chat-dock .chat-input .input { min-width: 0; }
 
-/* On phones the dock becomes a full-screen sheet so the chat fits well and is
-   comfortable to type into; the launcher hides while it's open (the sheet has
-   its own close button in the header). The same sheet kicks in on any short
-   viewport (e.g. a phone rotated into landscape) so the chat is never crushed
-   into a sliver. Safe-area insets keep the header and composer clear of
-   notches and the home indicator. */
-@media (max-width: 640px), (max-height: 520px) {
+/* On phones AND tablets the dock becomes a full-screen sheet so the chat fills
+   the whole screen and is comfortable to type into; the launcher hides while
+   it's open (the sheet has its own close button in the header). `pointer:coarse`
+   catches every touch device in BOTH orientations — including tablets and large
+   / folding phones whose landscape height is over 520px, which used to fall
+   through the size-only breakpoints and leave the chat stranded as a small
+   floating dock that never filled the screen even when rotated. The width /
+   height fallbacks still fire the sheet on a narrow or short desktop window and
+   anywhere the pointer type is unknown. Height is pinned to the dynamic viewport
+   (100dvh) so the sheet tracks the mobile browser's collapsing top/bottom bars
+   and the composer stays on-screen. Safe-area insets keep the header and
+   composer clear of notches and the home indicator. */
+@media (max-width: 640px), (max-height: 520px), (pointer: coarse) {
   .chat-dock {
     right: 0;
     left: 0;
@@ -2848,7 +2854,9 @@ pre.code {
     top: 0;
     width: auto;
     max-width: none;
-    height: auto;
+    height: 100vh; /* fallback for browsers without dynamic-viewport units */
+    height: 100dvh;
+    max-height: none;
     border-radius: 0;
     border-width: 0;
   }
@@ -2860,6 +2868,10 @@ pre.code {
   }
   .chat-fab.open { display: none; }
 }
+/* Freeze the background while the full-screen chat sheet is open (toggled from
+   App.tsx only when the sheet breakpoint is active) so nothing shows through
+   beside the sheet and the dashboard behind can't scroll under a touch drag. */
+body.chat-locked { overflow: hidden; }
 
 /* ---- Confirm-before-live approval panel -------------------------------
    Shown only when the bot has decided a LIVE entry on its own and is waiting

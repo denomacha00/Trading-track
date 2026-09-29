@@ -623,6 +623,28 @@ function Dashboard({
   useEffect(() => {
     if (chatOpen || tab === 'assistant') setChatSeenLen(turns.length)
   }, [chatOpen, tab, turns.length])
+  // On touch devices / small screens the chat dock renders as a full-screen sheet
+  // (see the .chat-dock media query). Lock the background page from scrolling
+  // while it's open so the sheet reliably covers the WHOLE viewport — no page
+  // peeking through the scrollbar gutter and no scroll "bleed" into the dashboard
+  // behind it. Desktop keeps the small floating dock, where the page should stay
+  // scrollable, so this only engages when the full-screen-sheet breakpoint is
+  // active; the media-query listener keeps it correct across a rotate/resize.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const sheet = window.matchMedia(
+      '(max-width: 640px), (max-height: 520px), (pointer: coarse)',
+    )
+    const apply = () => {
+      document.body.classList.toggle('chat-locked', chatOpen && sheet.matches)
+    }
+    apply()
+    sheet.addEventListener?.('change', apply)
+    return () => {
+      sheet.removeEventListener?.('change', apply)
+      document.body.classList.remove('chat-locked')
+    }
+  }, [chatOpen])
   // Read-aloud (Web Speech) is OFF by default; the user turns it on in the
   // assistant. Lifted so a pushed alert can be spoken from any tab when it's on.
   const [readAloud, setReadAloud] = useState(false)
