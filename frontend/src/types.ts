@@ -531,6 +531,28 @@ export interface Ticker {
   source?: string | null
 }
 
+// One ranked market-mover row — honest fields straight from the venue's 24h
+// ticker (never fabricated). `percentage` is the 24h change; `quote_volume` is
+// 24h traded volume in the quote asset (e.g. USDT).
+export interface MoverRow {
+  symbol: string
+  last: number
+  percentage: number
+  quote_volume: number
+}
+
+// Live 24h market movers computed from the exchange's OWN tickers — the honest
+// version of TradingView's paid screener/"Editor's Picks", never an invented
+// editorial list. Each list is ranked and capped server-side. Empty lists mean
+// the venue's tickers were unreachable — never faked.
+export interface Movers {
+  gainers: MoverRow[]
+  losers: MoverRow[]
+  most_active: MoverRow[]
+  quote: string
+  source?: string | null
+}
+
 // One price level of the live order book (a real resting order aggregate).
 export interface OrderBookLevel {
   price: number

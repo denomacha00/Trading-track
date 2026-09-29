@@ -24,7 +24,7 @@ import { Admin } from './Admin'
 import { useSocket } from './useSocket'
 import { useTheme, type Theme } from './theme'
 import { ThemeToggle } from './ThemeToggle'
-import type { AiHealth, Alert, AutoConfirmation, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, Fundamentals, IctAnalysis, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, ScheduledOrder, Settings, SignalRow, StrategyInfo, Technicals, TechGauge, TechItem, Ticker, Trade, TrainingReport } from './types'
+import type { AiHealth, Alert, AutoConfirmation, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, Fundamentals, IctAnalysis, MarketAnalysis, Me, Movers, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, ScheduledOrder, Settings, SignalRow, StrategyInfo, Technicals, TechGauge, TechItem, Ticker, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d', '1w']
@@ -146,7 +146,7 @@ export default function App() {
   return <Dashboard me={me} onLogout={logout} onMeChanged={setMe} theme={theme} onToggleTheme={toggleTheme} />
 }
 
-type TabKey = 'trades' | 'performance' | 'history' | 'signals' | 'assistant' | 'news' | 'fundamentals' | 'analyze' | 'technicals' | 'train' | 'backtest' | 'settings' | 'admin'
+type TabKey = 'trades' | 'performance' | 'history' | 'signals' | 'assistant' | 'news' | 'movers' | 'fundamentals' | 'analyze' | 'technicals' | 'train' | 'backtest' | 'settings' | 'admin'
 
 // Left-drawer navigation. `admin: true` items only render for admins. The same
 // keys drive the in-panel tab strip, so the two stay in sync off one `tab`.
@@ -157,6 +157,7 @@ const NAV: { key: TabKey; label: string; icon: string; admin?: boolean }[] = [
   { key: 'signals', label: 'Signals', icon: '📡' },
   { key: 'assistant', label: 'AI Assistant', icon: '🤖' },
   { key: 'news', label: 'News', icon: '📰' },
+  { key: 'movers', label: 'Movers', icon: '🔥' },
   { key: 'fundamentals', label: 'Fundamentals', icon: '🌐' },
   { key: 'analyze', label: 'Analyze', icon: '🔍' },
   { key: 'technicals', label: 'Technicals', icon: '📊' },
@@ -174,6 +175,7 @@ const NAV_LABEL: Record<TabKey, string> = {
   signals: 'Signals',
   assistant: 'AI Assistant',
   news: 'News',
+  movers: 'Movers',
   fundamentals: 'Fundamentals',
   analyze: 'Analyze',
   technicals: 'Technicals',
@@ -2123,6 +2125,12 @@ function Dashboard({
                   News
                 </span>
                 <span
+                  className={`tab ${tab === 'movers' ? 'active' : ''}`}
+                  onClick={() => setTab('movers')}
+                >
+                  Movers
+                </span>
+                <span
                   className={`tab ${tab === 'fundamentals' ? 'active' : ''}`}
                   onClick={() => setTab('fundamentals')}
                 >
@@ -2218,6 +2226,15 @@ function Dashboard({
                 />
               )}
               {tab === 'news' && <NewsPanel onError={showPanelError} />}
+              {tab === 'movers' && (
+                <MoversPanel
+                  onError={showPanelError}
+                  onPick={(s) => {
+                    setSymbol(s)
+                    showToast('ok', `Loaded ${s} on the chart`)
+                  }}
+                />
+              )}
               {tab === 'fundamentals' && (
                 <FundamentalsPanel symbol={symbol} onError={showPanelError} />
               )}
@@ -5410,6 +5427,145 @@ function AssistantPanel({
 // Memoized (see PerformancePanel): a stable `onError` keeps it from re-rendering
 // on the dashboard's live price polls; it refreshes on its own 60s cadence.
 const NewsPanel = memo(NewsPanelImpl)
+
+const MoversPanel = memo(MoversPanelImpl)
+
+// A live, honest "market movers" watchlist: the real top gainers / losers /
+// most-active spot pairs, computed server-side from the exchange's OWN 24h
+// tickers — never an invented editorial "picks" list. Tap a row to load that
+// pair on the chart. Empty = the venue's tickers were unreachable, not faked.
+function MoversPanelImpl({
+  onPick,
+  onError,
+}: {
+  onPick: (symbol: string) => void
+  onError: (msg: string) => void
+}) {
+  const [movers, setMovers] = useState<Movers | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [view, setView] = useState<'gainers' | 'losers' | 'most_active'>('gainers')
+  const [fetchedAt, setFetchedAt] = useState<number | null>(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await api.movers('USDT', 12)
+      setMovers(res)
+      setFetchedAt(Date.now())
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }, [onError])
+
+  // Refresh on mount, then poll: the backend fetches the whole ticker board in
+  // one public call, so 60s keeps it live without hammering the venue.
+  useEffect(() => {
+    load()
+    const id = setInterval(load, 60000)
+    return () => clearInterval(id)
+  }, [load])
+
+  const fmtCompactUsd = (v: number): string => {
+    const a = Math.abs(v)
+    if (a >= 1e9) return `$${(v / 1e9).toFixed(2)}B`
+    if (a >= 1e6) return `$${(v / 1e6).toFixed(2)}M`
+    if (a >= 1e3) return `$${(v / 1e3).toFixed(1)}K`
+    return `$${v.toFixed(0)}`
+  }
+  const fmtPrice = (v: number): string => {
+    const a = Math.abs(v)
+    if (a >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 2 })
+    if (a >= 1) return v.toFixed(2)
+    return v.toFixed(4)
+  }
+  const rows = movers ? movers[view] : []
+
+  return (
+    <div className="movers-panel">
+      <div className="movers-head">
+        <span>🔥 Market movers</span>
+        <span className="muted tiny">
+          {fetchedAt
+            ? `updated ${new Date(fetchedAt).toLocaleTimeString([], {
+                hour: '2-digit',
+                minute: '2-digit',
+              })}`
+            : ''}
+        </span>
+        <button
+          type="button"
+          className="btn ghost sm"
+          onClick={load}
+          disabled={loading}
+          title="Refresh movers"
+        >
+          {loading ? '…' : '↻'}
+        </button>
+      </div>
+      <p className="hint tiny">
+        Real 24h top movers from the exchange’s own tickers — never an invented
+        list. Illiquid pairs (under $1M/24h) are filtered out so a pump on
+        near-zero volume can’t masquerade as a gainer. Tap a row to chart it.
+      </p>
+      {/* __MOVERS_BODY__ */}
+      <div className="movers-seg" role="tablist" aria-label="Movers view">
+        {(
+          [
+            ['gainers', '▲ Gainers'],
+            ['losers', '▼ Losers'],
+            ['most_active', '⇅ Most active'],
+          ] as const
+        ).map(([k, label]) => (
+          <button
+            key={k}
+            type="button"
+            role="tab"
+            aria-selected={view === k}
+            className={`movers-tab ${view === k ? 'active' : ''}`}
+            onClick={() => setView(k)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      {rows.length === 0 ? (
+        <div className="empty sm">
+          {loading
+            ? 'Loading live movers…'
+            : 'No movers available — the exchange’s tickers are unreachable right now. Nothing is fabricated.'}
+        </div>
+      ) : (
+        <ul className="movers-list">
+          {rows.map((r) => {
+            const up = r.percentage >= 0
+            return (
+              <li key={r.symbol}>
+                <button
+                  type="button"
+                  className="mover-row"
+                  onClick={() => onPick(r.symbol)}
+                  title={`Load ${r.symbol} on the chart`}
+                >
+                  <span className="mover-sym">{r.symbol.replace('/', ' / ')}</span>
+                  <span className="mover-price">{fmtPrice(r.last)}</span>
+                  <span className={`mover-pct ${up ? 'up' : 'down'}`}>
+                    {up ? '+' : ''}
+                    {r.percentage.toFixed(2)}%
+                  </span>
+                  <span className="mover-vol muted">{fmtCompactUsd(r.quote_volume)}</span>
+                </button>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+      {movers?.source && <p className="hint tiny">Source: {movers.source}.</p>}
+    </div>
+  )
+}
+
 function NewsPanelImpl({ onError }: { onError: (msg: string) => void }) {
   const [news, setNews] = useState<NewsItem[]>([])
   const [newsErrors, setNewsErrors] = useState<string[]>([])

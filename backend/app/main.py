@@ -75,6 +75,7 @@ from app.schemas import (
     LoginRequest,
     ManualOrder,
     MeOut,
+    MoversOut,
     OrderBookOut,
     PerformanceOut,
     RedeemLicenseKey,
@@ -1546,6 +1547,35 @@ def ticker(
         percentage=t.get("percentage"),
         base_volume=t.get("baseVolume"),
         quote_volume=t.get("quoteVolume"),
+        source=getattr(engine.connector, "last_data_source", None),
+    )
+
+
+@app.get("/api/movers", response_model=MoversOut)
+def movers(
+    quote: str = "USDT",
+    top: int = 8,
+    min_quote_volume: float = 1_000_000.0,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    """Live top gainers / losers / most-active spot pairs — REAL 24h movers
+    from the exchange's own tickers, not an invented "picks" list. A minimum
+    quote-volume floor (default $1M/24h) keeps illiquid noise — a huge %
+    move on near-zero volume — out of the rankings; pass min_quote_volume=0
+    to disable it. Empty lists = the venue's tickers were unreachable."""
+    engine = _engine_for(db, user)
+    top = max(1, min(int(top), 50))
+    floor = max(0.0, float(min_quote_volume))
+    try:
+        m = engine.connector.market_movers(quote=quote, top=top, min_quote_volume=floor)
+    except Exception as exc:
+        raise _upstream_error("Market movers unavailable", exc)
+    return MoversOut(
+        gainers=m["gainers"],
+        losers=m["losers"],
+        most_active=m["most_active"],
+        quote=(quote or "USDT").upper(),
         source=getattr(engine.connector, "last_data_source", None),
     )
 

@@ -128,6 +128,29 @@ class TickerOut(BaseModel):
     source: Optional[str] = None
 
 
+class MoverRow(BaseModel):
+    """One ranked market-mover row — honest fields straight from the venue's
+    24h ticker, never fabricated."""
+
+    symbol: str
+    last: float
+    percentage: float  # 24h % change as the exchange reports it
+    quote_volume: float  # 24h traded volume in the quote asset (e.g. USDT)
+
+
+class MoversOut(BaseModel):
+    """Live 24h market movers computed from the exchange's OWN tickers (the
+    honest version of TradingView's paid screener/"Editor's Picks" — never an
+    invented editorial list). Each list is ranked and capped."""
+
+    gainers: list[MoverRow]
+    losers: list[MoverRow]
+    most_active: list[MoverRow]
+    quote: str
+    # Which venue served the tickers (primary exchange or geo-block fallback).
+    source: Optional[str] = None
+
+
 class OrderBookLevel(BaseModel):
     price: float
     amount: float

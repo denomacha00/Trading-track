@@ -15,6 +15,7 @@ import type {
   LicenseKeyRow,
   MarketAnalysis,
   Me,
+  Movers,
   NewsItem,
   OrderBook,
   Performance,
@@ -309,6 +310,13 @@ export const api = {
   // hardcoded list. Empty list = markets unreachable (honest, never fabricated).
   symbols: (quote = 'USDT') =>
     req<{ symbols: string[]; quote: string }>(`/api/symbols?quote=${quote}`),
+  // Live 24h market movers — REAL top gainers/losers/most-active spot pairs
+  // computed from the exchange's own tickers, not an invented "picks" list. A
+  // quote-volume floor keeps illiquid noise out; empty lists = venue unreachable.
+  movers: (quote = 'USDT', top = 8, minQuoteVolume = 1_000_000) =>
+    req<Movers>(
+      `/api/movers?quote=${quote}&top=${top}&min_quote_volume=${minQuoteVolume}`,
+    ),
   // Clean slate for SIMULATED data: wipe this account's paper trades + signal
   // log and reset the paper wallet. Real (live) trades are never touched.
   resetPaperData: () =>

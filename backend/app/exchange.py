@@ -7,6 +7,7 @@ run even when no API keys are configured (useful for paper trading and the UI).
 from __future__ import annotations
 
 import logging
+import math
 import time
 import uuid
 from typing import Any, Callable, Optional, TypeVar
@@ -93,6 +94,58 @@ _TIMEFRAME_MS: dict[str, int] = {
     "3d": 259_200_000,
     "1w": 604_800_000,
 }
+
+
+def rank_movers(
+    tickers: dict[str, Any],
+    quote: str = "USDT",
+    *,
+    top: int = 10,
+    min_quote_volume: float = 0.0,
+) -> dict[str, list[dict[str, Any]]]:
+    """Rank live 24h tickers into top gainers / losers / most-active pairs.
+
+    Honest "market movers" — the real version of TradingView's paid
+    screener/"Editor's Picks": computed straight from the venue's OWN 24h
+    tickers, never an invented editorial list. A ticker is ranked ONLY when it
+    exposes a real 24h percentage, a real last price AND a real quote volume;
+    entries missing any of these — or carrying a non-finite value — are skipped
+    rather than guessed. Only spot pairs quoted in `quote` are considered (a
+    symbol containing ':' is a derivatives contract and is ignored).
+    `min_quote_volume` drops illiquid pairs whose percentage move is just noise
+    (a +900% print on $50/day volume is not a real "gainer"). Returns three
+    lists, each ranked and capped at `top`; each row is honest, straight from
+    the ticker: {symbol, last, percentage, quote_volume}.
+    """
+    q = (quote or "USDT").upper()
+    floor = max(0.0, float(min_quote_volume))
+    rows: list[dict[str, Any]] = []
+    for sym, t in (tickers or {}).items():
+        if not isinstance(sym, str) or not isinstance(t, dict):
+            continue
+        if ":" in sym or "/" not in sym:
+            continue  # derivatives contract or malformed key — not a spot pair
+        base, _, qc = sym.partition("/")
+        if not base or qc.upper() != q:
+            continue
+        try:
+            pct = float(t.get("percentage"))
+            last = float(t.get("last", t.get("close")))
+            qv = float(t.get("quoteVolume"))
+        except (TypeError, ValueError):
+            continue  # a field the venue didn't report — honest skip, never faked
+        if not (math.isfinite(pct) and math.isfinite(last) and math.isfinite(qv)):
+            continue
+        if qv < floor:
+            continue
+        rows.append(
+            {"symbol": sym, "last": last, "percentage": pct, "quote_volume": qv}
+        )
+    n = max(0, int(top))
+    gainers = sorted(rows, key=lambda r: r["percentage"], reverse=True)[:n]
+    losers = sorted(rows, key=lambda r: r["percentage"])[:n]
+    most_active = sorted(rows, key=lambda r: r["quote_volume"], reverse=True)[:n]
+    return {"gainers": gainers, "losers": losers, "most_active": most_active}
 
 
 class BinanceConnector:
@@ -364,6 +417,26 @@ class BinanceConnector:
 
     def fetch_ticker(self, symbol: str) -> dict[str, Any]:
         return self._fetch_public(lambda c: c.fetch_ticker(symbol))
+
+    def market_movers(
+        self,
+        quote: str = "USDT",
+        *,
+        top: int = 10,
+        min_quote_volume: float = 0.0,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Live top gainers / losers / most-active spot pairs for `quote`.
+
+        Honest market movers computed from the venue's real 24h tickers (ccxt
+        ``fetch_tickers`` — one public call for the whole market) via the same
+        geo-block-aware fallback path as the other market reads, so it keeps
+        working when the primary is geo-blocked. Never an invented list — the
+        ranking/filtering rules live in :func:`rank_movers`.
+        """
+        tickers = self._fetch_public(lambda c: c.fetch_tickers())
+        return rank_movers(
+            tickers or {}, quote, top=top, min_quote_volume=min_quote_volume
+        )
 
     def fetch_price(self, symbol: str) -> float:
         ticker = self.fetch_ticker(symbol)
