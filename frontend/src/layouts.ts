@@ -1,12 +1,15 @@
 // Saved chart layouts (a.k.a. templates) — TradingView-paid "multiple layouts"
 // parity, honest version. A layout is a named, reusable snapshot of the chart's
-// configuration: timeframe, history depth, indicator overlays and ICT overlays.
-// It deliberately does NOT capture the symbol, so a layout applies to whatever
-// pair you're viewing (an "indicator template"). Everything here is pure and
-// storage-safe: parsing a corrupt or older value never throws and unknown keys
-// are dropped, so a layout saved by an older build still applies cleanly.
+// configuration: timeframe, history depth, indicator overlays, ICT overlays and
+// the per-indicator parameters (look-backs / multiples). It deliberately does NOT
+// capture the symbol, so a layout applies to whatever pair you're viewing (an
+// "indicator template"). Everything here is pure and storage-safe: parsing a
+// corrupt or older value never throws and unknown keys are dropped, so a layout
+// saved by an older build (before params were captured) still applies cleanly —
+// its params fall back to the shipped defaults.
 import { DEFAULT_INDICATORS, type IndicatorPrefs } from './indicators'
 import { DEFAULT_ICT_OVERLAYS, mergeIctOverlays, type IctOverlayPrefs } from './ictOverlays'
+import { sanitizeParams, type IndicatorParams } from './indicatorParams'
 
 export const STORAGE_KEY = 'tt.layouts'
 export const MAX_LAYOUTS = 24
@@ -18,6 +21,7 @@ export type ChartLayout = {
   chartBars: number
   indicators: IndicatorPrefs
   ict: IctOverlayPrefs
+  params: IndicatorParams
 }
 
 const INDICATOR_KEYS = Object.keys(DEFAULT_INDICATORS) as (keyof IndicatorPrefs)[]
@@ -51,8 +55,9 @@ function sameName(a: string, b: string): boolean {
 }
 
 // Coerce one raw entry into a valid layout, or null if it can't be salvaged (no
-// usable name / timeframe / positive bar count). Indicators & ICT are merged
-// onto their defaults so a missing or partial set still yields a full object.
+// usable name / timeframe / positive bar count). Indicators, ICT & params are
+// merged onto their defaults so a missing or partial set still yields a full
+// object — a layout saved before params existed gets the shipped default lengths.
 export function sanitizeLayout(raw: unknown): ChartLayout | null {
   if (!raw || typeof raw !== 'object') return null
   const o = raw as Record<string, unknown>
@@ -69,6 +74,7 @@ export function sanitizeLayout(raw: unknown): ChartLayout | null {
     chartBars,
     indicators: mergeIndicators(DEFAULT_INDICATORS, o.indicators as Partial<Record<string, unknown>>),
     ict: mergeIctOverlays(DEFAULT_ICT_OVERLAYS, o.ict as Partial<Record<string, unknown>>),
+    params: sanitizeParams(o.params),
   }
 }
 

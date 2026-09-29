@@ -15,6 +15,7 @@ import {
 } from './layouts'
 import { DEFAULT_INDICATORS } from './indicators'
 import { DEFAULT_ICT_OVERLAYS } from './ictOverlays'
+import { DEFAULT_INDICATOR_PARAMS } from './indicatorParams'
 
 // A valid layout to build variations from.
 function layout(name: string, over: Partial<ChartLayout> = {}): ChartLayout {
@@ -24,6 +25,7 @@ function layout(name: string, over: Partial<ChartLayout> = {}): ChartLayout {
     chartBars: 500,
     indicators: { ...DEFAULT_INDICATORS },
     ict: { ...DEFAULT_ICT_OVERLAYS },
+    params: { ...DEFAULT_INDICATOR_PARAMS },
     ...over,
   }
 }
@@ -84,6 +86,23 @@ describe('sanitizeLayout', () => {
   it('floors a fractional bar count', () => {
     expect(sanitizeLayout({ name: 'x', timeframe: '1h', chartBars: 500.9 })!.chartBars).toBe(500)
   })
+  it('captures indicator params, clamping bad values', () => {
+    const out = sanitizeLayout({
+      name: 'P',
+      timeframe: '1h',
+      chartBars: 200,
+      params: { rsiPeriod: 21, emaFast: 0, bbMult: 'nope' },
+    })
+    expect(out!.params.rsiPeriod).toBe(21) // real value kept
+    expect(out!.params.emaFast).toBe(1) // 0 → clamped up to the min look-back
+    expect(out!.params.bbMult).toBe(DEFAULT_INDICATOR_PARAMS.bbMult) // garbage → default
+    // full param key set present after merge
+    expect(Object.keys(out!.params).sort()).toEqual(Object.keys(DEFAULT_INDICATOR_PARAMS).sort())
+  })
+  it('fills params to shipped defaults when an older layout omits them', () => {
+    const out = sanitizeLayout({ name: 'Old', timeframe: '1h', chartBars: 200 })
+    expect(out!.params).toEqual(DEFAULT_INDICATOR_PARAMS)
+  })
 })
 
 describe('parseLayouts', () => {
@@ -106,6 +125,15 @@ describe('parseLayouts', () => {
   it('round-trips a clean list', () => {
     const list = [layout('A', { indicators: { ...DEFAULT_INDICATORS, rsi: true } }), layout('B', { timeframe: '1d' })]
     expect(parseLayouts(serializeLayouts(list))).toEqual(list)
+  })
+  it('round-trips non-default indicator params', () => {
+    const tuned = layout('Tuned', {
+      params: { ...DEFAULT_INDICATOR_PARAMS, rsiPeriod: 21, emaFast: 34, bbMult: 2.5 },
+    })
+    const out = parseLayouts(serializeLayouts([tuned]))
+    expect(out[0].params.rsiPeriod).toBe(21)
+    expect(out[0].params.emaFast).toBe(34)
+    expect(out[0].params.bbMult).toBe(2.5)
   })
 })
 

@@ -816,9 +816,10 @@ function Dashboard({
   }, [])
 
   // Saved chart layouts. saveLayout snapshots the CURRENT setup (timeframe +
-  // depth + indicator/ICT overlays) under a name, overwriting a same-name entry;
-  // applyLayout replays a saved setup onto whatever pair is charted (timeframe &
-  // depth clamped to the menus so a stale value can't wedge the picker);
+  // depth + indicator/ICT overlays + per-indicator params) under a name,
+  // overwriting a same-name entry; applyLayout replays a saved setup onto
+  // whatever pair is charted (timeframe & depth clamped to the menus so a stale
+  // value can't wedge the picker, params restored to what the layout captured);
   // deleteLayout drops one. Each outcome — saved / updated / full / applied /
   // deleted — toasts honestly. No data is fabricated; a layout just replays your
   // own earlier choices, all computed from the real candles.
@@ -833,16 +834,29 @@ function Dashboard({
       return false
     }
     const existed = layouts.some((l) => l.name.toLowerCase() === name.toLowerCase())
-    setLayouts((list) => upsertLayout(list, { name, timeframe, chartBars, indicators, ict: ictOverlays }))
+    setLayouts((list) =>
+      upsertLayout(list, {
+        name,
+        timeframe,
+        chartBars,
+        indicators,
+        ict: ictOverlays,
+        params: indicatorParams,
+      }),
+    )
     showToast('ok', existed ? `Updated layout "${name}"` : `Saved layout "${name}"`)
     return true
-  }, [layouts, timeframe, chartBars, indicators, ictOverlays, showToast])
+  }, [layouts, timeframe, chartBars, indicators, ictOverlays, indicatorParams, showToast])
 
   const applyLayout = useCallback((l: ChartLayout) => {
     if (TIMEFRAMES.includes(l.timeframe)) setTimeframe(l.timeframe)
     if (HISTORY_DEPTHS.includes(l.chartBars)) setChartBars(l.chartBars)
     setIndicators({ ...l.indicators })
     setIctOverlays({ ...l.ict })
+    // Restore the indicator look-backs/multiples the layout captured (an older
+    // layout that predates param capture carries the shipped defaults, so this
+    // is always a full, honest set — never leaves the previous chart's lengths).
+    setIndicatorParams({ ...l.params })
     showToast('ok', `Applied layout "${l.name}"`)
   }, [showToast])
 
