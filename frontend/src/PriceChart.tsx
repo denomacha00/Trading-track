@@ -22,7 +22,7 @@ import {
 import type { Candle } from './types'
 import type { IctAnalysis, IctZone } from './types'
 import type { Theme } from './theme'
-import { sma, ema, bollinger, vwap, rsi, macd, type IndicatorPrefs, type LinePoint } from './indicators'
+import { sma, ema, bollinger, vwap, rsi, macd, hma, donchian, keltner, type IndicatorPrefs, type LinePoint } from './indicators'
 import { volumeProfile, type VolumeProfile } from './volumeProfile'
 import { priceDecimals, fmtPrice, priceMinMove } from './priceFormat'
 import type { ChartMarker } from './chartMarkers'
@@ -1676,6 +1676,19 @@ export function PriceChart({
       specs.push({ key: 'bbBasis', color: 'rgba(120,144,180,0.45)', data: bb.basis })
       specs.push({ key: 'bbLower', color: 'rgba(120,144,180,0.9)', data: bb.lower })
     }
+    if (p?.donchian) {
+      const dc = donchian(candles, 20)
+      specs.push({ key: 'dcUpper', color: 'rgba(45,212,191,0.95)', data: dc.upper })
+      specs.push({ key: 'dcBasis', color: 'rgba(45,212,191,0.45)', data: dc.basis })
+      specs.push({ key: 'dcLower', color: 'rgba(45,212,191,0.95)', data: dc.lower })
+    }
+    if (p?.keltner) {
+      const kc = keltner(candles, 20, 10, 2)
+      specs.push({ key: 'kcUpper', color: 'rgba(251,146,60,0.95)', data: kc.upper })
+      specs.push({ key: 'kcBasis', color: 'rgba(251,146,60,0.45)', data: kc.basis })
+      specs.push({ key: 'kcLower', color: 'rgba(251,146,60,0.95)', data: kc.lower })
+    }
+    if (p?.hma) specs.push({ key: 'hma', color: '#ec4899', data: hma(candles, 55) })
     const want = new Set(specs.map((s) => s.key))
     const map = overlayRef.current
     for (const [key, series] of map) {

@@ -2596,7 +2596,10 @@ const INDICATOR_DEFS: { key: keyof IndicatorPrefs; label: string; color: string 
   { key: 'ema21', label: 'EMA 21', color: '#3b82f6' },
   { key: 'sma50', label: 'SMA 50', color: '#a855f7' },
   { key: 'sma200', label: 'SMA 200', color: '#9aa7b8' },
+  { key: 'hma', label: 'Hull MA (55)', color: '#ec4899' },
   { key: 'bb', label: 'Bollinger Bands (20, 2)', color: 'rgba(120,144,180,0.95)' },
+  { key: 'keltner', label: 'Keltner Channels (20, 10, 2)', color: 'rgba(251,146,60,0.95)' },
+  { key: 'donchian', label: 'Donchian Channels (20)', color: 'rgba(45,212,191,0.95)' },
   { key: 'vwap', label: 'VWAP (loaded range)', color: '#e6c200' },
 ]
 

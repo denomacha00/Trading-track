@@ -296,7 +296,7 @@ _ACTION_GUIDE = (
     '"reason":"..."}. Every field is optional — send ONLY what changes. Use it just '
     "when the operator asks you to show a symbol, switch timeframe, add/remove an "
     "indicator, or wipe the hand-drawn lines. Indicator keys (true=show, false=hide): "
-    "ema9, ema21, sma50, sma200, bb, vwap, rsi, macd, volume, volumeProfile. "
+    "ema9, ema21, sma50, sma200, hma, bb, keltner, donchian, vwap, rsi, macd, volume, volumeProfile. "
     "Timeframes: 1m,5m,15m,1h,4h,1d. You can ALSO toggle the ICT / smart-money "
     'overlays with an optional "ict" object (true=show, false=hide), e.g. '
     '{"type":"chart","ict":{"orderBlocks":true,"fvg":true,"dealingRange":true},'

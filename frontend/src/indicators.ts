@@ -22,6 +22,9 @@ export type IndicatorPrefs = {
   sma50: boolean
   sma200: boolean
   bb: boolean
+  donchian: boolean
+  keltner: boolean
+  hma: boolean
   vwap: boolean
   rsi: boolean
   macd: boolean
@@ -35,6 +38,9 @@ export const DEFAULT_INDICATORS: IndicatorPrefs = {
   sma50: false,
   sma200: false,
   bb: false,
+  donchian: false,
+  keltner: false,
+  hma: false,
   vwap: false,
   rsi: false,
   macd: false,
@@ -195,4 +201,139 @@ export function macd(
     value: (lineAt.get(s.time) as number) - s.value,
   }))
   return { macd: line, signal, histogram }
+}
+
+// Weighted moving average over a plain numeric series: the newest value carries
+// the largest weight (period, period-1, …, 1). Returns a SAME-LENGTH array with
+// null before the window is full, so a caller can align it to bar times or feed
+// it into another pass (the Hull MA does exactly that). Pure — no candle shape.
+function wmaSeries(values: number[], period: number): (number | null)[] {
+  const out: (number | null)[] = new Array(values.length).fill(null)
+  if (period <= 0) return out
+  const denom = (period * (period + 1)) / 2
+  for (let i = period - 1; i < values.length; i++) {
+    let weighted = 0
+    for (let j = 0; j < period; j++) weighted += values[i - j] * (period - j)
+    out[i] = weighted / denom
+  }
+  return out
+}
+
+// Hull Moving Average (Alan Hull) — a low-lag, smooth average:
+//   HMA(n) = WMA( 2·WMA(n/2) − WMA(n), round(√n) )
+// Computed from the candles' own closes; the line begins only where the full
+// nested window is valid, so it never draws over warm-up bars.
+export function hma(candles: Candle[], period = 55): LinePoint[] {
+  if (period <= 1 || candles.length < period) return []
+  const closes = candles.map((c) => c.close)
+  const wHalf = wmaSeries(closes, Math.max(1, Math.floor(period / 2)))
+  const wFull = wmaSeries(closes, period)
+  // raw = 2·WMA(n/2) − WMA(n), defined once the full WMA exists (index period-1).
+  const start = period - 1
+  const raw: number[] = []
+  for (let i = start; i < closes.length; i++) {
+    raw.push(2 * (wHalf[i] as number) - (wFull[i] as number))
+  }
+  const sqrtN = Math.max(1, Math.round(Math.sqrt(period)))
+  const hull = wmaSeries(raw, sqrtN)
+  const out: LinePoint[] = []
+  for (let i = 0; i < hull.length; i++) {
+    const v = hull[i]
+    if (v != null) out.push({ time: candles[start + i].time, value: v })
+  }
+  return out
+}
+// APPEND_MARKER
+
+// True Range per bar, Wilder-smoothed into ATR. Returns a SAME-LENGTH per-candle
+// array (null until the average exists at bar `period`) so Keltner can line ATR
+// up with its EMA basis by index. TR uses the previous close, so it needs ≥2
+// bars; ATR(period) is seeded with the mean of the first `period` true ranges.
+function atrAligned(candles: Candle[], period = 14): (number | null)[] {
+  const out: (number | null)[] = new Array(candles.length).fill(null)
+  if (period <= 0 || candles.length <= period) return out
+  const tr: number[] = new Array(candles.length).fill(0)
+  for (let i = 1; i < candles.length; i++) {
+    const h = candles[i].high
+    const l = candles[i].low
+    const pc = candles[i - 1].close
+    tr[i] = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc))
+  }
+  let sum = 0
+  for (let i = 1; i <= period; i++) sum += tr[i]
+  let prev = sum / period
+  out[period] = prev
+  for (let i = period + 1; i < candles.length; i++) {
+    prev = (prev * (period - 1) + tr[i]) / period
+    out[i] = prev
+  }
+  return out
+}
+
+// Average True Range as plottable points — real volatility in price units,
+// starting once Wilder's average is defined. Same values atrAligned() feeds to
+// Keltner, just filtered to the bars where they exist.
+export function atr(candles: Candle[], period = 14): LinePoint[] {
+  const a = atrAligned(candles, period)
+  const out: LinePoint[] = []
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] != null) out.push({ time: candles[i].time, value: a[i] as number })
+  }
+  return out
+}
+
+// Donchian Channels — the highest high and lowest low over `period` bars, plus
+// their midline. Pure highs/lows off the candles; defined from the period-th bar.
+export function donchian(
+  candles: Candle[],
+  period = 20,
+): { upper: LinePoint[]; basis: LinePoint[]; lower: LinePoint[] } {
+  const upper: LinePoint[] = []
+  const basis: LinePoint[] = []
+  const lower: LinePoint[] = []
+  if (period <= 0) return { upper, basis, lower }
+  for (let i = period - 1; i < candles.length; i++) {
+    let hi = -Infinity
+    let lo = Infinity
+    for (let j = i - period + 1; j <= i; j++) {
+      if (candles[j].high > hi) hi = candles[j].high
+      if (candles[j].low < lo) lo = candles[j].low
+    }
+    const t = candles[i].time
+    upper.push({ time: t, value: hi })
+    lower.push({ time: t, value: lo })
+    basis.push({ time: t, value: (hi + lo) / 2 })
+  }
+  return { upper, basis, lower }
+}
+// APPEND_MARKER2
+
+// Keltner Channels — an EMA basis with an envelope `mult`×ATR wide (the modern
+// ATR form). basis = EMA(close, emaPeriod); upper/lower = basis ± mult·ATR
+// (atrPeriod). Aligned only on bars where BOTH the EMA and the ATR are defined,
+// matched by timestamp, so the three lines always share their x-points.
+export function keltner(
+  candles: Candle[],
+  emaPeriod = 20,
+  atrPeriod = 10,
+  mult = 2,
+): { basis: LinePoint[]; upper: LinePoint[]; lower: LinePoint[] } {
+  const basis: LinePoint[] = []
+  const upper: LinePoint[] = []
+  const lower: LinePoint[] = []
+  const emaLine = ema(candles, emaPeriod)
+  if (!emaLine.length) return { basis, upper, lower }
+  const a = atrAligned(candles, atrPeriod)
+  const atrAtTime = new Map<number, number>()
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] != null) atrAtTime.set(candles[i].time, a[i] as number)
+  }
+  for (const pt of emaLine) {
+    const av = atrAtTime.get(pt.time)
+    if (av == null) continue
+    basis.push({ time: pt.time, value: pt.value })
+    upper.push({ time: pt.time, value: pt.value + mult * av })
+    lower.push({ time: pt.time, value: pt.value - mult * av })
+  }
+  return { basis, upper, lower }
 }
