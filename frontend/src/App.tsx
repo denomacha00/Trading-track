@@ -5,6 +5,15 @@ import { TradingViewChart } from './TradingViewChart'
 import { useReplay, ReplayBar } from './ReplayControls'
 import { replaySlice } from './replay'
 import { alignCompare, percentChange, formatPct } from './compare'
+import {
+  MAX_WATCHLIST,
+  inList as inWatchlist,
+  toggleSymbol as toggleWatchSymbol,
+  removeSymbol as removeWatchSymbol,
+  moveSymbol as moveWatchSymbol,
+  parseStored as parseWatchlist,
+  serialize as serializeWatchlist,
+} from './watchlist'
 import { DEFAULT_INDICATORS, type IndicatorPrefs } from './indicators'
 import {
   ICT_OVERLAY_GROUPS,
@@ -146,7 +155,7 @@ export default function App() {
   return <Dashboard me={me} onLogout={logout} onMeChanged={setMe} theme={theme} onToggleTheme={toggleTheme} />
 }
 
-type TabKey = 'trades' | 'performance' | 'history' | 'signals' | 'assistant' | 'news' | 'movers' | 'fundamentals' | 'analyze' | 'technicals' | 'train' | 'backtest' | 'settings' | 'admin'
+type TabKey = 'trades' | 'performance' | 'history' | 'signals' | 'assistant' | 'news' | 'movers' | 'watchlist' | 'fundamentals' | 'analyze' | 'technicals' | 'train' | 'backtest' | 'settings' | 'admin'
 
 // Left-drawer navigation. `admin: true` items only render for admins. The same
 // keys drive the in-panel tab strip, so the two stay in sync off one `tab`.
@@ -158,6 +167,7 @@ const NAV: { key: TabKey; label: string; icon: string; admin?: boolean }[] = [
   { key: 'assistant', label: 'AI Assistant', icon: '🤖' },
   { key: 'news', label: 'News', icon: '📰' },
   { key: 'movers', label: 'Movers', icon: '🔥' },
+  { key: 'watchlist', label: 'Watchlist', icon: '⭐' },
   { key: 'fundamentals', label: 'Fundamentals', icon: '🌐' },
   { key: 'analyze', label: 'Analyze', icon: '🔍' },
   { key: 'technicals', label: 'Technicals', icon: '📊' },
@@ -176,6 +186,7 @@ const NAV_LABEL: Record<TabKey, string> = {
   assistant: 'AI Assistant',
   news: 'News',
   movers: 'Movers',
+  watchlist: 'Watchlist',
   fundamentals: 'Fundamentals',
   analyze: 'Analyze',
   technicals: 'Technicals',
@@ -196,6 +207,9 @@ const NAV_ALIAS: Record<string, TabKey> = {
   signals: 'signals', signal: 'signals',
   assistant: 'assistant', ai: 'assistant', chat: 'assistant',
   news: 'news', headlines: 'news', feed: 'news', feeds: 'news',
+  movers: 'movers', mover: 'movers', gainers: 'movers', losers: 'movers', screener: 'movers',
+  watchlist: 'watchlist', watch: 'watchlist', watchlists: 'watchlist', favorites: 'watchlist',
+  favourites: 'watchlist', favorite: 'watchlist', starred: 'watchlist', star: 'watchlist',
   fundamentals: 'fundamentals', fundamental: 'fundamentals', macro: 'fundamentals',
   sentiment: 'fundamentals', funding: 'fundamentals', dominance: 'fundamentals',
   'fear greed': 'fundamentals', feargreed: 'fundamentals', onchain: 'fundamentals',
@@ -288,6 +302,17 @@ function Dashboard({
   // the majors as a fallback so the picker is never empty if markets are briefly
   // unreachable; replaced with the live Binance listing once it loads.
   const [symbolList, setSymbolList] = useState<string[]>(SYMBOLS)
+  // The user's saved watchlist (TradingView "watchlists" parity): symbols they
+  // starred to track, persisted in localStorage and validated/deduped/capped on
+  // load so a corrupt value can never crash boot. The live prices shown against
+  // each row are real per-symbol tickers fetched in WatchlistPanel — this list
+  // only owns which pairs the user chose and their order.
+  const [watchlist, setWatchlist] = useState<string[]>(
+    () => parseWatchlist(localStorage.getItem('tt.watchlist')),
+  )
+  useEffect(() => {
+    localStorage.setItem('tt.watchlist', serializeWatchlist(watchlist))
+  }, [watchlist])
   // Which chart the user is looking at: our own real-data candle chart (with the
   // bot's trades/alerts marked) or the embedded full TradingView chart. Remembered
   // between visits.
@@ -700,6 +725,37 @@ function Dashboard({
   // That's the "Performance reacting to the whole dashboard" jank, fixed at the
   // source: the panel now only re-renders on its OWN data, never on price ticks.
   const showPanelError = useCallback((m: string) => showToast('error', m), [showToast])
+
+  // Star/unstar a symbol on the watchlist. Toast honestly on each outcome —
+  // added, removed, already-there-and-full — using the pure list helpers so the
+  // cap and dedupe rules live in one tested place.
+  const toggleWatch = useCallback((sym: string) => {
+    setWatchlist((list) => {
+      const was = inWatchlist(list, sym)
+      const next = toggleWatchSymbol(list, sym)
+      if (next === list) {
+        // Unchanged: either invalid, or an add blocked by the cap.
+        if (!was && list.length >= MAX_WATCHLIST) {
+          showToast('error', `Watchlist is full (${MAX_WATCHLIST} max) — remove one first`)
+        }
+        return list
+      }
+      showToast('ok', was ? `Removed ${sym} from watchlist` : `Added ${sym} to watchlist`)
+      return next
+    })
+  }, [showToast])
+
+  const removeWatch = useCallback((sym: string) => {
+    setWatchlist((list) => removeWatchSymbol(list, sym))
+  }, [])
+
+  const reorderWatch = useCallback((sym: string, dir: -1 | 1) => {
+    setWatchlist((list) => moveWatchSymbol(list, sym, dir))
+  }, [])
+
+  // A stable Set of watched symbols for O(1) star-state lookups in the movers
+  // rows and the chart header, recomputed only when the list actually changes.
+  const watchedSet = useMemo(() => new Set(watchlist), [watchlist])
   // Read a line aloud via the browser's Web Speech API — ONLY when the user has
   // turned voice on (OFF by default) and the browser supports it. Shared by the
   // assistant's typed replies and the proactive monitor/alert call-outs.
@@ -1696,6 +1752,15 @@ function Dashboard({
               </div>
               <div className="row" style={{ alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                 <SymbolPicker value={symbol} symbols={symbolList} onChange={setSymbol} />
+                <button
+                  type="button"
+                  className={`star-btn ${watchedSet.has(symbol) ? 'on' : ''}`}
+                  aria-pressed={watchedSet.has(symbol)}
+                  onClick={() => toggleWatch(symbol)}
+                  title={watchedSet.has(symbol) ? `Remove ${symbol} from watchlist` : `Add ${symbol} to watchlist`}
+                >
+                  {watchedSet.has(symbol) ? '★' : '☆'}
+                </button>
                 <select
                   className="select"
                   value={timeframe}
@@ -2131,6 +2196,12 @@ function Dashboard({
                   Movers
                 </span>
                 <span
+                  className={`tab ${tab === 'watchlist' ? 'active' : ''}`}
+                  onClick={() => setTab('watchlist')}
+                >
+                  Watchlist
+                </span>
+                <span
                   className={`tab ${tab === 'fundamentals' ? 'active' : ''}`}
                   onClick={() => setTab('fundamentals')}
                 >
@@ -2229,6 +2300,20 @@ function Dashboard({
               {tab === 'movers' && (
                 <MoversPanel
                   onError={showPanelError}
+                  watched={watchedSet}
+                  onToggleWatch={toggleWatch}
+                  onPick={(s) => {
+                    setSymbol(s)
+                    showToast('ok', `Loaded ${s} on the chart`)
+                  }}
+                />
+              )}
+              {tab === 'watchlist' && (
+                <WatchlistPanel
+                  symbols={watchlist}
+                  onError={showPanelError}
+                  onRemove={removeWatch}
+                  onReorder={reorderWatch}
                   onPick={(s) => {
                     setSymbol(s)
                     showToast('ok', `Loaded ${s} on the chart`)
@@ -5437,9 +5522,13 @@ const MoversPanel = memo(MoversPanelImpl)
 function MoversPanelImpl({
   onPick,
   onError,
+  watched,
+  onToggleWatch,
 }: {
   onPick: (symbol: string) => void
   onError: (msg: string) => void
+  watched: Set<string>
+  onToggleWatch: (symbol: string) => void
 }) {
   const [movers, setMovers] = useState<Movers | null>(null)
   const [loading, setLoading] = useState(false)
@@ -5540,8 +5629,9 @@ function MoversPanelImpl({
         <ul className="movers-list">
           {rows.map((r) => {
             const up = r.percentage >= 0
+            const starred = watched.has(r.symbol)
             return (
-              <li key={r.symbol}>
+              <li key={r.symbol} className="mover-li">
                 <button
                   type="button"
                   className="mover-row"
@@ -5556,12 +5646,127 @@ function MoversPanelImpl({
                   </span>
                   <span className="mover-vol muted">{fmtCompactUsd(r.quote_volume)}</span>
                 </button>
+                <button
+                  type="button"
+                  className={`star-btn ${starred ? 'on' : ''}`}
+                  aria-pressed={starred}
+                  onClick={() => onToggleWatch(r.symbol)}
+                  title={starred ? `Remove ${r.symbol} from watchlist` : `Add ${r.symbol} to watchlist`}
+                >
+                  {starred ? '★' : '☆'}
+                </button>
               </li>
             )
           })}
         </ul>
       )}
       {movers?.source && <p className="hint tiny">Source: {movers.source}.</p>}
+    </div>
+  )
+}
+
+const WatchlistPanel = memo(WatchlistPanelImpl)
+
+// The user's saved-symbols watchlist (TradingView "watchlists" parity): each
+// starred pair with its REAL live price + 24h change, polled from the venue's
+// own per-symbol ticker. A pair whose ticker is momentarily unreachable shows
+// an em dash — never a stale or invented number. Tap a row to chart it; reorder
+// or unstar with the row controls.
+function WatchlistPanelImpl({
+  symbols,
+  onPick,
+  onRemove,
+  onReorder,
+  onError,
+}: {
+  symbols: string[]
+  onPick: (symbol: string) => void
+  onRemove: (symbol: string) => void
+  onReorder: (symbol: string, dir: -1 | 1) => void
+  onError: (msg: string) => void
+}) {
+  type Quote = { last: number | null; pct: number | null }
+  const [quotes, setQuotes] = useState<Record<string, Quote>>({})
+  const [loading, setLoading] = useState(false)
+  const [fetchedAt, setFetchedAt] = useState<number | null>(null)
+
+  const load = useCallback(async () => {
+    if (symbols.length === 0) { setQuotes({}); setFetchedAt(Date.now()); return }
+    setLoading(true)
+    try {
+      const results = await Promise.allSettled(symbols.map((s) => api.ticker(s)))
+      const next: Record<string, Quote> = {}
+      results.forEach((r, i) => {
+        if (r.status === 'fulfilled') {
+          next[symbols[i]] = { last: r.value.last, pct: r.value.percentage }
+        } else {
+          next[symbols[i]] = { last: null, pct: null }
+        }
+      })
+      setQuotes(next)
+      setFetchedAt(Date.now())
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }, [symbols, onError])
+
+  useEffect(() => {
+    load()
+    const id = setInterval(load, 60000)
+    return () => clearInterval(id)
+  }, [load])
+
+  const fmtPrice = (v: number | null): string => {
+    if (v == null || !Number.isFinite(v)) return '—'
+    const a = Math.abs(v)
+    if (a >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 2 })
+    if (a >= 1) return v.toFixed(2)
+    return v.toFixed(4)
+  }
+  const fmtPct = (v: number | null): string =>
+    v == null || !Number.isFinite(v) ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`
+
+  return (
+    <div className="movers-panel">
+      <div className="movers-head">
+        <span>⭐ Watchlist</span>
+        <span className="muted tiny">
+          {fetchedAt ? `updated ${new Date(fetchedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}
+        </span>
+        <button type="button" className="btn ghost sm" onClick={load} disabled={loading || symbols.length === 0} title="Refresh prices">
+          {loading ? '…' : '↻'}
+        </button>
+      </div>
+      {symbols.length === 0 ? (
+        <div className="empty sm">
+          No saved symbols yet. Tap the ☆ on a Movers row (or the chart header) to track a pair here — its real live price updates automatically.
+        </div>
+      ) : (
+        <ul className="movers-list">
+          {symbols.map((sym, i) => {
+            const q = quotes[sym]
+            const pct = q ? q.pct : null
+            const up = pct != null && pct >= 0
+            return (
+              <li key={sym} className="mover-li">
+                <button type="button" className="mover-row" onClick={() => onPick(sym)} title={`Load ${sym} on the chart`}>
+                  <span className="mover-sym">{sym.replace('/', ' / ')}</span>
+                  <span className="mover-price">{q ? fmtPrice(q.last) : '…'}</span>
+                  <span className={`mover-pct ${pct == null ? 'muted' : up ? 'up' : 'down'}`}>{fmtPct(pct)}</span>
+                </button>
+                <span className="watch-ctrls">
+                  <button type="button" className="star-btn sm" onClick={() => onReorder(sym, -1)} disabled={i === 0} title="Move up" aria-label={`Move ${sym} up`}>▲</button>
+                  <button type="button" className="star-btn sm" onClick={() => onReorder(sym, 1)} disabled={i === symbols.length - 1} title="Move down" aria-label={`Move ${sym} down`}>▼</button>
+                  <button type="button" className="star-btn on" onClick={() => onRemove(sym)} title={`Remove ${sym}`} aria-label={`Remove ${sym} from watchlist`}>✕</button>
+                </span>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+      <p className="hint tiny">Live per-symbol prices from the exchange. A pair that’s briefly unreachable shows “—”, never a stale figure. Up to {MAX_WATCHLIST} symbols.</p>
     </div>
   )
 }

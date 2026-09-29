@@ -2441,6 +2441,34 @@ pre.code {
 .mover-pct.down { color: var(--red); }
 .mover-vol { text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; }
 
+/* A movers/watchlist list item: the clickable row grows to fill the width and
+   the star / reorder / remove controls sit at the trailing edge. */
+.mover-li { display: flex; align-items: center; gap: 4px; }
+.mover-li .mover-row { flex: 1 1 auto; min-width: 0; }
+.watch-ctrls { display: inline-flex; align-items: center; gap: 2px; flex: 0 0 auto; }
+/* Star toggle (also reused for the watchlist reorder ▲▼ and remove ✕ buttons).
+   Muted by default; gold when active so a tracked pair reads at a glance. */
+.star-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 30px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.star-btn.sm { min-width: 24px; height: 24px; font-size: 11px; }
+.star-btn:hover:not(:disabled) { background: var(--panel-2); border-color: var(--border); color: var(--text); }
+.star-btn.on { color: var(--gold, #f5b301); }
+.star-btn:disabled { opacity: 0.35; cursor: default; }
+
 
 /* Fundamentals panel: a responsive grid of honest data cards (sentiment, global
    market, per-coin fundamentals, trailing returns, derivatives). */
