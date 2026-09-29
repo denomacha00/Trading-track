@@ -2258,7 +2258,7 @@ _AI_RISK_SETTINGS = {
 # and the timeframe set mirrors the chart's own picker; anything else is dropped.
 _AI_CHART_INDICATORS = {
     "ema9", "ema21", "sma50", "sma200", "hma", "bb", "keltner", "donchian", "vwap",
-    "rsi", "macd", "volume", "volumeProfile",
+    "rsi", "macd", "stoch", "atr", "obv", "volume", "volumeProfile",
 }
 _AI_CHART_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w"}
 # The ICT / smart-money overlay keys the assistant may toggle on the chart. These

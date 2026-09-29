@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { sma, ema, rsi, vwap, bollinger, macd, hma, atr, donchian, keltner, DEFAULT_INDICATORS } from './indicators'
+import { sma, ema, rsi, vwap, bollinger, macd, hma, atr, donchian, keltner, stochastic, obv, DEFAULT_INDICATORS } from './indicators'
 import type { Candle } from './types'
 
 // Build candles from a list of closes. time is a simple 60s grid; OHLC default
@@ -168,11 +168,74 @@ describe('keltner', () => {
   })
 })
 
+describe('stochastic', () => {
+  it('pins %K and %D near 100 on a monotonic up-ramp (close at the top of range)', () => {
+    // high=low=close ramp: current close is the window's highest, oldest its
+    // lowest → raw %K = 100 every bar → both smoothed lines are 100.
+    const s = stochastic(candles(Array.from({ length: 20 }, (_, i) => i + 1)), 14, 3, 3)
+    expect(s.k.length).toBeGreaterThan(0)
+    expect(s.d.length).toBeGreaterThan(0)
+    for (const p of s.k) expect(p.value).toBeCloseTo(100, 9)
+    for (const p of s.d) expect(p.value).toBeCloseTo(100, 9)
+  })
+
+  it('pins %K and %D near 0 on a monotonic down-ramp (close at the bottom)', () => {
+    const s = stochastic(candles(Array.from({ length: 20 }, (_, i) => 20 - i)), 14, 3, 3)
+    expect(s.k.length).toBeGreaterThan(0)
+    for (const p of s.k) expect(p.value).toBeCloseTo(0, 9)
+    for (const p of s.d) expect(p.value).toBeCloseTo(0, 9)
+  })
+
+  it('stays within 0..100 and keeps %K/%D time-aligned on oscillating data', () => {
+    const closes = Array.from({ length: 60 }, (_, i) => 100 + Math.sin(i / 2) * 8)
+    const highs = closes.map((c) => c + 1)
+    const lows = closes.map((c) => c - 1)
+    const s = stochastic(candles(closes, { highs, lows }), 14, 3, 3)
+    for (const p of s.k) {
+      expect(p.value).toBeGreaterThanOrEqual(0)
+      expect(p.value).toBeLessThanOrEqual(100)
+    }
+    // %D lags %K by dPeriod-1 points but every %D time must match some %K time.
+    const kTimes = new Set(s.k.map((p) => p.time))
+    for (const p of s.d) expect(kTimes.has(p.time)).toBe(true)
+  })
+
+  it('skips a perfectly flat window rather than inventing 50 (honest 0/0)', () => {
+    // 30 identical closes → every 14-bar window has high == low → raw %K is 0/0
+    // → no points emitted, never a fabricated midpoint.
+    expect(stochastic(candles(new Array(30).fill(50)), 14, 3, 3)).toEqual({ k: [], d: [] })
+  })
+
+  it('returns empty without enough bars', () => {
+    expect(stochastic(candles([1, 2, 3, 4, 5]), 14, 3, 3)).toEqual({ k: [], d: [] })
+  })
+})
+
+describe('obv', () => {
+  it('starts at 0 and adds/subtracts real volume by close direction', () => {
+    const c = candles([10, 11, 10, 10, 12], { vols: [5, 3, 2, 4, 6] })
+    // 0 → +3 (up) → -2 (down) → flat (equal) → +6 (up)
+    expect(obv(c).map((p) => p.value)).toEqual([0, 3, 1, 1, 7])
+  })
+
+  it('counts a non-finite volume as 0 (never guessed)', () => {
+    const c = candles([10, 11, 12], { vols: [1, NaN, 2] })
+    expect(obv(c).map((p) => p.value)).toEqual([0, 0, 2])
+  })
+
+  it('returns nothing for no candles', () => {
+    expect(obv([])).toEqual([])
+  })
+})
+
 describe('DEFAULT_INDICATORS', () => {
   it('ships the new overlays off by default (volume alone is on)', () => {
     expect(DEFAULT_INDICATORS.donchian).toBe(false)
     expect(DEFAULT_INDICATORS.keltner).toBe(false)
     expect(DEFAULT_INDICATORS.hma).toBe(false)
+    expect(DEFAULT_INDICATORS.stoch).toBe(false)
+    expect(DEFAULT_INDICATORS.atr).toBe(false)
+    expect(DEFAULT_INDICATORS.obv).toBe(false)
     expect(DEFAULT_INDICATORS.volume).toBe(true)
   })
 })

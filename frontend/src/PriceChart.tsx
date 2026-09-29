@@ -22,7 +22,7 @@ import {
 import type { Candle } from './types'
 import type { IctAnalysis, IctZone } from './types'
 import type { Theme } from './theme'
-import { sma, ema, bollinger, vwap, rsi, macd, hma, donchian, keltner, type IndicatorPrefs, type LinePoint } from './indicators'
+import { sma, ema, bollinger, vwap, rsi, macd, hma, donchian, keltner, stochastic, atr, obv, type IndicatorPrefs, type LinePoint } from './indicators'
 import { volumeProfile, type VolumeProfile } from './volumeProfile'
 import { priceDecimals, fmtPrice, priceMinMove } from './priceFormat'
 import type { ChartMarker } from './chartMarkers'
@@ -127,15 +127,20 @@ function readPalette(): Palette {
 const VOL_UP = 'rgba(38, 166, 154, 0.45)'
 const VOL_DOWN = 'rgba(239, 83, 80, 0.45)'
 
-// Oscillator sub-panes (RSI, MACD) live in their own charts stacked under price,
-// each with its own y-scale (RSI 0–100, MACD centred on 0). Line colours are
-// fixed literals (not theme-driven) so the two panes read consistently; the MACD
-// histogram uses the theme's up/down. Every value is real math on the candles.
-type OscKind = 'rsi' | 'macd'
-const OSC_ORDER: OscKind[] = ['rsi', 'macd']
+// Oscillator sub-panes live in their own charts stacked under price, each with
+// its own y-scale (RSI/Stoch 0–100, MACD centred on 0, ATR in price units, OBV a
+// cumulative volume total). Line colours are fixed literals (not theme-driven) so
+// the panes read consistently; the MACD histogram uses the theme's up/down. Every
+// value is real math on the candles.
+type OscKind = 'rsi' | 'macd' | 'stoch' | 'atr' | 'obv'
+const OSC_ORDER: OscKind[] = ['rsi', 'macd', 'stoch', 'atr', 'obv']
 const RSI_COLOR = '#d1a1ff'
 const MACD_LINE = '#3b82f6'
 const MACD_SIGNAL = '#f0b90b'
+const STOCH_K = '#22d3ee'
+const STOCH_D = '#f0b90b'
+const ATR_COLOR = '#fb923c'
+const OBV_COLOR = '#4ade80'
 // One live sub-pane: its chart, the line series it draws, the optional histogram
 // (MACD), a floating value label, and the range handler we subscribed for sync.
 type SubPane = {
@@ -385,13 +390,19 @@ export function PriceChart({
   // Indicator overlay line series (EMA/SMA/Bollinger/VWAP), keyed so we can add,
   // update, or remove one without disturbing the candles or the others.
   const overlayRef = useRef<Map<string, ISeriesApi<'Line'>>>(new Map())
-  // Oscillator sub-panes (RSI/MACD): each is its own synced chart under price.
-  // The two container divs are always in the DOM; a chart is created inside one
-  // only while its oscillator is switched on, and torn down when switched off.
+  // Oscillator sub-panes (RSI/MACD/Stoch/ATR/OBV): each is its own synced chart
+  // under price. The container divs are always in the DOM; a chart is created
+  // inside one only while its oscillator is switched on, torn down when off.
   const rsiPaneRef = useRef<HTMLDivElement>(null)
   const macdPaneRef = useRef<HTMLDivElement>(null)
+  const stochPaneRef = useRef<HTMLDivElement>(null)
+  const atrPaneRef = useRef<HTMLDivElement>(null)
+  const obvPaneRef = useRef<HTMLDivElement>(null)
   const rsiLabelRef = useRef<HTMLDivElement>(null)
   const macdLabelRef = useRef<HTMLDivElement>(null)
+  const stochLabelRef = useRef<HTMLDivElement>(null)
+  const atrLabelRef = useRef<HTMLDivElement>(null)
+  const obvLabelRef = useRef<HTMLDivElement>(null)
   const subPanesRef = useRef<Map<OscKind, SubPane>>(new Map())
   // Every chart (price + active sub-panes) so a pan/zoom on any one drives the
   // rest; the guard stops the programmatic echo from looping back.
@@ -1811,9 +1822,23 @@ export function PriceChart({
     for (const kind of OSC_ORDER) {
       if (!want.includes(kind)) destroySubPane(kind)
     }
+    const containers: Record<OscKind, HTMLDivElement | null> = {
+      rsi: rsiPaneRef.current,
+      macd: macdPaneRef.current,
+      stoch: stochPaneRef.current,
+      atr: atrPaneRef.current,
+      obv: obvPaneRef.current,
+    }
+    const labels: Record<OscKind, HTMLDivElement | null> = {
+      rsi: rsiLabelRef.current,
+      macd: macdLabelRef.current,
+      stoch: stochLabelRef.current,
+      atr: atrLabelRef.current,
+      obv: obvLabelRef.current,
+    }
     for (const kind of want) {
-      const container = kind === 'rsi' ? rsiPaneRef.current : macdPaneRef.current
-      const label = kind === 'rsi' ? rsiLabelRef.current : macdLabelRef.current
+      const container = containers[kind]
+      const label = labels[kind]
       if (!container) continue
       let pane = subPanesRef.current.get(kind)
       if (!pane) {
@@ -1838,13 +1863,24 @@ export function PriceChart({
           line.createPriceLine({ price: 70, color: p.grid, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: '70' })
           line.createPriceLine({ price: 30, color: p.grid, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: '30' })
           lines.push(line)
-        } else {
+        } else if (kind === 'macd') {
           // Histogram first so the two lines paint over it.
           hist = sub.addHistogramSeries({ priceLineVisible: false, lastValueVisible: false })
           lines.push(
             sub.addLineSeries({ color: MACD_LINE, lineWidth: 2, priceLineVisible: false, crosshairMarkerVisible: false }),
             sub.addLineSeries({ color: MACD_SIGNAL, lineWidth: 2, priceLineVisible: false, crosshairMarkerVisible: false }),
           )
+        } else if (kind === 'stoch') {
+          // %K then %D, with overbought 80 / oversold 20 guides (classic).
+          const kLine = sub.addLineSeries({ color: STOCH_K, lineWidth: 2, priceLineVisible: false, crosshairMarkerVisible: false })
+          kLine.createPriceLine({ price: 80, color: p.grid, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: '80' })
+          kLine.createPriceLine({ price: 20, color: p.grid, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: '20' })
+          lines.push(kLine, sub.addLineSeries({ color: STOCH_D, lineWidth: 2, priceLineVisible: false, crosshairMarkerVisible: false }))
+        } else if (kind === 'atr') {
+          lines.push(sub.addLineSeries({ color: ATR_COLOR, lineWidth: 2, priceLineVisible: false, crosshairMarkerVisible: false }))
+        } else {
+          // obv
+          lines.push(sub.addLineSeries({ color: OBV_COLOR, lineWidth: 2, priceLineVisible: false, crosshairMarkerVisible: false }))
         }
         const rangeHandler = (r: LogicalRange | null) => syncRange(sub, r)
         sub.timeScale().subscribeVisibleLogicalRangeChange(rangeHandler)
@@ -1864,7 +1900,7 @@ export function PriceChart({
         pane.lines[0].setData(data.map((pt) => ({ time: pt.time as Time, value: pt.value })))
         const latest = data.length ? data[data.length - 1].value : null
         if (pane.label) pane.label.textContent = latest == null ? 'RSI 14' : `RSI 14  ${latest.toFixed(2)}`
-      } else {
+      } else if (kind === 'macd') {
         const m = macd(candles)
         pane.lines[0].setData(m.macd.map((pt) => ({ time: pt.time as Time, value: pt.value })))
         pane.lines[1].setData(m.signal.map((pt) => ({ time: pt.time as Time, value: pt.value })))
@@ -1877,6 +1913,36 @@ export function PriceChart({
           pane.label.textContent = lastLine == null
             ? 'MACD 12 26 9'
             : `MACD 12 26 9  ${lastLine.toFixed(2)} / ${lastSig != null ? lastSig.toFixed(2) : '—'}`
+        }
+      } else if (kind === 'stoch') {
+        const s = stochastic(candles, 14, 3, 3)
+        pane.lines[0].setData(s.k.map((pt) => ({ time: pt.time as Time, value: pt.value })))
+        pane.lines[1].setData(s.d.map((pt) => ({ time: pt.time as Time, value: pt.value })))
+        const lastK = s.k.length ? s.k[s.k.length - 1].value : null
+        const lastD = s.d.length ? s.d[s.d.length - 1].value : null
+        if (pane.label) {
+          pane.label.textContent = lastK == null
+            ? 'Stoch 14 3 3'
+            : `Stoch 14 3 3  ${lastK.toFixed(2)} / ${lastD != null ? lastD.toFixed(2) : '—'}`
+        }
+      } else if (kind === 'atr') {
+        const a = atr(candles, 14)
+        pane.lines[0].setData(a.map((pt) => ({ time: pt.time as Time, value: pt.value })))
+        const latest = a.length ? a[a.length - 1].value : null
+        if (pane.label) {
+          pane.label.textContent = latest == null
+            ? 'ATR 14'
+            : `ATR 14  ${latest.toLocaleString('en-US', { maximumSignificantDigits: 5 })}`
+        }
+      } else {
+        // obv — cumulative from the loaded range; compact label (values are large).
+        const o = obv(candles)
+        pane.lines[0].setData(o.map((pt) => ({ time: pt.time as Time, value: pt.value })))
+        const latest = o.length ? o[o.length - 1].value : null
+        if (pane.label) {
+          pane.label.textContent = latest == null
+            ? 'OBV'
+            : `OBV  ${latest.toLocaleString('en-US', { notation: 'compact', maximumFractionDigits: 2 })}`
         }
       }
       const mainRange = main.timeScale().getVisibleLogicalRange()
@@ -2034,7 +2100,12 @@ export function PriceChart({
 
   // Grow the wrapper by one fixed-height slot per active oscillator so price
   // keeps its height and each pane stacks below (like adding TradingView panes).
-  const activeSubs = (indicators?.rsi ? 1 : 0) + (indicators?.macd ? 1 : 0)
+  const activeSubs =
+    (indicators?.rsi ? 1 : 0) +
+    (indicators?.macd ? 1 : 0) +
+    (indicators?.stoch ? 1 : 0) +
+    (indicators?.atr ? 1 : 0) +
+    (indicators?.obv ? 1 : 0)
   return (
     <div className="chart-wrap" style={{ height: 380 + activeSubs * 118 }}>
       <div className="chart-legend">
@@ -2104,6 +2175,18 @@ export function PriceChart({
       <div className={`chart-sub${indicators?.macd ? '' : ' hidden'}`}>
         <div className="chart-sub-label" ref={macdLabelRef} />
         <div className="chart-sub-canvas" ref={macdPaneRef} />
+      </div>
+      <div className={`chart-sub${indicators?.stoch ? '' : ' hidden'}`}>
+        <div className="chart-sub-label" ref={stochLabelRef} />
+        <div className="chart-sub-canvas" ref={stochPaneRef} />
+      </div>
+      <div className={`chart-sub${indicators?.atr ? '' : ' hidden'}`}>
+        <div className="chart-sub-label" ref={atrLabelRef} />
+        <div className="chart-sub-canvas" ref={atrPaneRef} />
+      </div>
+      <div className={`chart-sub${indicators?.obv ? '' : ' hidden'}`}>
+        <div className="chart-sub-label" ref={obvLabelRef} />
+        <div className="chart-sub-canvas" ref={obvPaneRef} />
       </div>
     </div>
   )

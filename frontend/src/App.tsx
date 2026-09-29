@@ -2745,10 +2745,14 @@ const INDICATOR_DEFS: { key: keyof IndicatorPrefs; label: string; color: string 
 
 // Oscillators that draw in their OWN pane under price (their y-scale isn't the
 // price), so they're offered as a separate group. Same rule: real math on the
-// chart's candles — RSI(14) and MACD(12,26,9), nothing fabricated.
+// chart's candles — RSI(14), MACD(12,26,9), Stochastic(14,3,3), ATR(14) and OBV,
+// nothing fabricated.
 const OSCILLATOR_DEFS: { key: keyof IndicatorPrefs; label: string; color: string }[] = [
   { key: 'rsi', label: 'RSI (14)', color: '#d1a1ff' },
   { key: 'macd', label: 'MACD (12, 26, 9)', color: '#3b82f6' },
+  { key: 'stoch', label: 'Stochastic (14, 3, 3)', color: '#22d3ee' },
+  { key: 'atr', label: 'ATR (14)', color: '#fb923c' },
+  { key: 'obv', label: 'OBV (loaded range)', color: '#4ade80' },
 ]
 
 // Volume visualisations. `volume` is the bar histogram along the bottom (on by

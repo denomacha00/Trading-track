@@ -12,7 +12,8 @@ export type LinePoint = { time: number; value: number }
 
 // Which price-overlay indicators the user has switched on. Persisted so the
 // choice sticks between visits (see App: loaded from / saved to localStorage).
-// The first group draws ON price; rsi/macd draw in their own sub-panes below it.
+// The first group draws ON price; rsi/macd/stoch/atr/obv draw in their own
+// sub-panes below it (each has its own y-scale, not the price axis).
 // `volume`/`volumeProfile` are the two volume VISUALISATIONS (the bottom bars
 // and the right-edge VPVR histogram) — toggles handled in PriceChart, not line
 // math here — kept in the same prefs object so they persist with the rest.
@@ -28,6 +29,9 @@ export type IndicatorPrefs = {
   vwap: boolean
   rsi: boolean
   macd: boolean
+  stoch: boolean
+  atr: boolean
+  obv: boolean
   volume: boolean
   volumeProfile: boolean
 }
@@ -44,6 +48,9 @@ export const DEFAULT_INDICATORS: IndicatorPrefs = {
   vwap: false,
   rsi: false,
   macd: false,
+  stoch: false,
+  atr: false,
+  obv: false,
   volume: true,
   volumeProfile: false,
 }
@@ -336,4 +343,70 @@ export function keltner(
     lower.push({ time: pt.time, value: pt.value - mult * av })
   }
   return { basis, upper, lower }
+}
+
+// Simple moving average over a plain LinePoint series (carries each point's own
+// timestamp through). Used to smooth the Stochastic's %K and derive %D, the same
+// way emaOfPoints backs the MACD signal. Begins once the window is full.
+function smaOfPoints(points: LinePoint[], period: number): LinePoint[] {
+  if (period <= 0 || points.length < period) return []
+  const out: LinePoint[] = []
+  let sum = 0
+  for (let i = 0; i < points.length; i++) {
+    sum += points[i].value
+    if (i >= period) sum -= points[i - period].value
+    if (i >= period - 1) out.push({ time: points[i].time, value: sum / period })
+  }
+  return out
+}
+
+// Stochastic Oscillator (slow, classic 14/3/3) — momentum as where the close
+// sits inside the recent high–low range, all real off the candles:
+//   raw %K = 100 · (close − lowestLow(kPeriod)) / (highestHigh(kPeriod) − lowestLow)
+//   %K     = SMA(raw %K, smoothK)   (the "slowing")
+//   %D     = SMA(%K, dPeriod)       (the signal line)
+// Returns two 0–100 lines aligned to their bars, for the sub-pane with 80/20
+// guides. A perfectly flat window (high == low) makes raw %K a 0/0 — that bar is
+// SKIPPED rather than shown as a fabricated 50, keeping the series honest.
+export function stochastic(
+  candles: Candle[],
+  kPeriod = 14,
+  dPeriod = 3,
+  smoothK = 3,
+): { k: LinePoint[]; d: LinePoint[] } {
+  if (kPeriod <= 0 || candles.length < kPeriod) return { k: [], d: [] }
+  const raw: LinePoint[] = []
+  for (let i = kPeriod - 1; i < candles.length; i++) {
+    let hi = -Infinity
+    let lo = Infinity
+    for (let j = i - kPeriod + 1; j <= i; j++) {
+      if (candles[j].high > hi) hi = candles[j].high
+      if (candles[j].low < lo) lo = candles[j].low
+    }
+    const range = hi - lo
+    if (!(range > 0)) continue // flat window: %K is 0/0 — skip, never invent a value
+    raw.push({ time: candles[i].time, value: (100 * (candles[i].close - lo)) / range })
+  }
+  const k = smoothK > 1 ? smaOfPoints(raw, smoothK) : raw
+  const d = smaOfPoints(k, dPeriod)
+  return { k, d }
+}
+
+// On-Balance Volume — Granville's cumulative volume flow, anchored to the first
+// loaded bar (labelled as a loaded-range total, like VWAP): add the bar's real
+// volume on an up-close, subtract it on a down-close, leave it flat on an equal
+// close. Every step uses real volume (a non-finite volume counts as 0, never
+// guessed). The absolute level is arbitrary (it depends on the anchor); it's the
+// slope/divergence that's read, so we start at 0 on the first bar.
+export function obv(candles: Candle[]): LinePoint[] {
+  if (candles.length === 0) return []
+  const out: LinePoint[] = [{ time: candles[0].time, value: 0 }]
+  let acc = 0
+  for (let i = 1; i < candles.length; i++) {
+    const v = Number.isFinite(candles[i].volume) ? candles[i].volume : 0
+    if (candles[i].close > candles[i - 1].close) acc += v
+    else if (candles[i].close < candles[i - 1].close) acc -= v
+    out.push({ time: candles[i].time, value: acc })
+  }
+  return out
 }
