@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # ---------------------------------------------------------------------------
-# Tranding-track — SINGLE-SERVICE image for Railway (and any Docker host).
+# Trading-track — SINGLE-SERVICE image for Railway (and any Docker host).
 #
 # Stage 1 builds the React dashboard. Stage 2 runs the FastAPI backend and
 # serves that built dashboard from the SAME process, so the whole bot is one

@@ -1,4 +1,4 @@
-# Deployment Guide — Tranding-track (Railway, single service)
+# Deployment Guide — Trading-track (Railway, single service)
 
 Operator checklist to take the app live. The FastAPI backend serves the built
 React UI from **one** Railway service, so there is a single public URL and no

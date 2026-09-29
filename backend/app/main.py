@@ -1,4 +1,4 @@
-"""FastAPI application: multi-user REST + WebSocket API for Tranding-track.
+"""FastAPI application: multi-user REST + WebSocket API for Trading-track.
 
 Multi-tenant design: anyone can self-sign-up, but an account must be LICENSED by
 the administrator before it can configure exchange keys or trade. Each user
@@ -231,7 +231,7 @@ async def lifespan(app: FastAPI):
         )
     monitor_task = asyncio.create_task(monitor_loop(get_manager(), broadcaster))
     news_task = asyncio.create_task(news_alarm_loop(get_manager()))
-    logger.info("Tranding-track backend started (multi-user)")
+    logger.info("Trading-track backend started (multi-user)")
     try:
         yield
     finally:
@@ -244,7 +244,7 @@ async def lifespan(app: FastAPI):
                 pass
 
 
-app = FastAPI(title="Tranding-track", version=__version__, lifespan=lifespan)
+app = FastAPI(title="Trading-track", version=__version__, lifespan=lifespan)
 
 settings = get_settings()
 app.add_middleware(

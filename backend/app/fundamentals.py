@@ -26,7 +26,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_UA = "Tranding-track/1.0 (+fundamentals)"
+_UA = "Trading-track/1.0 (+fundamentals)"
 _MAX_BYTES = 2 * 1024 * 1024  # 2 MiB -- these JSON payloads are tiny; cap anyway.
 
 # Per-source in-process cache: {key: (fetched_at, payload)}. Payload is whatever

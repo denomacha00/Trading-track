@@ -1,4 +1,4 @@
-# Tranding-track
+# Trading-track
 
 A professional crypto trading bot that turns TradingView alerts into real (or
 paper) Binance orders, with a deterministic "smart" market analyzer, autonomous
@@ -36,7 +36,7 @@ TradingView alert ──▶ /webhook ──▶ risk checks ──▶ Binance ord
 
 ## Multi-user, licensing & admin
 
-Tranding-track is **multi-tenant**: each client signs up with a **username,
+Trading-track is **multi-tenant**: each client signs up with a **username,
 email, password and the licence key you gave them** — redeeming the key
 activates the account **instantly**, no manual approval step. Each user brings
 their **own trade-only Binance keys** (stored encrypted at rest), gets their
@@ -157,7 +157,7 @@ from the FastAPI process as ONE service (same origin, no CORS) — this is what
 Railway uses (see below). Run it locally with:
 
 ```bash
-docker build -t tranding-track . && docker run -p 8000:8000 --env-file backend/.env tranding-track
+docker build -t trading-track . && docker run -p 8000:8000 --env-file backend/.env trading-track
 # Everything on http://localhost:8000
 ```
 

@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Small in-process cache: {feeds_key: (fetched_at, items, errors)}.
 _CACHE: dict[str, tuple[float, list[dict], list[str]]] = {}
-_UA = "Tranding-track/1.0 (+news reader)"
+_UA = "Trading-track/1.0 (+news reader)"
 # Hard cap on how much of a feed we read. Real RSS/Atom feeds are a few hundred KB
 # at most; refusing to buffer more protects memory against a huge/hostile body
 # (and pairs with defusedxml, which stops entity-expansion blowups after decode).

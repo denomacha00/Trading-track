@@ -1,6 +1,6 @@
 """Market analysis "brain": a transparent, multi-signal decision engine.
 
-This is what makes Tranding-track *think* about the market instead of reacting to
+This is what makes Trading-track *think* about the market instead of reacting to
 a single crossover. It computes a panel of classic indicators — trend (EMA
 stack), momentum (RSI + MACD), volatility (ATR), and recent return — then
 combines them into ONE confidence-scored verdict with human-readable reasons

@@ -1,6 +1,6 @@
 """Learning / training: optimise strategy parameters from historical data.
 
-This is how you "teach" Tranding-track: give it a symbol + strategy, and it
+This is how you "teach" Trading-track: give it a symbol + strategy, and it
 searches the parameter space by backtesting every combination on real candles,
 then reports the best-performing configuration (and can save it as the active
 strategy config). This is a transparent, deterministic optimiser — no black box.

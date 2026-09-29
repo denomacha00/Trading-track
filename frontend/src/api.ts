@@ -1,4 +1,4 @@
-// Thin fetch wrapper around the Tranding-track REST API.
+// Thin fetch wrapper around the Trading-track REST API.
 import type {
   BacktestResult,
   BotStatus,

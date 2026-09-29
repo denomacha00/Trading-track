@@ -1738,7 +1738,7 @@ function Dashboard({
         <div className="drawer-head">
           <div className="brand" style={{ fontSize: 16 }}>
             <span className="dot" />
-            Tranding-track
+            Trading-track
           </div>
           <button
             className="drawer-close"
@@ -1778,7 +1778,7 @@ function Dashboard({
         </button>
         <div className="brand">
           <span className="dot" />
-          Tranding-track
+          Trading-track
         </div>
         {status && (
           <>

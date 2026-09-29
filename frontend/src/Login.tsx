@@ -82,7 +82,7 @@ export function Login({
         <div className="auth-top">
           <div className="brand" style={{ fontSize: 20 }}>
             <span className="dot" />
-            Tranding-track
+            Trading-track
           </div>
           <ThemeToggle theme={theme} onToggle={onToggleTheme} />
         </div>
@@ -241,7 +241,7 @@ export function LicenseGate({
         <div className="auth-top">
           <div className="brand" style={{ fontSize: 20 }}>
             <span className="dot" />
-            Tranding-track
+            Trading-track
           </div>
           <ThemeToggle theme={theme} onToggle={onToggleTheme} />
         </div>

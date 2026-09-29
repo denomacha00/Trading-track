@@ -1,4 +1,4 @@
-# Tranding-track full stack. Copy backend/.env with your keys before running.
+# Trading-track full stack. Copy backend/.env with your keys before running.
 #   docker compose up -d --build
 # Dashboard: http://localhost:8080   API: http://localhost:8000
 services:
