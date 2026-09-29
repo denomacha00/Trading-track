@@ -431,6 +431,12 @@ export interface Settings {
   profit_lock_enabled: boolean
   profit_lock_trigger_pct: number
   profit_lock_floor_pct: number
+  // Dollar arm target (quote/USDT): lock arms once unrealized profit reaches this
+  // many dollars (0 => use the percent trigger). Trailing ride distance (%): after
+  // the lock arms the stop trails this far under price and ratchets up, so a winner
+  // keeps running and is banked only on a pullback of this size (0 => static floor).
+  profit_lock_trigger_usd: number
+  profit_lock_trail_pct: number
   // Actively bank a NET-positive winner when the read turns bearish and STAYS
   // bearish for `reversal_confirm_count` reads (anti-whipsaw). OFF => the trade
   // runs to its stop/target ("it must finish"). Only ever sells a real winner.

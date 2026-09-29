@@ -281,6 +281,8 @@ class SettingsOut(BaseModel):
     profit_lock_enabled: bool = False
     profit_lock_trigger_pct: float = 1.0
     profit_lock_floor_pct: float = 0.3
+    profit_lock_trigger_usd: float = 0.0
+    profit_lock_trail_pct: float = 0.0
     take_profit_on_reversal: bool = False
     reversal_confirm_count: int = 2
     # Global background monitor cadence (seconds).
@@ -340,6 +342,10 @@ class SettingsUpdate(BaseModel):
     profit_lock_enabled: Optional[bool] = None
     profit_lock_trigger_pct: Optional[float] = Field(default=None, ge=0, le=100)
     profit_lock_floor_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    # Dollar arm target (quote/USDT); 0 = use the percent trigger. Trailing ride
+    # distance (%) after the lock arms; 0 = static breakeven-plus floor.
+    profit_lock_trigger_usd: Optional[float] = Field(default=None, ge=0, le=1_000_000)
+    profit_lock_trail_pct: Optional[float] = Field(default=None, ge=0, le=100)
     take_profit_on_reversal: Optional[bool] = None
     reversal_confirm_count: Optional[int] = Field(default=None, ge=1, le=20)
     # Global background monitor cadence (seconds); clamped to [3, 60] server-side.

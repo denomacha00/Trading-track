@@ -249,11 +249,30 @@ _ACTION_GUIDE = (
     '"reason":"..."}. Allowed keys ONLY: risk_per_trade_pct, daily_loss_limit_pct, '
     "default_stop_loss_pct, default_take_profit_pct, trailing_stop_pct, "
     "max_total_exposure_pct, max_open_positions, min_signal_confidence, "
-    "paper_taker_fee_pct, auto_trade_enabled, auto_symbols, auto_timeframe, "
-    "auto_confirm_timeframe, use_saved_strategy, ai_trade_confirm, ai_monitor_enabled. "
-    "You CANNOT switch "
+    "paper_taker_fee_pct, profit_lock_enabled, profit_lock_trigger_usd, "
+    "profit_lock_trigger_pct, profit_lock_floor_pct, profit_lock_trail_pct, "
+    "take_profit_on_reversal, reversal_confirm_count, auto_trade_enabled, "
+    "auto_symbols, auto_timeframe, auto_confirm_timeframe, use_saved_strategy, "
+    "ai_trade_confirm, ai_monitor_enabled. You CANNOT switch "
     "between paper and live here — going live is a deliberate human step, so guide "
     "them to Settings → Trading mode for that.\n"
+    "PROFIT PROTECTION — you CAN make the bot auto-take profit, so offer it plainly "
+    "when someone asks to 'lock in $X', 'take profit at $1', 'sell when I'm up', or "
+    "'let winners run' (never say you can only set price stops or close by hand — that "
+    "is wrong). Turn on profit_lock_enabled and set profit_lock_trigger_usd to their "
+    "DOLLAR target (e.g. 1 = arm once the position is +$1 of unrealized profit; use "
+    "profit_lock_trigger_pct instead for a percent). That raises a protective stop INTO "
+    "profit so the trade can no longer turn back into a loss. To LET IT RIDE — their "
+    "words, 'the money is still coming so go on, but the moment it drops a bit stop' — "
+    "ALSO set profit_lock_trail_pct to a small percent (~0.3): once the target is hit "
+    "the stop trails up behind the price and banks the gain only when price pulls back "
+    "that far, so a winner keeps running and only a real reversal closes it, in the "
+    "green. Be honest about fees: on a small position a $1 target thinner than the "
+    "round-trip fee won't arm until the trade is genuinely net-positive — say that, "
+    "don't promise a sub-fee dollar. For an ACTIVE exit on a trend flip, "
+    "take_profit_on_reversal=true (with reversal_confirm_count, default 2, as anti-"
+    "whipsaw) sells a real net winner when the read turns bearish and stays bearish. "
+    "These apply to long (spot) positions.\n"
     '• Start/stop the bot: {"type":"bot","state":"start|stop","reason":"..."}.\n'
     '• Set a price alert: {"type":"alert","symbol":"BTC/USDT","condition":"above|'
     'below","price":65000,"reason":"..."}. It fires once when the REAL live price '
@@ -1273,7 +1292,31 @@ class AICommentator:
             f"daily loss limit: {getattr(s, 'daily_loss_limit_pct', 0)}% of equity\n"
             f"- Max total exposure: {getattr(s, 'max_total_exposure_pct', 0)}% "
             "(0 = uncapped)"
+            + self._profit_lock_line()
         )
+
+    def _profit_lock_line(self) -> str:
+        """One honest line on the auto-take-profit state, so the assistant grounds
+        'can you take profit for me' answers in what's actually configured rather
+        than guessing. Empty when profit-lock is off."""
+        s = self._settings
+        if not getattr(s, "profit_lock_enabled", False):
+            return (
+                "\n- Auto take-profit: OFF (you CAN turn it on — a $ target via "
+                "profit_lock_trigger_usd, plus profit_lock_trail_pct to let it ride)"
+            )
+        usd = float(getattr(s, "profit_lock_trigger_usd", 0.0) or 0.0)
+        arm = (
+            f"+${usd:g}" if usd > 0
+            else f"+{getattr(s, 'profit_lock_trigger_pct', 0)}%"
+        )
+        trail = float(getattr(s, "profit_lock_trail_pct", 0.0) or 0.0)
+        ride = (
+            f"then trails {trail:g}% behind price (rides winners, banks on a pullback)"
+            if trail > 0
+            else f"locks a floor {getattr(s, 'profit_lock_floor_pct', 0)}% above entry"
+        )
+        return f"\n- Auto take-profit: ON — arms at {arm}, {ride}"
 
 
 def _is_edge_block(resp: httpx.Response) -> bool:

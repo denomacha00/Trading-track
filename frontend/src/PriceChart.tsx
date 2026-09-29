@@ -263,6 +263,7 @@ export function PriceChart({
   ictOverlays,
   fullscreen,
   zoomLock,
+  compare,
 }: {
   candles: Candle[]
   theme: Theme
@@ -315,11 +316,20 @@ export function PriceChart({
   // page owns the zoom. Undefined is treated as locked. No effect when not
   // full-screen, where the page scrolls/zooms exactly as before.
   zoomLock?: boolean
+  // A second instrument to overlay for correlation (TradingView "Compare"). Its
+  // real closes are drawn as a line on an independent LEFT price scale (so wildly
+  // different price magnitudes each use their own vertical range and you compare
+  // shape/timing), time-aligned to the main bars upstream. `pct` is that symbol's
+  // move over the shown window, for the legend. Null = no overlay. Real data only.
+  compare?: { label: string; color?: string; data: { time: number; value: number }[]; pct?: number | null } | null
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const volumeRef = useRef<ISeriesApi<'Histogram'> | null>(null)
+  // The compare-symbol overlay line (TradingView "Compare"), on its own left
+  // price scale. Lazily created/removed by its effect; null when no overlay.
+  const compareRef = useRef<ISeriesApi<'Line'> | null>(null)
   // The newest bar, kept current so live ticks extend it rather than reset it.
   const lastBarRef = useRef<CandlestickData | null>(null)
   const lastVolRef = useRef<number | undefined>(undefined)
@@ -1452,6 +1462,51 @@ export function PriceChart({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [candles, indKey])
+
+  // Compare-symbol overlay (TradingView "Compare"). Draws the second instrument's
+  // real closes as a line on an INDEPENDENT left price scale, so a $60k asset and
+  // a sub-dollar one each fill their own vertical range and you read correlation of
+  // shape/timing rather than absolute magnitude. Deliberately isolated from the
+  // candle / live-tick / drawing logic — it only adds, updates or removes its one
+  // line series and toggles the left axis. Re-runs when the overlay data changes
+  // (including on every replay step, since App re-slices the aligned points).
+  const cmpKey = compare
+    ? `${compare.label}|${compare.color ?? ''}|${compare.data.length}|${compare.data[compare.data.length - 1]?.time ?? 0}|${compare.data[compare.data.length - 1]?.value ?? 0}`
+    : ''
+  useEffect(() => {
+    const chart = chartRef.current
+    if (!chart) return
+    if (!compare || compare.data.length === 0) {
+      if (compareRef.current) {
+        try {
+          chart.removeSeries(compareRef.current)
+        } catch {
+          /* chart already torn down */
+        }
+        compareRef.current = null
+      }
+      chart.applyOptions({ leftPriceScale: { visible: false } })
+      return
+    }
+    chart.applyOptions({ leftPriceScale: { visible: true } })
+    let series = compareRef.current
+    if (!series) {
+      series = chart.addLineSeries({
+        priceScaleId: 'left',
+        lineWidth: 2,
+        priceLineVisible: false,
+        crosshairMarkerVisible: true,
+        lastValueVisible: true,
+      })
+      // Match the candles' vertical band so the compare line sits over price, not
+      // down in the volume histogram's strip.
+      series.priceScale().applyOptions({ scaleMargins: { top: 0.08, bottom: 0.26 } })
+      compareRef.current = series
+    }
+    series.applyOptions({ color: compare.color ?? '#22d3ee', title: compare.label })
+    series.setData(compare.data.map((pt) => ({ time: pt.time as Time, value: pt.value })))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cmpKey])
 
   // Volume visualisations. `volume` shows/hides the bottom histogram (on by
   // default — a missing pref counts as on). `volumeProfile` recomputes the VPVR

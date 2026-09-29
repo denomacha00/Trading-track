@@ -153,6 +153,75 @@ def test_profit_lock_never_banks_a_fee_loss(db):
     assert t.stop_loss == pytest.approx(100.20)
 
 
+# ---- dollar-target arming + profit-activated trailing ("let it ride") ------
+
+
+def test_profit_lock_arms_on_dollar_target(db):
+    # The non-trader knob: "bank me when I'm up $1". entry 100 x amount 1 => $1 of
+    # unrealized profit at price 101. Below that it must NOT arm; at/above it locks
+    # a net-positive floor (0.3%) above entry.
+    eng = _engine(
+        profit_lock_enabled=True,
+        profit_lock_trigger_usd=1.0,
+        profit_lock_floor_pct=0.3,
+        profit_lock_trail_pct=0.0,   # static floor, no ride
+        paper_taker_fee_pct=0.0,
+    )
+    t = _open_buy(db, entry=100.0, amount=1.0, stop=98.0)
+    eng._maybe_lock_profit(db, t, price=100.5)   # only +$0.50 -> not armed
+    assert t.stop_loss == 98.0
+    eng._maybe_lock_profit(db, t, price=101.0)   # +$1.00 -> arm, lock 100.30
+    assert t.stop_loss == pytest.approx(100.30)
+
+
+def test_profit_lock_dollar_target_respects_fee_floor(db):
+    # A $0.01 target on a $100 position is thinner than round-trip fees: the lock
+    # must wait until the trade actually clears fees, never arming on a fee-loss.
+    eng = _engine(
+        profit_lock_enabled=True,
+        profit_lock_trigger_usd=0.01,   # absurdly tiny on purpose
+        profit_lock_floor_pct=0.3,
+        paper_taker_fee_pct=0.1,        # 0.2% round trip => $0.20 floor on notional 100
+    )
+    t = _open_buy(db, entry=100.0, amount=1.0, stop=98.0)
+    eng._maybe_lock_profit(db, t, price=100.1)   # +$0.10 < $0.20 fee floor -> no arm
+    assert t.stop_loss == 98.0
+    eng._maybe_lock_profit(db, t, price=100.5)   # +$0.50 clears fees -> arm at 100.30
+    assert t.stop_loss == pytest.approx(100.30)
+
+
+def test_profit_lock_trails_up_and_holds_on_pullback(db):
+    # "The money is still coming so go on — but the moment it drops a bit, stop."
+    # Once armed at the $ target the stop trails 0.5% under price and ratchets UP as
+    # price climbs; a pullback never LOWERS it (raise-only), so the monitor's stop
+    # check banks the ridden-up gain instead of giving it back.
+    eng = _engine(
+        profit_lock_enabled=True,
+        profit_lock_trigger_usd=1.0,
+        profit_lock_floor_pct=0.3,
+        profit_lock_trail_pct=0.5,      # ride, bank on a 0.5% pullback
+        paper_taker_fee_pct=0.0,
+    )
+    t = _open_buy(db, entry=100.0, amount=1.0, stop=98.0)
+    eng._maybe_lock_profit(db, t, price=101.0)   # arm: max(100.30, 101*0.995=100.495)
+    assert t.stop_loss == pytest.approx(100.495)
+    eng._maybe_lock_profit(db, t, price=110.0)   # ride up: 110*0.995 = 109.45
+    assert t.stop_loss == pytest.approx(109.45)
+    eng._maybe_lock_profit(db, t, price=108.0)   # pullback: raise-only, stop unchanged
+    assert t.stop_loss == pytest.approx(109.45)
+
+
+def test_profit_lock_dollar_target_ignores_shorts(db):
+    # Spot bot: profit-lock is long-only. A short is left untouched.
+    eng = _engine(profit_lock_enabled=True, profit_lock_trigger_usd=1.0)
+    t = Trade(symbol="BTC/USDT", side="sell", amount=1.0, entry_price=100.0,
+              stop_loss=102.0, status=TradeStatus.open.value, mode="paper")
+    db.add(t)
+    db.commit()
+    eng._maybe_lock_profit(db, t, price=90.0)   # deep in profit for a short
+    assert t.stop_loss == 102.0                 # untouched
+
+
 # ---- reversal exit (opt-in ON/OFF, confirmed, net-winner only) ------------
 
 

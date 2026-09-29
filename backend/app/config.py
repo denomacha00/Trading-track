@@ -146,6 +146,19 @@ class Settings(BaseSettings):
     # The locked-in floor: stop is raised to entry × (1 + this %). Kept just above
     # a round-trip taker fee (~0.2%) so a triggered lock is net-positive after fees.
     profit_lock_floor_pct: float = Field(default=0.3)
+    # DOLLAR arm target (quote/USDT). When > 0 the lock arms once UNREALIZED PROFIT
+    # reaches this many dollars instead of the percent trigger above — the knob a
+    # non-trader thinks in ("bank me $1"). Clamped up to the round-trip fee on the
+    # position's notional so it never arms on a gain fees would erase; 0 = use the
+    # percent trigger.
+    profit_lock_trigger_usd: float = Field(default=0.0)
+    # Profit-activated TRAILING distance (%). After the lock arms, the stop trails
+    # this far below the live price and ratchets up as price makes new highs, so a
+    # winner keeps running while the market favours it and is banked only on a
+    # pullback of this size ("let it run, stop the moment it turns"). 0 = static
+    # breakeven-plus floor (no ride). Only active once the lock has armed, so it
+    # never stops a position out before it reaches the profit target.
+    profit_lock_trail_pct: float = Field(default=0.0)
     # Early profit-take on a reversal: when in profit beyond the fee buffer AND the
     # brain/saved strategy turns bearish (a "red flag"), close and bank the gain
     # rather than waiting for the full take-profit. Off by default; the trailing

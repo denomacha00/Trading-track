@@ -78,6 +78,12 @@ class TradingEngine:
         # rather than on a single noisy tick. Keyed by trade id; reset when the flag
         # clears or the trade closes. In-memory: a restart re-arms it harmlessly.
         self._reversal_flags: dict[int, int] = {}
+        # Trade ids whose profit-lock has already ARMED, so the "🔒 locked in"
+        # heads-up is sent once (on arming) rather than on every ride-up raise as
+        # a profit-activated trailing stop ratchets the level higher tick by tick.
+        # In-memory: a restart re-arms silently (the stop level itself is durable
+        # on the row), which is harmless.
+        self._profit_locked_ids: set[int] = set()
         # ---- risk-safeguard state ----
         # Peak TOTAL equity (free cash + open-position value) seen so far, for the
         # max-drawdown kill-switch. Seeded on the first drawdown check and, once
@@ -2518,6 +2524,7 @@ class TradingEngine:
                         continue
                     ok, _msg, _t = self._close_trade(db, trade, reason, fill_price=fill)
                 self._reversal_flags.pop(trade.id, None)
+                self._profit_locked_ids.discard(trade.id)
                 if ok:
                     closed.append((trade, hit))
         # A close just booked P&L: maybe remind the operator about held profit.
@@ -2622,39 +2629,68 @@ class TradingEngine:
         return fee * 2.0
 
     def _maybe_lock_profit(self, db: Session, trade: Trade, price: float) -> None:
-        """Bank a winning long early by ratcheting the stop into profit.
+        """Bank a winning long by ratcheting the stop into profit — and, once the
+        winner is secured, let it RIDE and bank only on a pullback.
 
-        The autopilot profit-taking asked for: once an open long is up by at least
-        ``profit_lock_trigger_pct`` (and by more than round-trip fees, so the exit
-        is genuinely net-positive), raise the stop to a small profit floor above
-        entry. A later "red-flag" pullback then closes the trade in the green
-        instead of giving the gain back. Raise-only, never above the live price;
-        on LIVE the exchange-side stop is moved too (cancel + replace). Longs only.
+        Two ways to arm the lock (whichever the operator set):
+          • a DOLLAR target — ``profit_lock_trigger_usd`` (e.g. 1.0 = arm at +$1 of
+            unrealized profit). This is the "give me a real $X and protect it" knob a
+            non-trader thinks in. It is clamped UP to the round-trip fee so it never
+            arms on a gain the fees would erase — if $1 is below fees on this size the
+            lock waits until the position is genuinely net-positive (the assistant says
+            so honestly rather than pretending a sub-fee $1 is bankable).
+          • a PERCENT target — ``profit_lock_trigger_pct`` (used when the dollar knob
+            is 0), same fee clamp.
 
-        This does NOT withdraw to a bank: a closed live trade realizes to USDT in
-        the Binance spot wallet (real, spendable) — as far as an API key without
-        withdrawal permission can, or should, go.
+        Once armed, the locked stop is the HIGHER of:
+          • a breakeven-plus floor: entry × (1 + floor%), floor clamped above fees, so
+            the trade can no longer turn into a loss; and
+          • a profit-activated TRAILING level: price × (1 − ``profit_lock_trail_pct``%)
+            when that trail is set (>0). As price makes new highs this ratchets the stop
+            up behind it, so a winner keeps running while the market favors it and is
+            banked only when price DROPS BACK by the trail — exactly "let the money keep
+            coming, stop the moment it turns". With the trail at 0 it's the static
+            breakeven-plus floor (the original behaviour).
+
+        Raise-only, never at/above the live price; on LIVE the exchange-side stop is
+        moved too (cancel + replace). Longs only (spot). The heads-up fires ONCE, when
+        the lock first arms — not on every ride-up raise. This never withdraws to a
+        bank: a closed live trade realizes to USDT in the Binance spot wallet (real,
+        spendable) — as far as an API key without withdrawal permission can, or should, go.
         """
         if not getattr(self.settings, "profit_lock_enabled", False) or trade.side != "buy":
             return
         entry = float(trade.entry_price or 0)
-        if entry <= 0 or price <= 0:
+        amount = float(trade.amount or 0)
+        if entry <= 0 or price <= 0 or amount <= 0:
             return
+        rtf_pct = self._round_trip_fee_pct()
         gain_pct = (price - entry) / entry * 100.0
-        trigger = max(
-            float(getattr(self.settings, "profit_lock_trigger_pct", 1.0) or 0.0),
-            self._round_trip_fee_pct(),
-        )
-        if gain_pct < trigger:
+        # ---- arm? (a dollar target takes precedence when the operator set one) ----
+        trigger_usd = float(getattr(self.settings, "profit_lock_trigger_usd", 0.0) or 0.0)
+        if trigger_usd > 0:
+            # Never arm on a gain thinner than a round trip's fees would erase: wait
+            # until unrealized profit clears BOTH the operator's $ target and the fee
+            # cost on this position's notional (so a locked exit is genuinely positive).
+            fee_floor_usd = entry * amount * rtf_pct / 100.0
+            if self.unrealized_pnl(trade, price) < max(trigger_usd, fee_floor_usd):
+                return
+        elif gain_pct < max(
+            float(getattr(self.settings, "profit_lock_trigger_pct", 1.0) or 0.0), rtf_pct
+        ):
             return
-        # Lock a floor that is net-positive after fees, and never at/above price.
+        # ---- locked level: breakeven-plus floor, ridden up by the trailing level ----
         floor_pct = max(
-            float(getattr(self.settings, "profit_lock_floor_pct", 0.3) or 0.0),
-            self._round_trip_fee_pct(),
+            float(getattr(self.settings, "profit_lock_floor_pct", 0.3) or 0.0), rtf_pct
         )
         candidate = entry * (1 + floor_pct / 100.0)
+        trail_pct = float(getattr(self.settings, "profit_lock_trail_pct", 0.0) or 0.0)
+        if trail_pct > 0:
+            # Trail behind the live price so a winner rides up; the floor keeps the
+            # worst case net-positive even right after arming.
+            candidate = max(candidate, price * (1 - trail_pct / 100.0))
         if candidate >= price:
-            return
+            return  # can't place a stop at/above the live price
         if trade.stop_loss is not None and candidate <= float(trade.stop_loss):
             return  # existing stop is already at least this protective
         with self._lock:
@@ -2669,12 +2705,20 @@ class TradingEngine:
         self._emit(
             "profit_locked",
             {"id": trade.id, "symbol": trade.symbol, "stop_loss": candidate,
-             "locked_pct": round(floor_pct, 3)},
+             "locked_pct": round((candidate / entry - 1) * 100.0, 3)},
         )
-        self._notify(
-            f"🔒 {trade.symbol}: up {gain_pct:.2f}% — stop raised to lock in "
-            f"~{floor_pct:.2f}% ({candidate:g}). A pullback now banks the gain."
-        )
+        # Heads-up ONCE, when the lock first arms — not on every trailing ratchet.
+        if trade.id not in self._profit_locked_ids:
+            self._profit_locked_ids.add(trade.id)
+            locked_usd = self.unrealized_pnl(trade, candidate)
+            ride = (
+                " and it will ride up with the price, banking more if it keeps climbing"
+                if trail_pct > 0 else ""
+            )
+            self._notify(
+                f"🔒 {trade.symbol}: profit secured — stop raised to {candidate:g} "
+                f"(≈${locked_usd:.2f} locked in){ride}. A pullback now banks the gain."
+            )
 
     def _should_take_profit_on_reversal(self, db: Session, trade: Trade, price: float) -> bool:
         """True when a NET-POSITIVE long should be banked because the read flipped

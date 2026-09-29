@@ -4,6 +4,7 @@ import { PriceChart, TF_SECONDS } from './PriceChart'
 import { TradingViewChart } from './TradingViewChart'
 import { useReplay, ReplayBar } from './ReplayControls'
 import { replaySlice } from './replay'
+import { alignCompare, percentChange, formatPct } from './compare'
 import { DEFAULT_INDICATORS, type IndicatorPrefs } from './indicators'
 import {
   ICT_OVERLAY_GROUPS,
@@ -257,6 +258,12 @@ function Dashboard({
   const [trades, setTrades] = useState<Trade[]>([])
   const [signals, setSignals] = useState<SignalRow[]>([])
   const [candles, setCandles] = useState<Candle[]>([])
+  // Compare-symbol overlay (TradingView "Compare"): a second instrument drawn on
+  // the chart's left scale for correlation. Null = off. The choice is remembered.
+  const [compareSymbol, setCompareSymbol] = useState<string | null>(
+    () => localStorage.getItem('tt.compareSymbol') || null,
+  )
+  const [compareCandles, setCompareCandles] = useState<Candle[]>([])
   const [ticker, setTicker] = useState<Ticker | null>(null)
   const [tickerStale, setTickerStale] = useState(false)
   const [symbol, setSymbol] = useState(SYMBOLS[0])
@@ -1088,6 +1095,42 @@ function Dashboard({
     }
   }, [symbol, timeframe])
 
+  // Remember the compare choice, and never let it point at the main symbol.
+  useEffect(() => {
+    if (compareSymbol && compareSymbol !== symbol) {
+      localStorage.setItem('tt.compareSymbol', compareSymbol)
+    } else {
+      localStorage.removeItem('tt.compareSymbol')
+      if (compareSymbol === symbol) setCompareSymbol(null)
+    }
+  }, [compareSymbol, symbol])
+
+  // Load the compare symbol's candles (same timeframe, so the bars line up 1:1)
+  // and poll them, mirroring the main loader but lighter. Cleared the instant the
+  // overlay is switched off or set to the main symbol, so nothing stale lingers.
+  useEffect(() => {
+    if (!compareSymbol || compareSymbol === symbol) {
+      setCompareCandles([])
+      return
+    }
+    let alive = true
+    setCompareCandles([])
+    const load = () =>
+      api
+        .ohlcv(compareSymbol, timeframe, 200)
+        .then((c) => alive && setCompareCandles(c))
+        .catch(() => {
+          // Keep the last good overlay on a transient poll hiccup; a failed first
+          // fetch just leaves it empty (no overlay), never a fabricated line.
+        })
+    load()
+    const id = setInterval(load, 30000)
+    return () => {
+      alive = false
+      clearInterval(id)
+    }
+  }, [compareSymbol, symbol, timeframe])
+
   // Live price feed: poll the ticker fast so the chart's newest bar and the
   // header last-price move in near-real-time, like an exchange chart. Reset on
   // symbol change so a stale price from the previous market never lingers.
@@ -1386,6 +1429,24 @@ function Dashboard({
     ticker?.last ??
     (candles.length ? candles[candles.length - 1].close : null)
   const chgPct = ticker?.percentage ?? null
+
+  // The candle window actually on screen: the full array live, or the revealed
+  // prefix during bar replay. Both the chart and the compare overlay key off this
+  // so the comparison always covers exactly the bars the user is looking at.
+  const viewCandles = useMemo(
+    () => (replay.active ? replaySlice(candles, replay.cursor) : candles),
+    [replay.active, replay.cursor, candles],
+  )
+  // The compare overlay, time-aligned to the shown window and labelled with that
+  // symbol's real % move over it. Null when no compare symbol / no overlap.
+  const comparePayload = useMemo(() => {
+    if (!compareSymbol || compareSymbol === symbol || compareCandles.length === 0) return null
+    const times = viewCandles.map((c) => c.time)
+    const data = alignCompare(times, compareCandles)
+    if (data.length === 0) return null
+    const pct = percentChange(data.map((p) => p.value))
+    return { label: `${compareSymbol}  ${formatPct(pct)}`, color: '#22d3ee', data, pct }
+  }, [compareSymbol, symbol, compareCandles, viewCandles])
 
   return (
     <div className="app">
@@ -1724,9 +1785,29 @@ function Dashboard({
                 <TradingViewChart symbol={symbol} timeframe={timeframe} theme={theme} />
               ) : candles.length ? (
                 <>
-                  <ReplayBar replay={replay} />
+                  <div className="chart-aux">
+                    <ReplayBar replay={replay} />
+                    <label className="compare-pick" title="Overlay a second symbol for correlation (its own left scale)">
+                      <span className="sr-only">Compare symbol</span>
+                      <span aria-hidden="true" className="compare-ico">⇄</span>
+                      <select
+                        value={compareSymbol ?? ''}
+                        onChange={(e) => setCompareSymbol(e.target.value || null)}
+                        aria-label="Compare with another symbol"
+                      >
+                        <option value="">Compare…</option>
+                        {symbolList
+                          .filter((s) => s !== symbol)
+                          .map((s) => (
+                            <option key={s} value={s}>
+                              {s}
+                            </option>
+                          ))}
+                      </select>
+                    </label>
+                  </div>
                   <PriceChart
-                    candles={replay.active ? replaySlice(candles, replay.cursor) : candles}
+                    candles={viewCandles}
                     theme={theme}
                     last={replay.active ? null : livePrice}
                     liveBar={replay.active ? null : streamingLive ? stream.candle : null}
@@ -1741,6 +1822,7 @@ function Dashboard({
                     clearSignal={chartClearSignal}
                     fullscreen={chartMax}
                     zoomLock={chartZoomLock}
+                    compare={comparePayload}
                   />
                 </>
               ) : (
@@ -6791,6 +6873,8 @@ function SettingsPanel({
         profit_lock_enabled: form.profit_lock_enabled,
         profit_lock_trigger_pct: form.profit_lock_trigger_pct,
         profit_lock_floor_pct: form.profit_lock_floor_pct,
+        profit_lock_trigger_usd: form.profit_lock_trigger_usd,
+        profit_lock_trail_pct: form.profit_lock_trail_pct,
         take_profit_on_reversal: form.take_profit_on_reversal,
         reversal_confirm_count: form.reversal_confirm_count,
         monitor_interval_seconds: form.monitor_interval_seconds,
@@ -7407,36 +7491,67 @@ function SettingsPanel({
           checked={form.profit_lock_enabled}
           onChange={(e) => setForm({ ...form, profit_lock_enabled: e.target.checked })}
         />
-        Lock in profit as a winner runs (ratchet the stop up into the green)
+        Lock in profit as a winner runs (auto-take profit, then let it ride)
       </label>
       <p className="hint">
-        Once an open long is up by the <b>trigger %</b>, the bot raises its stop to
-        sit <b>floor %</b> above your entry, so a winner can't hand all its gains
-        back. You don't need to do any fee math: the bot <b>automatically</b> keeps
-        the locked level above round-trip fees, so it can never secure a level that
-        would actually be a loss. Keep trigger larger than floor.
+        Bank a real gain automatically. Set a <b>dollar target</b> (e.g. $1) and the
+        moment your open position is up that much, the bot raises a protective stop{' '}
+        <b>into profit</b> so the trade can't turn back into a loss. Leave the dollar
+        target at 0 to arm on the <b>trigger %</b> instead. You don't need to do any fee
+        math — the bot won't lock a level thinner than round-trip fees, so on a tiny
+        position a $1 target simply waits until you're genuinely net-positive. Keep
+        trigger % larger than floor %.
       </p>
       {form.profit_lock_enabled && (
-        <div className="row">
-          <div className="field">
-            <label>Arm after up % (trigger)</label>
-            <NumField
-              className="input"
-              value={form.profit_lock_trigger_pct}
-              onChange={setNum('profit_lock_trigger_pct')}
-              inputMode="decimal"
-            />
+        <>
+          <div className="row">
+            <div className="field">
+              <label>Take profit at $ (dollar target)</label>
+              <NumField
+                className="input"
+                value={form.profit_lock_trigger_usd}
+                onChange={setNum('profit_lock_trigger_usd')}
+                inputMode="decimal"
+              />
+            </div>
+            <div className="field">
+              <label>Let it ride — pullback % to bank (0 = off)</label>
+              <NumField
+                className="input"
+                value={form.profit_lock_trail_pct}
+                onChange={setNum('profit_lock_trail_pct')}
+                inputMode="decimal"
+              />
+            </div>
           </div>
-          <div className="field">
-            <label>Lock floor above entry %</label>
-            <NumField
-              className="input"
-              value={form.profit_lock_floor_pct}
-              onChange={setNum('profit_lock_floor_pct')}
-              inputMode="decimal"
-            />
+          <p className="hint">
+            <b>Let it ride:</b> with a pullback % set (try ~0.3), once your target is hit
+            the stop <b>trails up</b> behind the price — so if the market keeps going your
+            way the profit keeps growing, and it only closes when price <b>drops back</b>{' '}
+            by that much. That's "let the winner run, stop the moment it turns." Leave it
+            at 0 to bank at a fixed floor instead of riding.
+          </p>
+          <div className="row">
+            <div className="field">
+              <label>Arm after up % (used when $ target is 0)</label>
+              <NumField
+                className="input"
+                value={form.profit_lock_trigger_pct}
+                onChange={setNum('profit_lock_trigger_pct')}
+                inputMode="decimal"
+              />
+            </div>
+            <div className="field">
+              <label>Lock floor above entry %</label>
+              <NumField
+                className="input"
+                value={form.profit_lock_floor_pct}
+                onChange={setNum('profit_lock_floor_pct')}
+                inputMode="decimal"
+              />
+            </div>
           </div>
-        </div>
+        </>
       )}
       {/* REVERSAL_AND_CADENCE_MARKER */}
       <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>

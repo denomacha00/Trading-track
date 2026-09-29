@@ -2103,6 +2103,8 @@ _AI_SETTINGS_FLOAT = {
     # the engine clamps profit-lock to clear fees).
     "profit_lock_trigger_pct",
     "profit_lock_floor_pct",
+    "profit_lock_trigger_usd",
+    "profit_lock_trail_pct",
     "strategy_min_return_pct",
     "strategy_min_win_rate_pct",
     "strategy_max_drawdown_pct",
@@ -2152,6 +2154,7 @@ _AI_RISK_SETTINGS = {
     "min_signal_confidence", "max_open_positions",
     # profit-lock protection
     "profit_lock_enabled", "profit_lock_trigger_pct", "profit_lock_floor_pct",
+    "profit_lock_trigger_usd", "profit_lock_trail_pct",
     # strategy-validation gate (unproven edges driving real money)
     "require_strategy_validation", "strategy_min_return_pct",
     "strategy_min_win_rate_pct", "strategy_max_drawdown_pct", "strategy_min_trades",

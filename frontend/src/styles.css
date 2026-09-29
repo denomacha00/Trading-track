@@ -964,6 +964,37 @@ th.mono {
 .replay-exit:hover:not(:disabled) {
   color: var(--danger, #ea3943);
 }
+/* Chart aux row: the replay transport and the compare-symbol picker share one
+   wrapping line just above the chart so they never crowd it on a phone. */
+.chart-aux {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.compare-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0 0 8px;
+}
+.compare-ico {
+  color: var(--muted);
+  font-size: 13px;
+}
+.compare-pick select {
+  background: var(--input-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 5px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.compare-pick select:hover {
+  border-color: var(--accent);
+}
+
 /* Visually-hidden label text kept for screen readers. */
 .sr-only {
   position: absolute;
