@@ -93,12 +93,23 @@ class Settings(BaseSettings):
     # narrate/answer/veto — it never places a trade. Same key handling as the
     # primary (whitespace/quote/NAME= cleaning) so a pasted Railway value works.
     ai_fallback_api_key: str = Field(default="")
-    # This bot's configured fallback is glm-5.3-flash on the hcnsec gateway
-    # (OpenAI-compatible). These are non-secret defaults, so on Railway you only
-    # need to set AI_FALLBACK_API_KEY to switch the fallback ON — base_url/model/
-    # style are already correct. Override any of them via env if you swap vendors.
+    # This bot's configured fallback is sensenova-6.8-flash-lite on the hcnsec
+    # gateway (OpenAI-compatible). These are non-secret defaults, so on Railway you
+    # only need to set AI_FALLBACK_API_KEY to switch the fallback ON — base_url/
+    # model/style are already correct. Override any of them via env if you swap
+    # vendors.
+    #
+    # Model choice matters: the fallback must ANSWER, fast. The earlier default
+    # (glm-5.3-flash) was verified NON-RESPONSIVE on this gateway — it accepts the
+    # request but never returns (read-timeout past 120s), so every failover to it
+    # timed out and the assistant appeared to "do nothing" when the primary was
+    # down. Reasoning-style models (glm/DeepSeek/MiMo "flash") burn the token
+    # budget on hidden chain-of-thought and either time out or return empty visible
+    # content. sensenova-6.8-flash-lite answers a real chat completion in ~2s with
+    # clean content on the SAME gateway + key, so it is a fallback that actually
+    # works. If you point this at another model, pick one that returns promptly.
     ai_fallback_base_url: str = Field(default="https://api.hcnsec.cn/v1")
-    ai_fallback_model: str = Field(default="glm-5.3-flash")
+    ai_fallback_model: str = Field(default="sensenova-6.8-flash-lite")
     ai_fallback_api_style: str = Field(default="openai")
 
     # Risk management

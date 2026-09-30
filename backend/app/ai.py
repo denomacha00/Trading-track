@@ -638,17 +638,30 @@ class AICommentator:
         fb_key = getattr(s, "ai_fallback_api_key", "")
         if fb_key:
             fb_base = getattr(s, "ai_fallback_base_url", "") or s.ai_base_url
-            fb_model = getattr(s, "ai_fallback_model", "") or s.ai_model
             fb_style = getattr(s, "ai_fallback_api_style", "auto")
-            out.append(
-                {
-                    "label": "fallback",
-                    "key": fb_key,
-                    "base_url": fb_base,
-                    "model": fb_model,
-                    "style": self._resolve_style(fb_style, fb_model, fb_base),
-                }
-            )
+            # ai_fallback_model may be a SINGLE model or a comma/newline-separated
+            # LIST tried IN ORDER (put the fastest, most-reliable model first).
+            # Each listed model becomes its own fallback provider, so if the first
+            # is down/unresponsive the SAME request auto-rolls to the next — "auto
+            # pick a working model" with no config change. With one model it's a
+            # single fallback entry, identical to before.
+            models = _parse_model_list(getattr(s, "ai_fallback_model", "") or s.ai_model)
+            for i, model in enumerate(models):
+                out.append(
+                    {
+                        "label": "fallback" if i == 0 else f"fallback-{i + 1}",
+                        "key": fb_key,
+                        "base_url": fb_base,
+                        "model": model,
+                        "style": self._resolve_style(fb_style, model, fb_base),
+                        # Fast-fail: a fallback is a BACKUP for a down primary — you
+                        # want a quick answer, not a long wait stacked on the
+                        # primary's failure. Cap its READ timeout so a hung or
+                        # reasoning-heavy model is dropped quickly and the next
+                        # listed model (or an honest "unavailable") comes fast.
+                        "read_timeout": str(_FALLBACK_READ_TIMEOUT),
+                    }
+                )
         return out
 
     def _post_once(
@@ -702,6 +715,14 @@ class AICommentator:
         # quickly and the SAME request can retry the next provider — while a
         # healthy-but-slow response still gets the full read budget.
         read_to = self._settings.ai_timeout_seconds
+        # A fallback provider carries a shorter read cap (fast-fail) so a hung
+        # model can't burn the full budget while the primary is already down.
+        override = prov.get("read_timeout")
+        if override:
+            try:
+                read_to = min(read_to, float(override))
+            except (TypeError, ValueError):
+                pass
         connect_to = getattr(self._settings, "ai_connect_timeout_seconds", 5.0) or 5.0
         connect_to = min(connect_to, read_to)
         timeout = httpx.Timeout(connect=connect_to, read=read_to, write=read_to, pool=connect_to)
@@ -1463,6 +1484,30 @@ def _strip_reasoning(text: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
+# Shorter read cap for a fallback provider (seconds). A fallback answers a down
+# primary — it must be QUICK, not a long wait stacked on the primary's failure.
+# A verified fallback answers in ~2-5s, so 30s drops a hung/reasoning model fast
+# while never cutting a healthy reply. Always capped against ai_timeout_seconds.
+_FALLBACK_READ_TIMEOUT = 30.0
+
+
+def _parse_model_list(raw: str) -> list[str]:
+    """Split a fallback-model spec into an ordered, de-duplicated model list.
+
+    Accepts a single model id or a comma/newline-separated list; order is
+    preserved (put the fastest, most-reliable model first) and blanks/dupes are
+    dropped. A model id never contains a comma, so splitting on it is safe.
+    """
+    if not isinstance(raw, str):
+        return []
+    out: list[str] = []
+    for part in re.split(r"[,\n]+", raw):
+        m = part.strip()
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
 def _extract_openai_text(data: dict[str, Any]) -> Optional[str]:
     """Pull the text out of an OpenAI-compatible chat-completions response.
 
@@ -1474,6 +1519,11 @@ def _extract_openai_text(data: dict[str, Any]) -> Optional[str]:
     cleanly tries the next provider — the whole point of the fallback. We do NOT
     fall back to a ``reasoning_content`` scratchpad here: that is the model's raw
     chain-of-thought, never a finished answer, and must never reach the user.
+
+    ``content`` may also arrive as a LIST of parts (some OpenAI-compatible
+    gateways now mirror Anthropic's block shape). We join the real answer text of
+    those parts — a genuine finished answer, just delivered in a list — and skip
+    any reasoning/thinking block so chain-of-thought still never reaches the user.
     """
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -1485,6 +1535,18 @@ def _extract_openai_text(data: dict[str, Any]) -> Optional[str]:
     content = message.get("content")
     if isinstance(content, str):
         return _strip_reasoning(content)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for blk in content:
+            if isinstance(blk, dict):
+                if blk.get("type") in ("reasoning", "thinking"):
+                    continue
+                t = blk.get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+            elif isinstance(blk, str):
+                parts.append(blk)
+        return _strip_reasoning("".join(parts)) if parts else None
     return None
 
 

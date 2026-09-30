@@ -14,12 +14,14 @@ import pytest
 
 from app.ai import (
     AICommentator,
+    _FALLBACK_READ_TIMEOUT,
     _IDENTITY,
     _SYSTEM_ANALYST,
     _SYSTEM_ASSISTANT,
     _extract_anthropic_text,
     _extract_openai_text,
     _looks_anthropic,
+    _parse_model_list,
     _sanitize_history,
     _strip_reasoning,
 )
@@ -587,6 +589,65 @@ def test_available_true_with_only_fallback():
     assert ai.available is True
     provs = ai._providers()
     assert [p["label"] for p in provs] == ["fallback"]
+
+
+def test_parse_model_list_orders_and_dedupes():
+    assert _parse_model_list("a") == ["a"]
+    assert _parse_model_list("a, b ,c") == ["a", "b", "c"]  # order preserved
+    assert _parse_model_list("a\nb\na") == ["a", "b"]  # dupes dropped, order kept
+    assert _parse_model_list("  ") == []
+    assert _parse_model_list(None) == []  # type: ignore[arg-type]
+
+
+def test_fallback_model_list_expands_into_ordered_providers():
+    # A comma-separated ai_fallback_model becomes ONE fallback provider per model,
+    # tried in the listed order (fastest-verified first) — "auto pick a working
+    # model" with no code change. Each fallback carries the fast-fail read cap.
+    ai = AICommentator(
+        _settings(
+            ai_api_key="sk-primary",
+            ai_fallback_api_key="sk-fb",
+            ai_fallback_base_url="https://fb.example.com/v1",
+            ai_fallback_model="sensenova-6.8-flash-lite, glm-5.3, deepseek-v4",
+            ai_fallback_api_style="openai",
+        )
+    )
+    provs = ai._providers()
+    assert [p["label"] for p in provs] == ["primary", "fallback", "fallback-2", "fallback-3"]
+    assert [p["model"] for p in provs] == [
+        "gpt-4o-mini",
+        "sensenova-6.8-flash-lite",
+        "glm-5.3",
+        "deepseek-v4",
+    ]
+    # Primary carries no read cap; every fallback carries the fast-fail cap.
+    assert "read_timeout" not in provs[0]
+    for fb in provs[1:]:
+        assert fb["read_timeout"] == str(_FALLBACK_READ_TIMEOUT)
+        assert fb["key"] == "sk-fb"
+        assert fb["base_url"] == "https://fb.example.com/v1"
+
+
+def test_extract_openai_text_reads_list_content_and_skips_reasoning():
+    # Some OpenAI-compatible gateways return content as a LIST of blocks (like
+    # Anthropic). Join the real answer text; never surface a reasoning block.
+    data = {
+        "choices": [
+            {
+                "message": {
+                    "content": [
+                        {"type": "reasoning", "text": "let me think... hidden"},
+                        {"type": "text", "text": "Hello "},
+                        {"type": "text", "text": "world"},
+                    ]
+                }
+            }
+        ]
+    }
+    assert _extract_openai_text(data) == "Hello world"
+    # A list with no usable text parts is honest "no usable text" (None).
+    assert _extract_openai_text({"choices": [{"message": {"content": [{"type": "reasoning", "text": "x"}]}}]}) is None
+    assert _extract_openai_text({"choices": [{"message": {"content": []}}]}) is None
 
 
 def test_fallback_picks_up_when_primary_fails(monkeypatch):
