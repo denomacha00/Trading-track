@@ -13,6 +13,7 @@ import {
   type ISeriesPrimitive,
   type ISeriesPrimitivePaneRenderer,
   type ISeriesPrimitivePaneView,
+  type LineData,
   type LogicalRange,
   type MouseEventParams,
   type SeriesAttachedParameter,
@@ -24,7 +25,7 @@ import type { IctAnalysis, IctZone } from './types'
 import type { Theme } from './theme'
 import { sma, ema, bollinger, vwap, rsi, macd, hma, donchian, keltner, stochastic, atr, obv, type IndicatorPrefs, type LinePoint } from './indicators'
 import { volumeProfile, type VolumeProfile } from './volumeProfile'
-import { heikinAshi, haBar, hollowStyle, hollowStyles, type ChartKind, type Ohlc } from './chartTypes'
+import { heikinAshi, haBar, hollowStyle, hollowStyles, seriesKind, isValueSeries, toLineData, type ChartKind, type SeriesKind, type Ohlc } from './chartTypes'
 import { DEFAULT_INDICATOR_PARAMS, type IndicatorParams } from './indicatorParams'
 import { priceDecimals, fmtPrice, priceMinMove } from './priceFormat'
 import type { ChartMarker } from './chartMarkers'
@@ -105,7 +106,71 @@ function extendAutoscale(base: AutoscaleInfo | null, levels: number[]): Autoscal
   return changed ? { priceRange: { minValue: lo, maxValue: hi }, margins: base.margins } : base
 }
 
-type Palette = {
+// Line / Area (single-value) series colour — the app's blue accent, matching the
+// rgba(91,141,239,…) used elsewhere in the chart. A candlestick/bar chart keeps
+// its up/down colours; a line/area plots one close-line, so it gets one colour.
+const LINE_ACCENT = '#5b8def'
+const AREA_TOP = 'rgba(91,141,239,0.34)'
+const AREA_BOTTOM = 'rgba(91,141,239,0.02)'
+
+// Create the MAIN price series for a given family. Candles/Heikin-Ashi/hollow all
+// use the candlestick series (per-point colours differentiate them); Bars/Line/
+// Area each need their own lightweight-charts constructor. Every family gets the
+// same autoscale provider so the open position's entry/stop/target stay bracketed
+// on any chart type. The non-candlestick series are cast to ISeriesApi<'Candlestick'>
+// on return: all the methods the chart calls (createPriceLine, setMarkers,
+// applyOptions, priceScale, attachPrimitive, coordinate↔price) are identical across
+// series types — only setData/update differ, and those callers branch on the kind.
+function createMainSeries(
+  chart: IChartApi,
+  kind: SeriesKind,
+  p: Palette,
+  autoscale: (orig: () => AutoscaleInfo | null) => AutoscaleInfo | null,
+): ISeriesApi<'Candlestick'> {
+  if (kind === 'bar') {
+    const s = chart.addBarSeries({
+      upColor: p.up,
+      downColor: p.down,
+      thinBars: false,
+      autoscaleInfoProvider: autoscale,
+    })
+    return s as unknown as ISeriesApi<'Candlestick'>
+  }
+  if (kind === 'line') {
+    const s = chart.addLineSeries({
+      color: LINE_ACCENT,
+      lineWidth: 2,
+      lastValueVisible: true,
+      priceLineVisible: false,
+      autoscaleInfoProvider: autoscale,
+    })
+    return s as unknown as ISeriesApi<'Candlestick'>
+  }
+  if (kind === 'area') {
+    const s = chart.addAreaSeries({
+      lineColor: LINE_ACCENT,
+      topColor: AREA_TOP,
+      bottomColor: AREA_BOTTOM,
+      lineWidth: 2,
+      lastValueVisible: true,
+      priceLineVisible: false,
+      autoscaleInfoProvider: autoscale,
+    })
+    return s as unknown as ISeriesApi<'Candlestick'>
+  }
+  // candlestick (candles / heikin_ashi / hollow)
+  return chart.addCandlestickSeries({
+    upColor: p.up,
+    downColor: p.down,
+    borderVisible: false,
+    wickUpColor: p.up,
+    wickDownColor: p.down,
+    autoscaleInfoProvider: autoscale,
+  })
+}
+// Theme colours read once from CSS custom properties (see readPalette). Passed to
+// the series constructors and re-read on a theme flip.
+interface Palette {
   bg: string
   text: string
   grid: string
@@ -282,7 +347,7 @@ export function PriceChart({
   compare,
   onLoadOlder,
   loadingOlder,
-  chartType,
+  chartType = 'candles',
   indicatorParams,
 }: {
   candles: Candle[]
@@ -374,7 +439,23 @@ export function PriceChart({
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
+  // The MAIN price series. Typed as Candlestick (the default and the OHLC
+  // families — candles/Heikin-Ashi/hollow); when the chart-type family is Bars/
+  // Line/Area the swap effect recreates it as that lightweight-charts series and
+  // stores it here cast to this type. Every method we call (createPriceLine,
+  // setMarkers, applyOptions, priceScale, attachPrimitive, coordinateToPrice…)
+  // is identical across series types; only setData/update differ, and those
+  // sites branch on seriesKindRef and cast to the right series type.
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
+  // Which lightweight-charts series family is live right now (mirrors
+  // seriesKind(chartType)). The once-bound live-update effects read this to pick
+  // the data SHAPE ({time,value} for line/area vs OHLC for candlestick/bar)
+  // without re-subscribing, and the swap effect uses it to detect a family change.
+  const seriesKindRef = useRef<SeriesKind>(seriesKind(chartType))
+  // The drawings/ICT/volume-profile overlay primitive, kept in a ref so the
+  // series-swap effect can detach it from the old main series and re-attach it
+  // to the new one (attachPrimitive binds the series OBJECT, not the chart).
+  const primitiveRef = useRef<ISeriesPrimitive<Time> | null>(null)
   const volumeRef = useRef<ISeriesApi<'Histogram'> | null>(null)
   // The compare-symbol overlay line (TradingView "Compare"), on its own left
   // price scale. Lazily created/removed by its effect; null when no overlay.
@@ -471,6 +552,11 @@ export function PriceChart({
   const [drawings, setDrawings] = useState<Drawing[]>([])
   const [selected, setSelected] = useState<string | null>(null)
   const [color, setColor] = useState<string>(DRAW_COLORS[0])
+  // Bumped whenever the main series is torn down and recreated for a different
+  // chart-type family (Candles→Line, etc.). Series-attach effects (seed data,
+  // reference price lines, alert lines, markers) list this in their deps so they
+  // re-run and re-bind to the NEW series object after a swap.
+  const [seriesEpoch, setSeriesEpoch] = useState(0)
   const toolRef = useRef<Tool>('cursor')
   const colorRef = useRef<string>(DRAW_COLORS[0])
   const drawingsRef = useRef<Drawing[]>([])
@@ -600,17 +686,16 @@ export function PriceChart({
       crosshair: { mode: CrosshairMode.Normal },
       autoSize: true,
     })
-    const series = chart.addCandlestickSeries({
-      upColor: p.up,
-      downColor: p.down,
-      borderVisible: false,
-      wickUpColor: p.up,
-      wickDownColor: p.down,
-      // Keep the open position's entry/stop/target inside the vertical fit on
-      // every timeframe (reads scaleLevelsRef live; updated by the effect below).
-      autoscaleInfoProvider: (orig: () => AutoscaleInfo | null) =>
-        extendAutoscale(orig(), scaleLevelsRef.current),
-    })
+    // Create the main series for the CURRENT chart-type family (candlestick by
+    // default; Bars/Line/Area if the persisted chartType is one of those). The
+    // swap effect below rebuilds it whenever the family changes.
+    const series = createMainSeries(
+      chart,
+      seriesKind(chartType),
+      p,
+      (orig: () => AutoscaleInfo | null) => extendAutoscale(orig(), scaleLevelsRef.current),
+    )
+    seriesKindRef.current = seriesKind(chartType)
     // Leave room at the bottom for the volume histogram (its own overlay scale).
     series.priceScale().applyOptions({ scaleMargins: { top: 0.08, bottom: 0.26 } })
     const volume = chart.addHistogramSeries({
@@ -1149,6 +1234,8 @@ export function PriceChart({
       },
     }
     series.attachPrimitive(primitive)
+    // Keep the primitive so the series-swap effect can move it to a new series.
+    primitiveRef.current = primitive
     drawViewRef.current = { requestUpdate: () => requestUpdate?.() }
     // Place / select on click. In cursor mode a click selects the nearest
     // drawing (or clears the selection). A tool click lays down an anchor: one
@@ -1467,6 +1554,7 @@ export function PriceChart({
       chart.remove()
       chartRef.current = null
       seriesRef.current = null
+      primitiveRef.current = null
       volumeRef.current = null
       overlayRef.current.clear()
     }
@@ -1484,12 +1572,24 @@ export function PriceChart({
       timeScale: { borderColor: p.grid },
       rightPriceScale: { borderColor: p.grid },
     })
-    seriesRef.current.applyOptions({
-      upColor: p.up,
-      downColor: p.down,
-      wickUpColor: p.up,
-      wickDownColor: p.down,
-    })
+    // Re-colour the main series to the new theme — but only the families that
+    // carry theme-driven up/down colours. Candlestick uses body + wick colours;
+    // Bars use up/down. Line/Area plot one close-line in the fixed LINE_ACCENT
+    // (theme-independent), so there is nothing to retint for them.
+    const sk = seriesKindRef.current
+    if (sk === 'candlestick') {
+      seriesRef.current.applyOptions({
+        upColor: p.up,
+        downColor: p.down,
+        wickUpColor: p.up,
+        wickDownColor: p.down,
+      })
+    } else if (sk === 'bar') {
+      ;(seriesRef.current as unknown as ISeriesApi<'Bar'>).applyOptions({
+        upColor: p.up,
+        downColor: p.down,
+      })
+    }
     // Hollow candles carry per-point colours (set in the seed effect from the
     // palette), so the series-level up/down above doesn't retint them; the next
     // candle reload repaints them with the new theme's shade. The direction stays
@@ -1500,38 +1600,145 @@ export function PriceChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [theme])
 
+  // Swap the MAIN series when the chart-type FAMILY changes (Candles/HA/Hollow ↔
+  // Bars ↔ Line ↔ Area). Same-family switches (e.g. Candles↔Heikin-Ashi↔Hollow)
+  // share the ONE candlestick series and are handled by the seed effect's data
+  // transform — this returns early for them. A real swap tears down the old series
+  // (its price lines, alert lines and attached primitive die with it), builds the
+  // new one, re-attaches the drawings primitive, and bumps seriesEpoch so the data
+  // / reference-line / alert / marker effects re-bind to the new series object.
+  // Declared BEFORE the seed effect so, on a cross-family switch, the new series
+  // exists before seed runs; the epoch bump re-seeds it regardless of ordering.
+  useEffect(() => {
+    const chart = chartRef.current
+    const old = seriesRef.current
+    if (!chart || !old) return
+    const nextKind = seriesKind(chartType)
+    if (nextKind === seriesKindRef.current) return // same family — nothing to swap
+    // Detach the overlay primitive from the series that's about to be removed.
+    if (primitiveRef.current) {
+      try {
+        old.detachPrimitive(primitiveRef.current)
+      } catch {
+        /* already detached with the series */
+      }
+    }
+    // Reference price lines & alert lines are bound to the OLD series object and
+    // die with it; drop our handles so the re-attach effects recreate them fresh
+    // on the new series (via the epoch bump) rather than poking dead price lines.
+    priceLineObjsRef.current = []
+    alertLineObjsRef.current.clear()
+    try {
+      chart.removeSeries(old)
+    } catch {
+      /* already gone */
+    }
+    const p = paletteRef.current ?? readPalette()
+    const s = createMainSeries(
+      chart,
+      nextKind,
+      p,
+      (orig: () => AutoscaleInfo | null) => extendAutoscale(orig(), scaleLevelsRef.current),
+    )
+    // Leave room at the bottom for the volume histogram (its own overlay scale).
+    s.priceScale().applyOptions({ scaleMargins: { top: 0.08, bottom: 0.26 } })
+    // Re-apply the asset's price precision (the seed effect only re-applies it when
+    // the dp CHANGES, so set the fresh series to the precision already in force).
+    s.applyOptions({
+      priceFormat: {
+        type: 'price',
+        precision: priceDpRef.current,
+        minMove: priceMinMove(priceDpRef.current),
+      },
+    })
+    seriesRef.current = s
+    seriesKindRef.current = nextKind
+    if (primitiveRef.current) {
+      try {
+        s.attachPrimitive(primitiveRef.current)
+      } catch {
+        /* best-effort re-attach; the drawings layer redraws on the next paint */
+      }
+    }
+    // Indicator overlays and the compare line were created BEFORE this new main
+    // series, so they'd now draw UNDER it (a candlestick body would hide an EMA
+    // line). Remove them here; their effects re-run on the epoch bump and re-add
+    // them AFTER the new series, restoring the TradingView layering (lines on top).
+    for (const [, ov] of overlayRef.current) {
+      try {
+        chart.removeSeries(ov)
+      } catch {
+        /* already gone */
+      }
+    }
+    overlayRef.current.clear()
+    if (compareRef.current) {
+      try {
+        chart.removeSeries(compareRef.current)
+      } catch {
+        /* already gone */
+      }
+      compareRef.current = null
+    }
+    setSeriesEpoch((e) => e + 1)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartType])
+
   // Seed / replace the full history when the candle set changes.
   useEffect(() => {
     if (!seriesRef.current || candles.length === 0) return
-    // In Heikin-Ashi mode the DRAWN bars are the smoothed transform of the SAME
-    // real candles; indicators/drawings/alerts below keep using the real ones.
-    // Hollow mode draws the REAL bars but recolours them (see hollowStyles).
+    // Heikin-Ashi / Hollow are candlestick-only reskins of the SAME real candles;
+    // Bars draw the plain real OHLC; Line / Area plot a single value (the close).
+    // Indicators, drawings and alerts below always use the REAL candles regardless
+    // of the drawn type. seriesKindRef is kept in step with chartType by the swap
+    // effect (and at mount), so it names the family the live series belongs to.
+    const sk = seriesKindRef.current
+    const value = isValueSeries(sk)
     const ha = chartType === 'heikin_ashi'
     const hollow = chartType === 'hollow'
     heikinRef.current = ha
     hollowRef.current = hollow
     const bars = ha ? heikinAshi(candles) : candles
-    // Hollow candles need the series border drawn (the outline that makes an
-    // unfilled body visible); candles / HA keep the borderless look they shipped
-    // with. Toggled here so switching type flips it in place (no series swap).
-    seriesRef.current.applyOptions({ borderVisible: hollow })
-    const pal = paletteRef.current
-    const styles = hollow && pal ? hollowStyles(candles, pal.up, pal.down) : null
-    const data: CandlestickData[] = bars.map((c, i) => ({
-      time: c.time as Time,
-      open: c.open,
-      high: c.high,
-      low: c.low,
-      close: c.close,
-      ...(styles ? styles[i] : null),
-    }))
     // Snapshot the view + oldest bar BEFORE we swap the data, so a lazy older-
     // history prepend can be detected and the scroll position held (see below).
     const ts = chartRef.current?.timeScale()
     const prevRange = ts?.getVisibleLogicalRange() ?? null
     const prevOldest = prevOldestRef.current
     const newOldest = candles[0]?.time ?? null
-    seriesRef.current.setData(data)
+    // What we'll record as the DRAWN last bar (legend + live accumulator seed) and
+    // the DRAWN bar before it (HA recurrence). For a value series the drawn point
+    // is single-valued, but the legend still shows the real OHLC behind the line.
+    let drawnLast: CandlestickData
+    let prevHADrawn: CandlestickData | null = null
+    if (value) {
+      // One close-point per real bar for the Line / Area series. Candle.time is a
+      // plain number; lightweight-charts' LineData wants a branded Time, so cast
+      // the payload (the values are real UNIX-second timestamps either way).
+      ;(seriesRef.current as unknown as ISeriesApi<'Line'>).setData(
+        toLineData(candles) as unknown as LineData[],
+      )
+      const rl = candles[candles.length - 1]
+      drawnLast = { time: rl.time as Time, open: rl.open, high: rl.high, low: rl.low, close: rl.close }
+    } else {
+      // Hollow candles need the series border drawn (the outline that makes an
+      // unfilled body visible); candles / HA / bars keep the borderless look they
+      // shipped with. Toggled here so switching type flips it in place. (Only the
+      // candlestick series has a border; skip it for the bar series.)
+      if (sk === 'candlestick') seriesRef.current.applyOptions({ borderVisible: hollow })
+      const pal = paletteRef.current
+      const styles = hollow && pal ? hollowStyles(candles, pal.up, pal.down) : null
+      const data: CandlestickData[] = bars.map((c, i) => ({
+        time: c.time as Time,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        ...(styles ? styles[i] : null),
+      }))
+      seriesRef.current.setData(data)
+      drawnLast = { ...data[data.length - 1] }
+      prevHADrawn = ha && data.length >= 2 ? { ...data[data.length - 2] } : null
+    }
     // Match the price-axis / crosshair precision to this asset's magnitude so a
     // sub-cent coin shows its real price instead of "0.00" (lightweight-charts
     // defaults to 2 dp). Derived from the latest REAL close (not the HA close) so
@@ -1558,16 +1765,17 @@ export function PriceChart({
       }))
       volumeRef.current.setData(vol)
     }
-    // What's DRAWN + shown in the legend (HA bar in HA mode); the accumulator and
-    // real-price reference stay the genuine last candle.
-    lastBarRef.current = { ...data[data.length - 1] }
+    // What's DRAWN + shown in the legend (HA bar in HA mode, the real bar for a
+    // line/area chart); the accumulator and real-price reference stay the genuine
+    // last candle.
+    lastBarRef.current = drawnLast
     const rawLast = candles[candles.length - 1]
     lastRawRef.current = rawLast
       ? { time: rawLast.time as Time, open: rawLast.open, high: rawLast.high, low: rawLast.low, close: rawLast.close }
       : null
     // The HA bar just BEFORE the forming one, so the live paths continue the HA
-    // recurrence exactly (null in candle mode or with a single bar).
-    prevHARef.current = ha && data.length >= 2 ? { ...data[data.length - 2] } : null
+    // recurrence exactly (null in candle/bar/line/area mode or with a single bar).
+    prevHARef.current = prevHADrawn
     // The real close of the bar BEFORE the forming one, so the live hollow candle
     // keeps its bar-over-bar colour as it ticks (null unless hollow / <2 bars).
     prevCloseRef.current = hollow && candles.length >= 2 ? candles[candles.length - 2].close : null
@@ -1608,7 +1816,7 @@ export function PriceChart({
     }
     prevOldestRef.current = newOldest
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [candles, fitKey, chartType])
+  }, [candles, fitKey, chartType, seriesEpoch])
 
   // Move the newest bar live as the ticker price updates. Skipped entirely when
   // a real-time kline stream is feeding `liveBar` — that path is richer (true
@@ -1627,6 +1835,14 @@ export function PriceChart({
       close: last,
     }
     lastRawRef.current = updatedRaw
+    // Line / Area plot only the close: extend the single value-point. The legend
+    // still reads the real forming OHLC (honest — that bar IS real).
+    if (isValueSeries(seriesKindRef.current)) {
+      ;(seriesRef.current as unknown as ISeriesApi<'Line'>).update({ time: raw.time, value: last })
+      lastBarRef.current = updatedRaw
+      if (!hoveringRef.current) renderLegend(updatedRaw, lastVolRef.current)
+      return
+    }
     // Draw the real bar, its HA transform (derived from the prior closed HA bar so
     // it stays consistent with the batch transform), or the same real bar recoloured
     // for hollow candles (bar-over-bar colour vs the previous close), per the type.
@@ -1667,6 +1883,22 @@ export function PriceChart({
       close: liveBar.close,
     }
     lastRawRef.current = rawBar
+    // Line / Area: extend the single close-point instead of an OHLC bar (HA/hollow
+    // never apply to a value series — heikinRef/hollowRef are false there).
+    if (isValueSeries(seriesKindRef.current)) {
+      ;(series as unknown as ISeriesApi<'Line'>).update({ time: liveBar.time as Time, value: liveBar.close })
+      lastBarRef.current = rawBar
+      if (volumeRef.current && Number.isFinite(liveBar.volume)) {
+        volumeRef.current.update({
+          time: liveBar.time as Time,
+          value: liveBar.volume,
+          color: rawBar.close >= rawBar.open ? VOL_UP : VOL_DOWN,
+        })
+        lastVolRef.current = liveBar.volume
+      }
+      if (!hoveringRef.current) renderLegend(rawBar, lastVolRef.current)
+      return
+    }
     const shown: CandlestickData = heikinRef.current
       ? { time: liveBar.time as Time, ...haBar(rawBar, prevHARef.current) }
       : hollowRef.current && paletteRef.current
@@ -1752,7 +1984,7 @@ export function PriceChart({
         extendAutoscale(orig(), scaleLevelsRef.current),
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [priceLinesKey])
+  }, [priceLinesKey, seriesEpoch])
 
   // Draggable armed alerts. Rendered as native price lines (so they get a clean
   // axis label) but kept in a by-id map so the pointer handlers can move ONE of
@@ -1808,7 +2040,7 @@ export function PriceChart({
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [alertsKey])
+  }, [alertsKey, seriesEpoch])
 
   // Keep the move callback fresh for the once-bound pointer handlers even when
   // the alert set itself hasn't changed.
@@ -1833,7 +2065,7 @@ export function PriceChart({
     }))
     series.setMarkers(list)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [markersKey, candles])
+  }, [markersKey, candles, seriesEpoch])
 
   // Indicator overlays: moving averages, Bollinger Bands and VWAP, each a real
   // line computed from the candles above. We reconcile against what's on screen
@@ -1903,7 +2135,7 @@ export function PriceChart({
       series.setData(spec.data.map((pt) => ({ time: pt.time as Time, value: pt.value })))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [candles, indKey])
+  }, [candles, indKey, seriesEpoch])
 
   // Compare-symbol overlay (TradingView "Compare"). Draws the second instrument's
   // real closes as a line on an INDEPENDENT left price scale, so a $60k asset and
@@ -1948,7 +2180,7 @@ export function PriceChart({
     series.applyOptions({ color: compare.color ?? '#22d3ee', title: compare.label })
     series.setData(compare.data.map((pt) => ({ time: pt.time as Time, value: pt.value })))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cmpKey])
+  }, [cmpKey, seriesEpoch])
 
   // Volume visualisations. `volume` shows/hides the bottom histogram (on by
   // default — a missing pref counts as on). `volumeProfile` recomputes the VPVR

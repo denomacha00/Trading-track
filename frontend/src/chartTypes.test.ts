@@ -7,6 +7,9 @@ import {
   hollowStyle,
   hollowStyles,
   HOLLOW_TRANSPARENT,
+  seriesKind,
+  isValueSeries,
+  toLineData,
 } from './chartTypes'
 import type { Candle } from './types'
 
@@ -90,15 +93,76 @@ describe('haBar (live-bar transform)', () => {
 })
 
 describe('CHART_TYPES / isChartKind', () => {
-  it('lists candles, heikin_ashi and hollow', () => {
-    expect(CHART_TYPES.map((t) => t.key)).toEqual(['candles', 'heikin_ashi', 'hollow'])
+  it('lists all six drawable kinds in display order', () => {
+    expect(CHART_TYPES.map((t) => t.key)).toEqual([
+      'candles',
+      'heikin_ashi',
+      'hollow',
+      'bars',
+      'line',
+      'area',
+    ])
+  })
+  it('every listed kind has a non-empty label', () => {
+    for (const t of CHART_TYPES) {
+      expect(typeof t.label).toBe('string')
+      expect(t.label.length).toBeGreaterThan(0)
+    }
   })
   it('guards known kinds', () => {
     expect(isChartKind('candles')).toBe(true)
     expect(isChartKind('heikin_ashi')).toBe(true)
     expect(isChartKind('hollow')).toBe(true)
-    expect(isChartKind('line')).toBe(false)
+    expect(isChartKind('bars')).toBe(true)
+    expect(isChartKind('line')).toBe(true)
+    expect(isChartKind('area')).toBe(true)
+    expect(isChartKind('nope')).toBe(false)
     expect(isChartKind(null)).toBe(false)
+    expect(isChartKind(undefined)).toBe(false)
+  })
+})
+
+describe('seriesKind (which lightweight-charts series a kind needs)', () => {
+  it('groups candles / heikin_ashi / hollow under the ONE candlestick series', () => {
+    expect(seriesKind('candles')).toBe('candlestick')
+    expect(seriesKind('heikin_ashi')).toBe('candlestick')
+    expect(seriesKind('hollow')).toBe('candlestick')
+  })
+  it('maps bars/line/area to their own series types', () => {
+    expect(seriesKind('bars')).toBe('bar')
+    expect(seriesKind('line')).toBe('line')
+    expect(seriesKind('area')).toBe('area')
+  })
+  it('covers every CHART_TYPES entry (no kind maps to undefined)', () => {
+    for (const t of CHART_TYPES) {
+      expect(['candlestick', 'bar', 'line', 'area']).toContain(seriesKind(t.key))
+    }
+  })
+})
+
+describe('isValueSeries', () => {
+  it('is true only for the single-value series (line / area)', () => {
+    expect(isValueSeries('line')).toBe(true)
+    expect(isValueSeries('area')).toBe(true)
+    expect(isValueSeries('candlestick')).toBe(false)
+    expect(isValueSeries('bar')).toBe(false)
+  })
+})
+
+describe('toLineData (single-value points for line/area)', () => {
+  it('plots the real CLOSE, one point per bar, same length/order/timestamps', () => {
+    const pts = toLineData(SERIES)
+    expect(pts).toEqual([
+      { time: 1, value: 105 },
+      { time: 2, value: 108 },
+      { time: 3, value: 106 },
+    ])
+  })
+  it('returns [] for empty input and does not mutate the source', () => {
+    expect(toLineData([])).toEqual([])
+    const snapshot = JSON.parse(JSON.stringify(SERIES))
+    toLineData(SERIES)
+    expect(SERIES).toEqual(snapshot)
   })
 })
 

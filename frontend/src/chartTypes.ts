@@ -1,5 +1,10 @@
 // Chart-type transforms (TradingView parity: "Candles", "Heikin-Ashi",
-// "Hollow candles").
+// "Hollow candles", "Line", "Area", "Bars").
+//
+// Candles / Heikin-Ashi / Hollow all render through ONE candlestick series (a
+// data transform + per-point colours). Line / Area / Bars need a DIFFERENT
+// lightweight-charts series constructor, so they are grouped by `seriesKind`
+// below: the chart swaps the underlying series only when the FAMILY changes.
 //
 // Heikin-Ashi ("average bar") smooths the candles to make trend/consolidation
 // easier to read. It is a pure DERIVATION of the real OHLC — no data is invented
@@ -22,18 +27,74 @@
 // below. Pure styling derived from real prices — nothing invented.
 import type { Candle } from './types'
 
-export type ChartKind = 'candles' | 'heikin_ashi' | 'hollow'
+export type ChartKind =
+  | 'candles'
+  | 'heikin_ashi'
+  | 'hollow'
+  | 'line'
+  | 'area'
+  | 'bars'
 
 // The chart-type picker's options, in display order. Extend here to add more
-// drawable types later (line / area / bars) — the picker renders this list.
+// drawable types — the picker renders this list.
 export const CHART_TYPES: { key: ChartKind; label: string }[] = [
   { key: 'candles', label: 'Candles' },
   { key: 'heikin_ashi', label: 'Heikin-Ashi' },
   { key: 'hollow', label: 'Hollow candles' },
+  { key: 'bars', label: 'Bars' },
+  { key: 'line', label: 'Line' },
+  { key: 'area', label: 'Area' },
 ]
 
 export function isChartKind(v: unknown): v is ChartKind {
-  return v === 'candles' || v === 'heikin_ashi' || v === 'hollow'
+  return (
+    v === 'candles' ||
+    v === 'heikin_ashi' ||
+    v === 'hollow' ||
+    v === 'line' ||
+    v === 'area' ||
+    v === 'bars'
+  )
+}
+
+// Which lightweight-charts series constructor a chart kind needs. Candles /
+// Heikin-Ashi / Hollow share ONE candlestick series (same family → no series
+// swap, just a data/colour transform); Bars/Line/Area each need their own
+// series type. The chart only tears down & rebuilds the main series when this
+// value changes, so switching Candles↔Heikin-Ashi↔Hollow stays a cheap reskin.
+export type SeriesKind = 'candlestick' | 'bar' | 'line' | 'area'
+
+export function seriesKind(kind: ChartKind): SeriesKind {
+  switch (kind) {
+    case 'bars':
+      return 'bar'
+    case 'line':
+      return 'line'
+    case 'area':
+      return 'area'
+    default:
+      // candles / heikin_ashi / hollow all render as candlesticks.
+      return 'candlestick'
+  }
+}
+
+// True for the single-value series (Line / Area) that plot ONE number per bar
+// (the close) instead of a full OHLC quad. Callers use this to pick the data
+// shape: `{ time, value }` vs `{ time, open, high, low, close }`.
+export function isValueSeries(sk: SeriesKind): boolean {
+  return sk === 'line' || sk === 'area'
+}
+
+// One single-value point per real bar for a Line / Area series: the bar's
+// CLOSE. Same length/order/timestamps as the input — nothing invented, the
+// close is a real traded price. (Line/Area show only the close, TradingView
+// style; the real OHLC still drives indicators, drawings and the legend.)
+export interface LinePoint {
+  time: Candle['time']
+  value: number
+}
+export function toLineData(candles: Candle[]): LinePoint[] {
+  return candles.map((c) => ({ time: c.time, value: c.close }))
 }
 
 // Per-point candle styling for Hollow Candles. lightweight-charts lets each
