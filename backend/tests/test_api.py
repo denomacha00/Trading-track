@@ -1596,5 +1596,37 @@ def test_admin_delete_user_cascades_data(client):
     assert all(u["id"] != uid for u in client.get("/api/admin/users").json())
 
 
+# --- Request-body size cap (defence-in-depth middleware) -------------------
+
+def test_oversized_body_rejected_413(client, monkeypatch):
+    """A request whose declared Content-Length exceeds the cap is refused with
+    413 by the ``limit_request_body`` middleware, before the route runs.
+
+    The middleware reads the module global at call time, so we shrink the cap
+    to a tiny value and send a modest body — no need to allocate 16 MiB."""
+    monkeypatch.setattr("app.main._MAX_REQUEST_BODY_BYTES", 100)
+    r = client.post("/api/ai/chat", json={"question": "x" * 2000})
+    assert r.status_code == 413
+    assert "too large" in r.json()["detail"].lower()
+
+
+def test_body_under_cap_passes_through(client, monkeypatch):
+    """A body under the cap is NOT blocked — it reaches normal route handling
+    (here a schema 422 for the missing question), proving the middleware only
+    trips on genuinely oversized payloads."""
+    monkeypatch.setattr("app.main._MAX_REQUEST_BODY_BYTES", 100)
+    r = client.post("/api/ai/chat", json={})  # ~2 bytes, well under the cap
+    assert r.status_code != 413
+
+
+def test_default_cap_allows_a_normal_image_body(client, monkeypatch):
+    """The shipped default (16 MiB) sits above the largest legitimate body — an
+    AI chat turn carrying a downscaled image (base64 up to ~12 MB). A ~1 MB body
+    at the real cap must not be refused by the size middleware."""
+    import app.main as main_mod
+
+    assert main_mod._MAX_REQUEST_BODY_BYTES == 16 * 1024 * 1024
+    r = client.post("/api/ai/chat", json={"question": "x" * (1024 * 1024)})
+    assert r.status_code != 413
 
 

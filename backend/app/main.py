@@ -29,7 +29,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -255,6 +255,35 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---- Request body size cap -----------------------------------------
+# Defence-in-depth: refuse an oversized request body before it is buffered
+# into the worker's memory. The cap sits well ABOVE the largest legitimate
+# body — an AI chat turn carrying a downscaled image (base64 `data` up to
+# ~12 MB, see ``_validate_chat_image``) plus its JSON envelope — so no real
+# request is ever refused, while a multi-hundred-MB body can't exhaust the
+# process. We reject on the declared Content-Length (which every browser
+# ``fetch`` and webhook client sends for a JSON body); a body streamed with
+# NO Content-Length still hits the per-endpoint validators (e.g. the 6 MB
+# decoded-image cap) and the platform edge proxy, so it can't slip an
+# unbounded payload past this.
+_MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024  # 16 MiB
+
+
+@app.middleware("http")
+async def limit_request_body(request: Request, call_next):
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            size = int(declared)
+        except ValueError:
+            size = -1  # malformed header — leave framing to the ASGI server
+        if size > _MAX_REQUEST_BODY_BYTES:
+            return JSONResponse(
+                {"detail": "Request body too large."}, status_code=413
+            )
+    return await call_next(request)
 
 
 # ---- Security headers ----------------------------------------------
