@@ -175,6 +175,52 @@ def test_saved_sell_is_always_honoured(db, monkeypatch):
     assert out.confidence == pytest.approx(0.58)
 
 
+def test_saved_buy_held_below_confidence_floor(db, monkeypatch):
+    # The operator's min_signal_confidence is a risk floor on EVERY buy. A saved
+    # strategy whose honest confidence (its OOS win rate) sits below that floor
+    # must NOT open a new long — the override can't slip under the user's knob.
+    eng = _engine(use_saved_strategy=True, min_signal_confidence=0.70)
+    eng.strategy_configs["BTC/USDT"] = {
+        "strategy": "ma_cross", "params": {},
+        "metrics": {"validation_win_rate_pct": 55.0},  # 0.55 < 0.70 floor
+    }
+    _stub(monkeypatch, "buy")
+    analysis = MarketAnalyzer().analyze(_UP, "BTC/USDT")
+    assert eng._bear_regime(analysis) is False  # not blocked by regime — by the floor
+    out = eng._apply_saved_strategy("BTC/USDT", _UP, analysis)
+    assert out.verdict == "hold"
+    assert "confidence floor" in out.summary
+
+
+def test_saved_buy_taken_when_confidence_clears_floor(db, monkeypatch):
+    # Same setup but the strategy's win rate clears the floor -> the buy drives.
+    eng = _engine(use_saved_strategy=True, min_signal_confidence=0.50)
+    eng.strategy_configs["BTC/USDT"] = {
+        "strategy": "ma_cross", "params": {},
+        "metrics": {"validation_win_rate_pct": 58.0},  # 0.58 >= 0.50 floor
+    }
+    _stub(monkeypatch, "buy")
+    analysis = MarketAnalyzer().analyze(_UP, "BTC/USDT")
+    out = eng._apply_saved_strategy("BTC/USDT", _UP, analysis)
+    assert out.verdict == "buy"
+    assert out.confidence == pytest.approx(0.58)
+
+
+def test_saved_sell_ignores_confidence_floor(db, monkeypatch):
+    # The floor never blocks a risk-reducing SELL, even a low-confidence one under
+    # an aggressively high floor — reducing exposure is always allowed.
+    eng = _engine(use_saved_strategy=True, min_signal_confidence=0.90)
+    eng.strategy_configs["BTC/USDT"] = {
+        "strategy": "ma_cross", "params": {},
+        "metrics": {"validation_win_rate_pct": 55.0},  # 0.55, far below the 0.90 floor
+    }
+    _stub(monkeypatch, "sell")
+    analysis = MarketAnalyzer().analyze(_UP, "BTC/USDT")
+    out = eng._apply_saved_strategy("BTC/USDT", _UP, analysis)
+    assert out.verdict == "sell"
+    assert out.confidence == pytest.approx(0.55)
+
+
 def test_not_opted_in_keeps_analyzer_verdict(db, monkeypatch):
     eng = _engine(use_saved_strategy=False)  # opt-out
     eng.strategy_configs["BTC/USDT"] = {"strategy": "ma_cross", "params": {}}

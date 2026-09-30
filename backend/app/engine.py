@@ -500,6 +500,21 @@ class TradingEngine:
                     return analysis
             analysis.verdict = "buy"
             analysis.confidence = self._strategy_signal_confidence(cfg, analysis)
+            # Honour the operator's confidence floor. A saved strategy earns the
+            # right to drive the verdict, but a NEW long still may not open below
+            # min_signal_confidence — that floor is a risk knob governing EVERY
+            # buy, whatever its source. The analyzer applies it upstream; this
+            # override must not silently slip a low-confidence entry under it.
+            # (A SELL/exit is never gated — reducing risk is always allowed.)
+            floor = float(getattr(self.settings, "min_signal_confidence", 0.0) or 0.0)
+            if analysis.confidence < floor:
+                analysis.verdict = "hold"
+                analysis.summary = (
+                    f"{label} signalled BUY at {analysis.confidence:.0%}, below your "
+                    f"{floor:.0%} confidence floor — holding to honour it: "
+                    f"{analysis.summary}"
+                )
+                return analysis
         elif action == "sell":
             analysis.verdict = "sell"
             analysis.confidence = self._strategy_signal_confidence(cfg, analysis)
