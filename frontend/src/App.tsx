@@ -41,6 +41,19 @@ import { loadTurns, saveTurns } from './chatHistory'
 import { formatTranscript, transcriptFilename } from './chatExport'
 import { mergeOlder, mergeRecent, nextOlderEndMs, tfMs, OLDER_CHUNK } from './lazyHistory'
 import { CHART_TYPES, isChartKind, type ChartKind } from './chartTypes'
+import { ChartGrid } from './ChartGridView'
+import {
+  parseGridLayout,
+  parseGridCells,
+  serializeGridCells,
+  resizeGridCells,
+  setGridCellSymbol,
+  setGridCellTimeframe,
+  GRID_LAYOUTS,
+  STORAGE_LAYOUT,
+  STORAGE_CELLS,
+  type GridLayout,
+} from './chartGrid'
 import {
   DEFAULT_INDICATOR_PARAMS,
   PARAM_GROUPS,
@@ -341,9 +354,41 @@ function Dashboard({
   // Which chart the user is looking at: our own real-data candle chart (with the
   // bot's trades/alerts marked) or the embedded full TradingView chart. Remembered
   // between visits.
-  const [chartView, setChartView] = useState<'bot' | 'tv'>(
-    () => (localStorage.getItem('tt.chartView') === 'tv' ? 'tv' : 'bot'),
+  const [chartView, setChartView] = useState<'bot' | 'multi' | 'tv'>(() => {
+    const v = localStorage.getItem('tt.chartView')
+    return v === 'tv' || v === 'multi' ? v : 'bot'
+  })
+  // Multi-chart grid (TradingView Ultimate "16 charts per tab" parity): how many
+  // cells, and each cell's own real symbol + timeframe. Both persisted; the cell
+  // array is always kept exactly as long as the layout demands (resizeGridCells).
+  const [gridLayout, setGridLayout] = useState<GridLayout>(() =>
+    parseGridLayout(localStorage.getItem(STORAGE_LAYOUT)),
   )
+  const [gridCells, setGridCells] = useState(() =>
+    parseGridCells(localStorage.getItem(STORAGE_CELLS), parseGridLayout(localStorage.getItem(STORAGE_LAYOUT)), 'BTC/USDT', '1h'),
+  )
+  useEffect(() => {
+    localStorage.setItem(STORAGE_LAYOUT, String(gridLayout))
+  }, [gridLayout])
+  useEffect(() => {
+    localStorage.setItem(STORAGE_CELLS, serializeGridCells(gridCells))
+  }, [gridCells])
+  // Changing the layout grows/shrinks the cell array, keeping the pairs already
+  // chosen and padding new cells with the pair currently on the main chart.
+  const changeGridLayout = (n: GridLayout) => {
+    setGridLayout(n)
+    setGridCells((cur) => resizeGridCells(cur, n, symbol, timeframe))
+  }
+  const setGridSymbol = (index: number, raw: string) =>
+    setGridCells((cur) => setGridCellSymbol(cur, index, raw))
+  const setGridTimeframe = (index: number, tf: string) =>
+    setGridCells((cur) => setGridCellTimeframe(cur, index, tf))
+  // "Open on the main chart": load that pair full-featured (drawings/alerts/replay).
+  const focusGridSymbol = (sym: string) => {
+    setSymbol(sym)
+    setChartView('bot')
+  }
+
   // Chart size mode: normal, maximized (fixed full-screen overlay for close
   // analysis on phone or PC — the canvas simply re-fits the bigger box, so it
   // stays pixel-crisp, no image upscaling), or minimized (collapse the chart body
@@ -2045,6 +2090,14 @@ function Dashboard({
                   </button>
                   <button
                     type="button"
+                    className={`cvt-btn${chartView === 'multi' ? ' active' : ''}`}
+                    onClick={() => setChartView('multi')}
+                    title="Grid: watch up to 16 pairs at once, each on its own timeframe (real data)"
+                  >
+                    Grid
+                  </button>
+                  <button
+                    type="button"
                     className={`cvt-btn${chartView === 'tv' ? ' active' : ''}`}
                     onClick={() => setChartView('tv')}
                     title="The full TradingView chart: every drawing tool and indicator (live market data)"
@@ -2052,6 +2105,24 @@ function Dashboard({
                     TradingView
                   </button>
                 </div>
+                {chartView === 'multi' && (
+                  <div className="chart-view-toggle chart-grid-layout" role="group" aria-label="Grid layout">
+                    <label className="sr-only" htmlFor="grid-layout-pick">Grid layout</label>
+                    <select
+                      id="grid-layout-pick"
+                      className="grid-layout-select"
+                      value={gridLayout}
+                      onChange={(e) => changeGridLayout(Number(e.target.value) as GridLayout)}
+                      title="How many charts to show at once"
+                    >
+                      {GRID_LAYOUTS.map((l) => (
+                        <option key={l.value} value={l.value}>
+                          {l.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
                 {/* Size controls: minimize (collapse to the header so the panels
                     below come into view) and maximize (a full-screen overlay for
                     close analysis on phone or PC). Mutually exclusive. */}
@@ -2146,6 +2217,19 @@ function Dashboard({
               )}
               {chartView === 'tv' ? (
                 <TradingViewChart symbol={symbol} timeframe={timeframe} theme={theme} />
+              ) : chartView === 'multi' ? (
+                <ChartGrid
+                  layout={gridLayout}
+                  cells={gridCells}
+                  bars={chartBars}
+                  theme={theme}
+                  indicators={indicators}
+                  indicatorParams={indicatorParams}
+                  chartType={chartType}
+                  onSetSymbol={setGridSymbol}
+                  onSetTimeframe={setGridTimeframe}
+                  onFocusSymbol={focusGridSymbol}
+                />
               ) : candles.length ? (
                 <>
                   <div className="chart-aux">

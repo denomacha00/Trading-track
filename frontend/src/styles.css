@@ -3169,3 +3169,88 @@ body.chat-locked { overflow: hidden; }
 .pill-buy { background: var(--green); }
 .pill-sell { background: var(--red); }
 .warn-text { color: var(--warn); font-weight: 600; }
+
+/* ---- Multi-chart grid (TradingView Ultimate "16 charts per tab" parity) ---- */
+.chart-grid-layout .grid-layout-select {
+  font-size: 12px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: inherit;
+}
+.chart-grid {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+}
+.grid-cell {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--panel);
+}
+.grid-cell-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+}
+.grid-cell-sym {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  padding: 3px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: inherit;
+}
+.grid-cell-tf {
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 3px 4px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: inherit;
+}
+.grid-cell-focus {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+}
+.grid-cell-focus:hover { background: var(--panel-2); }
+.grid-cell-chart {
+  position: relative;
+  height: 240px;
+}
+.grid-cell-chart > * { height: 100%; width: 100%; }
+/* Full screen: let the grid fill the overlay and give each row an equal share. */
+.chart-max .chart-grid {
+  height: calc(100dvh - 120px);
+  grid-auto-rows: 1fr;
+  overflow: auto;
+}
+.chart-max .grid-cell-chart { height: auto; flex: 1 1 auto; }
+/* Phones/tablets: stack to a single column so each chart stays readable. The
+   grid's column count is an inline style, so override it here with !important. */
+@media (max-width: 900px) {
+  .chart-grid { grid-template-columns: 1fr !important; }
+  .grid-cell-chart { height: 220px; }
+}
