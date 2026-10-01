@@ -431,7 +431,17 @@ def strip_action_tag(text: str) -> tuple[str, Optional[dict]]:
     obj_end = _scan_json_object(text, obj_start)
     if obj_end < 0:
         return text, None
-    close = _ACTION_CLOSE_RE.match(text, obj_end)
+    # The tag SHOULD close with ``]]`` right after the JSON object, but models
+    # (especially reasoning models) sometimes emit a stray trailing brace or
+    # whitespace first — e.g. ``[[action:{...}}]]`` — which used to defeat the
+    # strict match, leaving the raw tag in the reply AND dropping the action (the
+    # user saw the tag "instead of doing"). Skip any whitespace / extra ``}``
+    # before requiring ``]]``; the parsed object below is still the first balanced
+    # ``{...}``, so the extra brace is discarded, not parsed.
+    tail = obj_end
+    while tail < len(text) and text[tail] in " \t\r\n}":
+        tail += 1
+    close = _ACTION_CLOSE_RE.match(text, tail)
     if not close:
         return text, None
     clean = (text[: m.start()] + text[close.end() :]).strip()
@@ -801,24 +811,43 @@ class AICommentator:
                 messages.append({"role": turn["role"], "content": turn["content"]})
         errors: list[str] = []
         for prov in providers:
-            try:
-                text = self._post_once(prov, system, messages, max_tokens, image=image)
-                if text:
-                    self._last_error = ""
-                    self._last_provider = prov["label"]
-                    if prov["label"] != "primary":
-                        # A trade might be riding on this — make the failover visible
-                        # in the logs (never the key or payload).
+            # A flaky gateway sometimes DROPS the connection mid-request
+            # (httpx RemoteProtocolError) or refuses a single connect — transient
+            # blips that a second try usually clears. Retry the SAME provider once
+            # on those, so we don't fall through to a slower model over a hiccup.
+            # We do NOT retry a ReadTimeout: that means the model itself is slow,
+            # and a retry would just burn another full budget — fail over instead.
+            reason = ""
+            for attempt in range(2):
+                try:
+                    text = self._post_once(prov, system, messages, max_tokens, image=image)
+                    if text:
+                        self._last_error = ""
+                        self._last_provider = prov["label"]
+                        if prov["label"] != "primary":
+                            # A trade might be riding on this — make the failover
+                            # visible in the logs (never the key or payload).
+                            logger.info(
+                                "AI answered via the %s provider after the primary failed",
+                                prov["label"],
+                            )
+                        return text
+                    reason = "provider answered with no usable text"
+                    break  # empty content isn't transient — fail over to the next
+                except _TRANSIENT_AI_ERRORS as exc:
+                    reason = _describe_ai_error(exc)
+                    if attempt == 0:
                         logger.info(
-                            "AI answered via the %s provider after the primary failed",
-                            prov["label"],
+                            "transient %s from %s provider — retrying once",
+                            type(exc).__name__, prov["label"],
                         )
-                    return text
-                errors.append(f"{prov['label']}: provider answered with no usable text")
-            except Exception as exc:  # noqa: BLE001 — categorised, secret-free below
-                reason = _describe_ai_error(exc)
-                errors.append(f"{prov['label']}: {reason}")
-                logger.warning("AI request via %s provider failed: %s", prov["label"], reason)
+                        continue
+                    logger.warning("AI request via %s provider failed: %s", prov["label"], reason)
+                except Exception as exc:  # noqa: BLE001 — categorised, secret-free
+                    reason = _describe_ai_error(exc)
+                    logger.warning("AI request via %s provider failed: %s", prov["label"], reason)
+                    break
+            errors.append(f"{prov['label']}: {reason}")
         # Every configured provider failed. Compose a combined, secret-free reason.
         self._last_error = "; ".join(errors) if errors else "AI request failed"
         self._last_provider = ""
@@ -1088,11 +1117,15 @@ class AICommentator:
             "detail": "",
         }
         try:
+            # Give a realistic token budget, not 5. A REASONING model spends its
+            # budget on hidden chain-of-thought first, so a tiny cap returns empty
+            # visible content (finish_reason=length) and the probe would FALSELY
+            # report a working provider as broken. 256 lets it finish + answer.
             text = self._post_once(
                 prov,
                 _SYSTEM_ASSISTANT,
                 [{"role": "user", "content": "Reply with exactly: ok"}],
-                5,
+                256,
             )
             if text:
                 st["ok"] = True
@@ -1421,6 +1454,13 @@ def _describe_ai_error(exc: Exception) -> str:
         return "the AI provider timed out — it may be slow or unreachable"
     if isinstance(exc, httpx.ConnectError):
         return "could not reach the AI provider — check the network or AI_BASE_URL"
+    if isinstance(exc, httpx.RemoteProtocolError):
+        return (
+            "the AI provider dropped the connection before sending a full response "
+            "— usually a flaky or overloaded gateway. It's retried once; if it keeps "
+            "happening, that provider isn't reliable for server-to-server calls "
+            "(consider a different AI_FALLBACK_MODEL or gateway)"
+        )
     if isinstance(exc, (KeyError, IndexError, ValueError)):
         return "the AI provider returned an unexpected response format"
     return f"AI request error ({type(exc).__name__})"
@@ -1489,6 +1529,16 @@ def _strip_reasoning(text: Optional[str]) -> Optional[str]:
 # A verified fallback answers in ~2-5s, so 30s drops a hung/reasoning model fast
 # while never cutting a healthy reply. Always capped against ai_timeout_seconds.
 _FALLBACK_READ_TIMEOUT = 30.0
+
+# Transient transport errors worth ONE same-provider retry: the connection was
+# established but DROPPED mid-response (a flaky/overloaded gateway), which a
+# second try usually clears. Deliberately narrow — it EXCLUDES ReadTimeout (a
+# slow model; retrying just burns another budget) and ConnectError (host down;
+# fail straight over to the next provider). Both of those fail over immediately.
+_TRANSIENT_AI_ERRORS = (
+    httpx.RemoteProtocolError,
+    httpx.WriteError,
+)
 
 
 def _parse_model_list(raw: str) -> list[str]:

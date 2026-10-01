@@ -18,6 +18,7 @@ from app.ai import (
     _IDENTITY,
     _SYSTEM_ANALYST,
     _SYSTEM_ASSISTANT,
+    _describe_ai_error,
     _extract_anthropic_text,
     _extract_openai_text,
     _looks_anthropic,
@@ -521,6 +522,29 @@ def test_strip_action_tag_reason_with_braces_and_brackets():
     assert obj["reason"] == "was {loose} [per plan]"
 
 
+def test_strip_action_tag_tolerates_stray_trailing_brace():
+    # Real production leak: the fallback (reasoning) model emitted an EXTRA `}`
+    # before `]]` — `[[action:{...}}]]`. The strict close-match failed, so the raw
+    # tag stayed in the reply AND the action was dropped (user saw the tag
+    # "instead of doing"). We must skip the stray brace/whitespace, strip the tag,
+    # and still parse the FIRST balanced object as the action.
+    reply = (
+        "I'm closing the long now (autopilot's on, so it applies).\n\n"
+        '[[action:{"type":"order","side":"close","symbol":"BTC/USDT","amount":null,'
+        '"reason":"Bear MSS + buy-side sweep, exit before the 81874 stop"}}]]'
+    )
+    clean, obj = strip_action_tag(reply)
+    assert "[[action" not in clean  # tag no longer leaks into the visible reply
+    assert clean.startswith("I'm closing the long now")
+    assert obj == {
+        "type": "order",
+        "side": "close",
+        "symbol": "BTC/USDT",
+        "amount": None,
+        "reason": "Bear MSS + buy-side sweep, exit before the 81874 stop",
+    }
+
+
 # ---- secondary (fallback) AI provider --------------------------------------
 # A backup provider that transparently picks up when the PRIMARY is down, so the
 # assistant keeps working mid-trade. Only ever a backstop: a healthy primary is
@@ -704,6 +728,58 @@ def test_both_providers_down_reports_both_reasons(monkeypatch):
     assert len(_RecordingClient.calls) == 2
     assert "primary" in ai._last_error and "fallback" in ai._last_error
     assert "AI request failed" in msg
+
+
+def test_transient_protocol_error_retries_same_provider(monkeypatch):
+    # A flaky gateway drops the connection mid-response (RemoteProtocolError).
+    # The SAME provider must be retried ONCE and succeed — not fall through to a
+    # slower fallback over a transient hiccup. (This was the user's live symptom.)
+    _install_sequence(monkeypatch, [
+        ("raise", httpx.RemoteProtocolError("server disconnected")),
+        _OPENAI_OK,  # retry of the SAME primary succeeds
+    ])
+    ai = AICommentator(_dual_settings())
+    out = ai.chat("how's my bot?")
+    assert out == "primary answer"
+    assert ai._last_provider == "primary"
+    assert len(_RecordingClient.calls) == 2  # both calls were the primary; fallback untouched
+    assert _RecordingClient.calls[0]["url"] == "https://primary.example.com/v1/chat/completions"
+    assert _RecordingClient.calls[1]["url"] == "https://primary.example.com/v1/chat/completions"
+
+
+def test_read_timeout_does_not_retry_and_fails_over(monkeypatch):
+    # A ReadTimeout means the MODEL is slow — retrying it just burns another
+    # budget. It must fail over to the fallback immediately (no primary retry).
+    _install_sequence(monkeypatch, [
+        ("raise", httpx.ReadTimeout("model slow")),
+        _ANTHROPIC_FB_OK,
+    ])
+    ai = AICommentator(_dual_settings())
+    out = ai.chat("how's my bot?")
+    assert out == "fallback answer"
+    assert ai._last_provider == "fallback"
+    assert len(_RecordingClient.calls) == 2  # 1 primary (no retry) + 1 fallback
+    assert _RecordingClient.calls[0]["url"] == "https://primary.example.com/v1/chat/completions"
+    assert _RecordingClient.calls[1]["url"].endswith("/messages")  # the fallback
+
+
+def test_transient_retry_gives_up_after_one_retry(monkeypatch):
+    # Two protocol drops in a row on the primary → one retry, then fail over.
+    _install_sequence(monkeypatch, [
+        ("raise", httpx.RemoteProtocolError("drop 1")),
+        ("raise", httpx.RemoteProtocolError("drop 2")),
+        _ANTHROPIC_FB_OK,
+    ])
+    ai = AICommentator(_dual_settings())
+    out = ai.chat("how's my bot?")
+    assert out == "fallback answer"
+    assert len(_RecordingClient.calls) == 3  # primary x2 (retry), then fallback
+
+
+def test_describe_error_remote_protocol_is_clear():
+    msg = _describe_ai_error(httpx.RemoteProtocolError("server disconnected"))
+    assert "dropped the connection" in msg
+    assert "retried once" in msg
 
 
 def test_health_probes_each_provider(monkeypatch):
